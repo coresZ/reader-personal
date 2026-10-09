@@ -140,14 +140,26 @@
           <label for="reader-image-opacity">透明度</label>
           <input
             id="reader-image-opacity"
+            class="settings-slider"
             type="range"
             min="0"
             max="1"
-            step="0.05"
+            :step="READER_BACKGROUND_OPACITY_STEP"
             :value="config.readerImageOpacity"
             @input="store.updateConfig('readerImageOpacity', Number(($event.target as HTMLInputElement).value))"
           >
-          <output>{{ Math.round(config.readerImageOpacity * 100) }}%</output>
+          <label class="opacity-input-wrap" title="可直接输入 0-100 的数值">
+            <input
+              class="opacity-input"
+              type="number"
+              min="0"
+              max="100"
+              step="1"
+              :value="readerOpacityToPercent(config.readerImageOpacity)"
+              @change="applyReaderOpacityPercent(($event.target as HTMLInputElement).value, $event.target as HTMLInputElement)"
+            >
+            <span class="opacity-unit">%</span>
+          </label>
         </div>
       </div>
 
@@ -562,12 +574,12 @@
                 v-if="capturingAction !== action.id"
                 type="button"
                 class="key-capture"
-                :title="`按下任意键为「${action.label}」绑定快捷键`"
+                :title="`按下任意键或鼠标键为「${action.label}」绑定快捷键`"
                 :aria-label="`为「${action.label}」录入快捷键`"
                 @click="startCapture(action.id)"
               >＋</button>
               <span v-else class="key-capturing">
-                请按键…
+                请按键/鼠标键…
                 <button type="button" class="key-capture-cancel" @click="cancelCapture">取消</button>
               </span>
             </div>
@@ -607,13 +619,23 @@ import {
   type SpeechAudioFormat,
 } from '../../utils/openaiSpeech'
 import { READER_FONT_SIZE_MAX, READER_FONT_SIZE_MIN } from '../../utils/readerFontSize'
-import { prepareReaderBackgroundImage } from '../../utils/readerBackground'
+import {
+  READER_BACKGROUND_OPACITY_STEP,
+  percentToReaderOpacity,
+  prepareReaderBackgroundImage,
+  readerOpacityToPercent,
+} from '../../utils/readerBackground'
 import {
   HOTKEY_ACTIONS,
   HOTKEY_ACTION_MAP,
   HOTKEY_KEYS,
+  bareMouseButtonKeyId,
   hotkeyIdFromEvent,
+  hotkeyIdFromMouseEvent,
+  hotkeyIdFromWheelEvent,
   hotkeyLabel,
+  isMouseButtonKeyId,
+  setHotkeyCaptureActive,
   type HotkeyActionId,
 } from '../../utils/readerHotkeys'
 
@@ -686,6 +708,27 @@ function removeReaderBackgroundImage() {
   appStore.showToast('已移除阅读页背景图', 'success')
 }
 
+/** 百分比输入框: 非数字输入不写回(保持原值), 越界自动夹到 0-100。
+ *
+ *  无论接受与否, 回调结束时都把 DOM 里的显示值重新对齐到 store 的真实值。
+ *  输入框是单向绑定(`:value`), store 值没变化时 Vue 不会重写 DOM —— 于是
+ *  「清空输入框」「输入 150」「输入 -5」这类情况会让框里停着非法文本, 而实际
+ *  透明度没变, UI 与真实值脱节, 直到面板重开才恢复。 */
+function syncOpacityInput(input: HTMLInputElement, applied: number) {
+  const actual = readerOpacityToPercent(applied)
+  if (input.value !== String(actual)) input.value = String(actual)
+}
+
+function applyReaderOpacityPercent(raw: string, input: HTMLInputElement) {
+  const next = percentToReaderOpacity(raw)
+  if (next === null) {
+    syncOpacityInput(input, store.config.readerImageOpacity)
+    return
+  }
+  store.updateConfig('readerImageOpacity', next)
+  syncOpacityInput(input, next)
+}
+
 /** 一键把背景色与文字色都还原为跟随主题。 */
 function resetReaderColors() {
   store.updateConfig('readerBackgroundColor', '')
@@ -715,10 +758,13 @@ function keysForAction(actionId: HotkeyActionId): string[] {
     })
 }
 
-/** 录入按键: 按下任意键即绑到当前功能。
+/** 录入按键: 按下任意键(或鼠标键/滚轮)即绑到当前功能。
  *
- *  用捕获阶段监听, 并 stopPropagation, 否则同一次按键会先被阅读页的
- *  handleKeydown 处理(比如按「↓」直接翻页), 设置面板反而收不到。 */
+ *  这些捕获监听是点「＋」时才注册的, 比阅读页的同阶段监听**更晚**, 因此同一次
+ *  操作里阅读页的 handler 会先跑 —— 真正让运行时整体让路的是
+ *  `setHotkeyCaptureActive(true)`(见 readerHotkeys 的「录入态」与 dispatchHotkey)。
+ *  这里的 stopPropagation 是第二道保险: 让后续同阶段/冒泡阶段的其它监听也收不到
+ *  这次操作, 免得面板内的滚轮滚动、选区菜单等被牵连。 */
 function handleCaptureKeydown(event: KeyboardEvent) {
   if (!capturingAction.value) return
   event.preventDefault()
@@ -730,14 +776,109 @@ function handleCaptureKeydown(event: KeyboardEvent) {
   }
   const keyId = hotkeyIdFromEvent(event)
   if (!keyId) return
+  finishCapture(keyId)
+}
+
+function handleCaptureMouseDown(event: MouseEvent) {
+  if (!capturingAction.value) return
+  // 左键/右键按下先不拦: 用户可能只是想点别处或取消。点「取消」按钮走 click,
+  // 由 cancelCapture 处理; 中键/侧键才是要录的鼠标键。
+  const keyId = hotkeyIdFromMouseEvent(event)
+  if (!keyId) {
+    // 左键点在录入区之外 = 放弃录入, 保持与 Esc 一致的心智模型。
+    if (event.button === 0 && !(event.target as HTMLElement | null)?.closest?.('.key-capturing')) {
+      cancelCapture()
+    }
+    return
+  }
+  event.preventDefault()
+  event.stopPropagation()
+  finishCapture(keyId)
+}
+
+function handleCaptureWheel(event: WheelEvent) {
+  if (!capturingAction.value) return
+  const keyId = hotkeyIdFromWheelEvent(event)
+  if (!keyId) return
+  event.preventDefault()
+  event.stopPropagation()
+  finishCapture(keyId)
+}
+
+/** 录入成功: 落库并提示。
+ *
+ *  **顺序不能动**: 抑制窗口必须在 `capturingAction.value = null` **之前**写好。
+ *  那个赋值会通过 watch(flush:'sync') **同步**跑 releaseCaptureListeners(),
+ *  它靠读窗口值算拆除延迟。若窗口还写着 0(或已过期), delayMs 就是 0, 五个捕获
+ *  监听器在下一宏任务被摘除 —— 而窗口的唯一读取者正是这些监听器, 于是窗口成了
+ *  没人读的死代码, 「按下录完、松开却导航」照旧发生。
+ *  曾把窗口赋值放在末尾, 靠手工模拟顺序的脚本"验证通过", 实际是假的:
+ *  真实 Vue 的同步 watch 在赋值那一行就跑完了。 */
+function finishCapture(keyId: string) {
   const actionId = capturingAction.value
+  if (!actionId) return
+  // 鼠标键的默认行为(中键自动滚动、侧键前进后退)在**松开**时才发生, 而录入是在
+  // 按下时完成的 —— 清空 capturingAction 后单靠它拦不住紧接着的 mouseup。
+  // 若漏掉, 侧键一按一放就导航一次: 本应用用 hash 路由, hash 一变即跳路由、
+  // 设置面板被卸载, 用户看到的就是「侧键录完就失灵」。因此先开抑制窗口, 再清状态。
+  if (isMouseButtonKeyId(keyId)) {
+    suppressedMouseButtonKey = bareMouseButtonKeyId(keyId)
+    suppressMouseButtonNavUntil = Date.now() + CAPTURE_MOUSEUP_SUPPRESS_MS
+  }
   capturingAction.value = null
   store.bindHotkeyKey(keyId, actionId)
   appStore.showToast(`已绑定「${hotkeyLabel(keyId)}」`, 'success')
 }
 
+/** 刚录完鼠标键后, 短暂抑制其默认导航的时间窗口(毫秒)。
+ *  只需覆盖同一次操作的 mouseup, 取值远大于「按下到松开」的间隔即可。 */
+const CAPTURE_MOUSEUP_SUPPRESS_MS = 1000
+let suppressMouseButtonNavUntil = 0
+/** 窗口内要抑制的**具体键位**。
+ *
+ *  必须记键位而不能只判断"是不是鼠标键": 用户录完侧键1 后一秒内若去按侧键2,
+ *  后者(通常未绑定)的松开会本应正常导航, 只按类别判断会把这次也吞掉 ——
+ *  表现为「刚设过快捷键, 另一个侧键就失灵了一秒」。 */
+let suppressedMouseButtonKey = ''
+/** 延迟拆除捕获监听的定时器句柄 —— 见 releaseCaptureListeners 的说明。 */
+let captureReleaseTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 是否处于「刚录完该鼠标键」的抑制窗口内。只对同一个键生效。 */
+function isMouseButtonNavSuppressed(keyId: string | null): boolean {
+  if (!keyId || keyId !== suppressedMouseButtonKey) return false
+  return Date.now() < suppressMouseButtonNavUntil
+}
+
 function startCapture(actionId: HotkeyActionId) {
+  // 开始新一次录入即作废上一次的抑制窗口, 避免它挡住用户接下来正常的侧键操作。
+  suppressMouseButtonNavUntil = 0
+  suppressedMouseButtonKey = ''
+  if (captureReleaseTimer !== null) {
+    clearTimeout(captureReleaseTimer)
+    captureReleaseTimer = null
+  }
   capturingAction.value = actionId
+}
+
+/** 拆除录入期的捕获监听。
+ *
+ *  不能一退出录入态就立即拆: 抑制窗口(mouseup 拦截)的判定函数正是这些监听器,
+ *  拆掉之后写入的窗口就成了没人读的死代码 —— 而「按下录完、松开导航」恰好发生
+ *  在这个窗口内。因此推迟到窗口结束后再拆。 */
+function releaseCaptureListeners() {
+  if (typeof window === 'undefined') return
+  if (captureReleaseTimer !== null) clearTimeout(captureReleaseTimer)
+  const delayMs = Math.max(0, suppressMouseButtonNavUntil - Date.now())
+  captureReleaseTimer = setTimeout(() => {
+    captureReleaseTimer = null
+    // 期间用户可能又开始录入 —— 那就不能拆。
+    if (capturingAction.value) return
+    window.removeEventListener('keydown', handleCaptureKeydown, true)
+    window.removeEventListener('mousedown', handleCaptureMouseDown, true)
+    window.removeEventListener('wheel', handleCaptureWheel, { capture: true })
+    window.removeEventListener('auxclick', handleCaptureAuxClick, true)
+    window.removeEventListener('mouseup', handleCaptureMouseUp, true)
+  }, delayMs)
 }
 
 function cancelCapture() {
@@ -746,13 +887,72 @@ function cancelCapture() {
 
 watch(capturingAction, (active) => {
   if (typeof window === 'undefined') return
-  if (active) window.addEventListener('keydown', handleCaptureKeydown, true)
-  else window.removeEventListener('keydown', handleCaptureKeydown, true)
-})
+  // 录入期间让运行时的快捷键派发整体让路(见 readerHotkeys 的「录入态」):
+  // 否则「把侧键改绑到目录」会先被阅读页接走、顺手切换面板。
+  setHotkeyCaptureActive(Boolean(active))
+  if (active) {
+    // 捕获阶段 + 非 passive: 必须能在阅读页的 wheel 监听之前消费掉这次滚动。
+    window.addEventListener('keydown', handleCaptureKeydown, true)
+    window.addEventListener('mousedown', handleCaptureMouseDown, true)
+    window.addEventListener('wheel', handleCaptureWheel, { capture: true, passive: false })
+    window.addEventListener('auxclick', handleCaptureAuxClick, true)
+    // 侧键的前进/后退导航在**松开**时触发(Chromium 行为, 见 MDN 与
+    // three.js issue #15713): 只拦 mousedown 不够, 录制期间松开侧键仍会导航 ——
+    // 本应用用 hash 路由, hash 一变就跳路由、设置面板被卸载, 录入随之中断。
+    window.addEventListener('mouseup', handleCaptureMouseUp, true)
+  } else {
+    // 不立即拆: 刚录完鼠标键时还要靠这些监听器拦住同一次操作的 mouseup,
+    // 详见 releaseCaptureListeners。拆掉之前它们是抑制窗口的唯一读取者。
+    releaseCaptureListeners()
+  }
+  // flush: 'sync' —— 标志必须在同一次用户操作内立即生效。默认的异步 flush 会
+  // 让「点开录入」这一拍之后的那次按键仍按运行时派发, 恰是要拦掉的那一次。
+}, { flush: 'sync' })
+
+/** 中键/侧键的默认行为(中键自动滚动、侧键前进后退)必须在按下时就被拦掉,
+ *  否则松开时浏览器仍会执行一次。这里只拦, 不录 —— 录入在 mousedown 完成。 */
+function handleCaptureAuxClick(event: MouseEvent) {
+  const keyId = hotkeyIdFromMouseEvent(event)
+  if (!capturingAction.value && !isMouseButtonNavSuppressed(keyId)) return
+  if (!keyId) return
+  event.preventDefault()
+  event.stopPropagation()
+}
+
+/** 侧键导航在松开时触发, 录制期间必须一并拦掉。
+ *
+ *  两个触发条件缺一不可: 正在录入, 或刚录完**同一个**鼠标键(此时 capturingAction
+ *  已清空)。后者针对的正是「按下录完、松开却导航」的那一次 —— 详见 finishCapture。
+ *
+ *  注意它比对的是具体键位而非"是不是鼠标键": 带修饰键录入(如 Ctrl+侧键1)后先松
+ *  Ctrl 再松侧键1, mouseup 的标识是未绑定的 `Mouse4`, 阅读页那边不会拦, 只能靠
+ *  这个窗口挡住 —— 所以窗口必须存在且能被读到(见 finishCapture 的顺序说明)。 */
+function handleCaptureMouseUp(event: MouseEvent) {
+  const keyId = hotkeyIdFromMouseEvent(event)
+  if (!capturingAction.value && !isMouseButtonNavSuppressed(keyId)) return
+  if (!keyId) return
+  event.preventDefault()
+  event.stopPropagation()
+}
 
 onBeforeUnmount(() => {
   if (typeof window === 'undefined') return
+  // 面板可能在录入途中被卸载(例如换章导致重渲染)。不清标志会让快捷键
+  // 永久失效 —— 运行时的派发会被一个永远为真的「正在录入」挡住。
+  setHotkeyCaptureActive(false)
+  // 抑制窗口与延迟拆除都要清: 面板若在「刚录完鼠标键」时被卸载, 留着定时器
+  // 会去操作已经卸载的监听器, 留着窗口会让侧键在一秒内无法导航。
+  suppressMouseButtonNavUntil = 0
+  suppressedMouseButtonKey = ''
+  if (captureReleaseTimer !== null) {
+    clearTimeout(captureReleaseTimer)
+    captureReleaseTimer = null
+  }
   window.removeEventListener('keydown', handleCaptureKeydown, true)
+  window.removeEventListener('mousedown', handleCaptureMouseDown, true)
+  window.removeEventListener('wheel', handleCaptureWheel, { capture: true })
+  window.removeEventListener('auxclick', handleCaptureAuxClick, true)
+  window.removeEventListener('mouseup', handleCaptureMouseUp, true)
 })
 
 function unbindKey(actionId: HotkeyActionId, keyId: string) {
@@ -919,8 +1119,10 @@ onMounted(async () => {
 .reset-btn {
   padding: 6px 16px;
   border-radius: 20px;
-  border: 1px solid var(--color-primary, #c97f3a);
-  color: var(--color-primary, #c97f3a);
+  /* 描边保留主色以示"重置"语义, 文字改跟随阅读主题: 主色文字压在阅读主题的
+   * 浅色底上只有 2.6~2.8:1, 不达标。 */
+  border: 1px solid color-mix(in srgb, var(--color-primary) 34%, transparent);
+  color: var(--settings-font, currentColor);
   font-size: 13px;
   font-weight: 500;
   transition: all 0.2s;
@@ -928,8 +1130,8 @@ onMounted(async () => {
 }
 
 .reset-btn:hover {
-  background: var(--color-selected-bg);
-  border-color: var(--color-selected-border);
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  border-color: var(--color-primary);
 }
 
 .settings-body {
@@ -1185,12 +1387,64 @@ onMounted(async () => {
   min-width: 0;
 }
 
-.inline-slider output {
+/* 注意选择器要带上 .inline-slider: 上面那条 `.inline-slider label` 是 (0,1,1),
+ * 单写 `.opacity-input-wrap` 只有 (0,1,0), 会被它的 opacity: 0.7 压回去。 */
+.inline-slider .opacity-input-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  flex-shrink: 0;
+  padding: 3px 5px;
+  border-radius: 6px;
+  /* 透明边框占位: 悬停/聚焦只换颜色, 不会冒出 1px 的布局抖动。 */
+  border: 1px solid transparent;
+  cursor: text;
+  /* 覆盖 .inline-slider label 的 0.7 —— 那是对说明文字的弱化; 输入控件保持正常
+   * 对比度, 否则数字看上去像禁用态。 */
+  opacity: 1;
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+
+.inline-slider .opacity-input-wrap:hover {
+  background: color-mix(in srgb, var(--settings-font, currentColor) 6%, transparent);
+}
+
+.inline-slider .opacity-input-wrap:focus-within {
+  background: color-mix(in srgb, var(--settings-font, currentColor) 10%, transparent);
+  border-color: color-mix(in srgb, var(--settings-font, currentColor) 24%, transparent);
+}
+
+.opacity-input {
+  /* 3.6ch ≈ 1.8em, 恰好容下三位数字(tabular-nums 下每位约 0.55em, "100" 要
+   * 1.65em)。再宽就会把数字推离 %, 再窄则三位数会顶格甚至被裁。 */
+  width: 3.6ch;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
   font-size: 12px;
-  opacity: 0.65;
   font-variant-numeric: tabular-nums;
-  min-width: 40px;
   text-align: right;
+  opacity: 0.85;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.opacity-input:focus {
+  outline: none;
+  opacity: 1;
+}
+
+/* number 输入的上下箭头在这么小的框里只会挤掉数字本身。 */
+.opacity-input::-webkit-outer-spin-button,
+.opacity-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.opacity-unit {
+  font-size: 12px;
+  opacity: 0.6;
 }
 
 /* ─── 快捷键: 以功能为主轴 ───
@@ -1543,14 +1797,17 @@ onMounted(async () => {
 /* 选中态用淡主色底 + 主色文字与描边, 而不是整块纯橙 —— 纯色块在设置面板
    里一屏会出现十来处, 连成一片非常刺眼, 也压掉了文字的层次。 */
 .opt-btn.active {
-  background: var(--color-selected-bg);
-  color: var(--color-primary, #c97f3a);
-  border-color: var(--color-selected-border);
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  /* 文字必须用 --settings-font(本组件跟随阅读主题的 fontColor), 不能写主色:
+   * 主色 #c97f3a 与阅读主题的浅色底亮度太接近, 默认主题只有 2.4:1、暗灰主题
+   * 更是 1.2:1, 字与底几乎同亮。改成跟随文字色后升到 6.4~10.9:1。 */
+  color: var(--settings-font, currentColor);
+  border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
   font-weight: 600;
 }
 
 .opt-btn.active:hover {
-  background: var(--color-selected-bg-hover);
+  background: color-mix(in srgb, var(--color-primary) 20%, transparent);
 }
 
 /* Steppers */

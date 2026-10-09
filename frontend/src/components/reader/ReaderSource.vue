@@ -580,9 +580,9 @@ async function handleSwitch(res: SearchBook) {
 }
 
 .source-item:hover .switch-btn {
-  background: var(--color-primary, #c97f3a);
-  color: white;
-  border-color: var(--color-primary, #c97f3a);
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  color: currentColor;
+  border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
   opacity: 1;
 }
 
@@ -609,9 +609,9 @@ async function handleSwitch(res: SearchBook) {
 }
 
 .switch-btn.primary {
-  background: var(--color-primary, #c97f3a);
-  border-color: var(--color-primary, #c97f3a);
-  color: #fff;
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
+  color: currentColor;
   opacity: 1;
 }
 

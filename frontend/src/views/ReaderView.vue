@@ -12,6 +12,8 @@
       '--reader-selection-color': theme.content,
     }"
     @click="handleBackgroundClick"
+    @pointermove="handleReaderPointerMove"
+    @pointerleave="handleReaderPointerLeave"
     @contextmenu.prevent="handleContextMenu"
   >
 
@@ -42,7 +44,7 @@
             'with-custom-background': hasReaderBackground,
             'drawer-wide': store.activePanel === 'settings',
           }"
-          :style="{ background: chromeTheme.popup, colorScheme: readerColorScheme }"
+          :style="{ background: chromeTheme.popup, color: chromeTheme.fontColor, colorScheme: readerColorScheme }"
         >
           <ReaderCatalog
             v-if="store.activePanel === 'catalog' || store.activePanel === 'bookmark'"
@@ -362,6 +364,11 @@ import { readerOrigin } from '../api/scheme'
 import { applySystemTheme } from '../utils/systemUi'
 import { APP_VIEWPORT_CHANGE_EVENT, syncViewportSize } from '../utils/viewport'
 import { isReaderInteractiveClickTarget } from '../utils/readerClick'
+import {
+  READER_HOVER_HIDE_DELAY_MS,
+  isReaderHoverPointInZone,
+  shouldRevealReaderControls,
+} from '../utils/readerHoverControls'
 import { shouldPreferServerReadingPosition, type ReadingPositionSnapshot } from '../utils/readingPosition'
 import { isLocalBook } from '../utils/localBook'
 import { processSourceImageOptions } from '../utils/sourceImageOptions'
@@ -377,7 +384,13 @@ import { splitBrParagraphs } from '../utils/readerParagraph'
 import { resolveReaderBackground } from '../utils/readerColor'
 import {
   hotkeyIdFromEvent,
+  hotkeyIdFromMouseEvent,
+  hotkeyIdFromWheelEvent,
   isActionAllowedWhilePanelOpen,
+  isHotkeyCaptureActive,
+  isMouseButtonHotkeyBlocked,
+  isPointerHotkeyBlocked,
+  mouseButtonHotkeyAction as resolveMouseButtonHotkeyAction,
   resolveHotkeyAction,
   type HotkeyActionId,
 } from '../utils/readerHotkeys'
@@ -468,6 +481,151 @@ const showControls = computed({
   set: (value: boolean) => { store.readerControlsVisible = value },
 })
 const isMobile = ref(false)
+
+/* ─── 鼠标靠近边缘自动展开菜单栏 ───
+ *  桌面环境(有真实指针、支持悬停)下, 指针进入阅读区 上/下/左/右 边缘的热区就展开
+ *  上/下菜单栏与两侧悬浮钮, 离开热区即收回(READER_HOVER_HIDE_DELAY_MS)。
+ *  触摸设备不启用(触摸没有「悬停」这一状态); 迷你窗口也不启用 —— 小窗只有
+ *  240px 高, 上下各 60px 的热区会占掉一半高度, 鼠标随便一停就把菜单栏顶出来。
+ *  热区边界与展开规则见 utils/readerHoverControls(已单测覆盖)。 */
+const supportsHoverPointer = ref(false)
+/** 指针是否停在边缘热区内(含热区里的正文)。 */
+let hoverPointerInZone = false
+/** 指针是否停在菜单栏自身上。菜单栏比热区高(底栏两行), 指针停在其上视为"没走开"。 */
+let hoverPointerOnControls = false
+/** 点击收起后, 直到指针离开热区前都不再自动展开 —— 否则贴着边缘点正文会立刻弹回。 */
+let hoverRevealSuppressed = false
+let hoverHideTimer: number | null = null
+let hoverMediaQuery: MediaQueryList | null = null
+let hoverSupportStop: (() => void) | null = null
+
+/** 热区以**阅读区**为基准, 而不是整个窗口: 阅读区顶边在标题栏之下,
+ *  若按 window 从顶边算, 顶部 60px 热区会被标题栏吃掉大半。
+ *  坐标一并换算成相对阅读区的, 与 rect 尺寸配成一对。 */
+function readerHoverFrame(element: EventTarget | null) {
+  const rect = (element as HTMLElement | null)?.getBoundingClientRect?.()
+  if (!rect || rect.width <= 0 || rect.height <= 0) return null
+  return {
+    rect,
+    viewport: { width: rect.width, height: rect.height },
+  }
+}
+
+function cancelHoverHide() {
+  if (hoverHideTimer !== null) {
+    clearTimeout(hoverHideTimer)
+    hoverHideTimer = null
+  }
+}
+
+/** 收起菜单栏。延迟为 0 时直接收, 不留异步尾巴(与 readest 的 mouseleave 立即隐藏一致)。 */
+function hideControlsNow() {
+  // 面板占用界面期间不收起。光标若一动不动, 面板关闭后单靠 pointermove 无法
+  // 再纠正, 所以由下面 watch(store.activePanel) 补一次判定。
+  if (store.activePanel) return
+  showControls.value = false
+}
+
+/** 指针离开热区后收起: 延迟见 READER_HOVER_HIDE_DELAY_MS(当前为 0, 即立即收起)。 */
+function scheduleHoverHide() {
+  cancelHoverHide()
+  if (READER_HOVER_HIDE_DELAY_MS <= 0) {
+    hideControlsNow()
+    return
+  }
+  hoverHideTimer = window.setTimeout(() => {
+    hoverHideTimer = null
+    hideControlsNow()
+  }, READER_HOVER_HIDE_DELAY_MS)
+}
+
+/** 搜索/朗读/书详情/书源面板等浮层打开时不自动展开。 */
+function readerOverlayOpen() {
+  return showSearch.value || showTTSPanel.value || showBookInfo.value || !!sourceBrowser.value?.visible
+}
+
+function handleReaderPointerMove(event: PointerEvent) {
+  // 触摸不产生「悬停」语义, 仍走点击呼出。这里要先把指针状态清掉: 触摸屏笔记本上
+  // 鼠标可能刚把状态留成"停在热区里", 不清就会与点击后的静默叠加成死角。
+  if (!supportsHoverPointer.value || event.pointerType === 'touch') {
+    hoverPointerInZone = false
+    hoverPointerOnControls = false
+    hoverRevealSuppressed = false
+    return
+  }
+  const target = event.target as Element | null
+  hoverPointerOnControls = !!target?.closest?.('.mobile-controls')
+  const frame = readerHoverFrame(event.currentTarget)
+  const inZone = !!frame && isReaderHoverPointInZone(
+    { x: event.clientX - frame.rect.left, y: event.clientY - frame.rect.top },
+    frame.viewport,
+  )
+  hoverPointerInZone = inZone
+
+  if (!inZone && !hoverPointerOnControls) {
+    // 指针走开即解除点击后的静默。
+    hoverRevealSuppressed = false
+    // 只按"指针停在菜单栏上"豁免收起: 热区里还有正文, 停在那儿滚动不该让菜单栏常驻。
+    if (showControls.value) scheduleHoverHide()
+    return
+  }
+
+  cancelHoverHide()
+  if (hoverRevealSuppressed) return
+  if (!frame) return
+  if (shouldRevealReaderControls(
+    { x: event.clientX - frame.rect.left, y: event.clientY - frame.rect.top },
+    frame.viewport,
+    { panelOpen: !!store.activePanel, overlayOpen: readerOverlayOpen() },
+  )) {
+    showControls.value = true
+  }
+}
+
+/** 指针离开整个阅读区(移出窗口/移到标题栏等外层区域)时按"离开热区"处理。 */
+function handleReaderPointerLeave(event: PointerEvent) {
+  if (!supportsHoverPointer.value || event.pointerType === 'touch') {
+    hoverPointerInZone = false
+    hoverPointerOnControls = false
+    hoverRevealSuppressed = false
+    return
+  }
+  hoverPointerInZone = false
+  hoverPointerOnControls = false
+  hoverRevealSuppressed = false
+  if (showControls.value) scheduleHoverHide()
+}
+
+/** 点击收起菜单栏(正文中部、正文空白处共用)。 */
+function collapseControlsByClick() {
+  cancelHoverHide()
+  showControls.value = false
+  // 悬停模式下指针多半还贴着边缘, 静默到它离开热区为止。
+  if (supportsHoverPointer.value && (hoverPointerInZone || hoverPointerOnControls)) {
+    hoverRevealSuppressed = true
+  }
+}
+
+/** 是否支持悬停展开: 桌面指针 + 非迷你窗口。 */
+function syncHoverPointerSupport() {
+  supportsHoverPointer.value = !!hoverMediaQuery?.matches && !appStore.miniMode
+  if (!supportsHoverPointer.value) {
+    hoverPointerInZone = false
+    hoverPointerOnControls = false
+    hoverRevealSuppressed = false
+    cancelHoverHide()
+  }
+}
+
+/** 面板打开时不自动展开(面板已占满视线), 关闭后补一次收起判定。 */
+watch(() => store.activePanel, (open) => {
+  if (open) {
+    cancelHoverHide()
+    return
+  }
+  if (showControls.value && !hoverPointerInZone && !hoverPointerOnControls) scheduleHoverHide()
+})
+
 let speechTimerTicker: number | null = null
 let readerViewUnmounted = false
 let suppressNextTapUntil = 0
@@ -1847,7 +2005,7 @@ function scrollPageBy(container: HTMLElement, delta: number) {
 function handleBackgroundClick(e: Event) {
   // If clicked directly on the reader-view wrapper, toggle controls
   if ((e.target as HTMLElement).classList.contains('reader-view')) {
-    showControls.value = false
+    collapseControlsByClick()
   }
 }
 
@@ -1947,7 +2105,7 @@ function handleGlobalClick(e: MouseEvent) {
   const target = e.target as HTMLElement | null
   if (isReaderInteractiveClickTarget(target)) return
   if (showControls.value && !store.activePanel) {
-    showControls.value = false
+    collapseControlsByClick()
     return
   }
   if (store.isAutoScrolling) return
@@ -1980,7 +2138,9 @@ function clickZoneAction(zone: 'prev' | 'menu' | 'next') {
     // 宽屏也走"点击正文中部呼出控件": 阅读页控件已统一为 ReaderMobileControls,
     // 不再有"鼠标移到边缘滑出竖栏"这条宽屏专属路径, 这里不能再按 isMobile 拦截,
     // 否则大窗口下点了中部什么都不会发生。
-    showControls.value = !showControls.value
+    // 悬停模式下指针常常还贴着边缘, 收起要一并静默, 否则会立刻被悬停弹回来。
+    if (showControls.value) collapseControlsByClick()
+    else showControls.value = true
     return
   }
 
@@ -2107,7 +2267,9 @@ function handleScroll() {
       store.preloadAroundChapter(store.currentIndex)
     }
   }
-  if (showControls.value && !store.activePanel) {
+  // 滚动时按原行为收起控件。悬停模式下只在指针停在菜单栏上(顶栏滚轮翻页)时才留 ——
+  // 热区里的正文不算, 否则鼠标停在边缘看正文时菜单栏会一直常驻遮挡。
+  if (showControls.value && !store.activePanel && !hoverPointerOnControls) {
     showControls.value = false
   }
   scheduleSaveReadingPosition()
@@ -2191,7 +2353,7 @@ function handleTouchEnd(event: TouchEvent) {
     if (touchDuration <= 260 && moved < 10) {
       suppressNextTapUntil = Date.now() + 350
       if (showControls.value && !store.activePanel) {
-        showControls.value = false
+        collapseControlsByClick()
       } else {
         const x = touch.clientX / window.innerWidth
         if (x < 0.3) {
@@ -2221,11 +2383,80 @@ const readingModeKind = computed<'paged' | 'scroll'>(() => (
   isHorizontalPageMode.value ? 'paged' : 'scroll'
 ))
 
+/* ─── 全屏 ───
+ *  必须走 Tauri 的**窗口全屏**(setFullscreen), 而不是 HTML5 的
+ *  document.documentElement.requestFullscreen()。窗口是无边框的
+ *  (decorations: false), 自定义标题栏由前端绘制: HTML5 全屏只把 webview
+ *  铺满屏幕, 窗口本身仍是普通窗口, --app-height 与真实视口在切换期间不一致,
+ *  顶部标题栏与底部就会露出错位/黑条(用户反馈的 F11 BUG)。
+ *
+ *  浏览器里(开发调试)没有 Tauri API, 回退到 HTML5 全屏。
+ *
+ *  「最大化状态下进全屏会露出任务栏高度的黑边」由 **tao 的 vendor 补丁**根治:
+ *  见 Cargo.toml 的 [patch.crates-io]/tao 与 vendor/tao 里的 VENDOR PATCH 注释。
+ *
+ *  这里刻意**不再**用「进全屏前先 unmaximize、退出后再 maximize」的变通。那虽
+ *  也能绕开黑边, 但 unmaximize/maximize 各对应一次 ShowWindow(SW_RESTORE) /
+ *  SW_MAXIMIZE, 且都由 tao 异步派发到事件循环线程 —— 退出全屏时必然先看到一次
+ *  窗口化动画、再来一次最大化动画, 观感很差。修好 tao 之后窗口在全屏前后始终
+ *  保持最大化状态, tao 退出全屏时用 SetWindowPlacement 一次性恢复, 一步到位。 */
+
+/** 全屏切换后布局会重排: 立刻同步一次视口变量, 并让位置恢复重新对齐。
+ *  Tauri 的全屏事件也会触发 window resize, 这里只是把首次同步提前,
+ *  避免中间帧按旧高度渲染。 */
+function afterFullscreenToggle() {
+  syncViewportSize()
+  window.requestAnimationFrame(() => {
+    syncViewportSize()
+    scheduleRestoreReadingPosition()
+  })
+}
+
+/** 本端追踪的全屏期望状态, 仅用于连续触发时不错乱。
+ *
+ *  不能只依赖 `setFullscreen(!(await isFullscreen()))`: 两次 IPC 往返之间用户
+ *  再按一次 F11, 第二次会读到**过期**的 isFullscreen, 于是把同一个值又设一遍 ——
+ *  用户连按两下期望「进→出」, 实际停在「进」。本地记一份期望值, 并在切换后再用
+ *  真实状态校准, 就能让连按变成两次真切换。 */
+let fullscreenToggleInFlight: Promise<void> | null = null
+let desiredFullscreen: boolean | null = null
+
+async function toggleTauriFullscreen() {
+  const { getCurrentWindow } = await import('@tauri-apps/api/window')
+  const appWindow = getCurrentWindow()
+  // 上一次切换还没落地就再按: 基于**期望值**取反, 而不是重新去问(可能过期的)实际状态。
+  const base = desiredFullscreen ?? (await appWindow.isFullscreen())
+  desiredFullscreen = !base
+  await appWindow.setFullscreen(desiredFullscreen)
+  // 用真实状态校准: 万一设置没生效(被系统拒、窗口已销毁), 下一次仍能正确取反。
+  try {
+    desiredFullscreen = await appWindow.isFullscreen()
+  } catch {
+    desiredFullscreen = null
+  }
+  afterFullscreenToggle()
+}
+
 function toggleFullscreen() {
+  if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
+    // 串行化: 快速连按 F11 时不并发发 IPC, 否则两次 setFullscreen 的到达顺序
+    // 无法保证, 结果可能是用户不想要的那个。
+    const run = (fullscreenToggleInFlight ?? Promise.resolve()).then(toggleTauriFullscreen)
+    fullscreenToggleInFlight = run.catch(() => undefined).finally(() => {
+      if (fullscreenToggleInFlight === run) fullscreenToggleInFlight = null
+    })
+    void fullscreenToggleInFlight.catch((error) => {
+      // 原来这里是 `.catch(() => undefined)` —— 全屏失败时用户按 F11 毫无反应也
+      // 没有任何提示, 只能反复按。至少给一条 toast, 并清除期望值以免后续取反错乱。
+      desiredFullscreen = null
+      appStore.showToast((error as Error)?.message || '切换全屏失败', 'warning')
+    })
+    return
+  }
   if (document.fullscreenElement) {
-    void document.exitFullscreen().catch(() => undefined)
+    void document.exitFullscreen().then(afterFullscreenToggle).catch(() => undefined)
   } else {
-    void document.documentElement.requestFullscreen().catch(() => undefined)
+    void document.documentElement.requestFullscreen().then(afterFullscreenToggle).catch(() => undefined)
   }
 }
 
@@ -2253,7 +2484,7 @@ function handleReaderBack() {
     return
   }
   if (showControls.value) {
-    showControls.value = false
+    collapseControlsByClick()
     return
   }
   goHome()
@@ -2324,34 +2555,29 @@ function runHotkeyAction(action: HotkeyActionId): boolean {
   }
 }
 
-function handleKeydown(e: KeyboardEvent) {
-  const activeElement = document.activeElement as HTMLElement | null
-  const tagName = activeElement?.tagName?.toLowerCase()
-  if (tagName === 'input' || tagName === 'textarea' || tagName === 'select' || activeElement?.isContentEditable) {
-    return
-  }
-
-  // 矩阵里没有换绑的按键不拦截: 用户在设置里把某键设为「不操作」后,
-  // 该键应彻底交还浏览器, 而不是被静默吞掉。
-  const keyId = hotkeyIdFromEvent(e)
-  if (!keyId) return
+/** 键盘/鼠标共用的快捷键派发。返回 true 表示已处理(调用方据此 preventDefault)。
+ *
+ *  抽出这一层的直接原因: 鼠标键与滚轮也要走完全相同的「模式分流 → 弹层拦截 →
+ *  返回优先」规则, 任何一条在两处各写一遍都迟早走偏。 */
+function dispatchHotkey(keyId: string | null): boolean {
+  if (!keyId) return false
+  // 设置面板正在录入快捷键: 这次按键/滚轮属于录入, 不能执行任何功能。
+  // 见 readerHotkeys 的「录入态」说明 —— 面板开关类动作在弹层打开时是放行的,
+  // 不做这层拦截会把设置面板自己切走。
+  if (isHotkeyCaptureActive()) return false
   const action = resolveHotkeyAction(store.hotkeyBindings, keyId, readingModeKind.value)
-  if (!action) return
+  if (!action) return false
 
   // 「返回」优先于弹层拦截: 否则 Esc 在弹层打开时会被下面的 return 吃掉。
   if (action === 'back') {
-    e.preventDefault()
-    runHotkeyAction(action)
-    return
+    return runHotkeyAction(action)
   }
 
   // 全屏/搜索是界面级动作, 面板开关是 toggle 语义 —— 弹层打开时都要放行,
   // 否则「打开目录」的键无法再关掉目录。其余按键在弹层打开时不生效, 避免误触翻页。
   if (store.activePanel) {
-    if (isActionAllowedWhilePanelOpen(action)) {
-      if (runHotkeyAction(action)) e.preventDefault()
-    }
-    return
+    if (isActionAllowedWhilePanelOpen(action)) return runHotkeyAction(action)
+    return false
   }
 
   // 自动滚动期间的导航按键先中断翻页补间并暂停, 静止后自动恢复。
@@ -2359,7 +2585,84 @@ function handleKeydown(e: KeyboardEvent) {
     handleManualReadingInput()
   }
 
-  if (runHotkeyAction(action)) e.preventDefault()
+  return runHotkeyAction(action)
+}
+
+/** 键盘: 焦点在输入类控件里时不当作快捷键(用户正在打字)。
+ *  与旧实现保持一致 —— 只看 input/textarea/select/可编辑区, 不含 button:
+ *  工具栏按钮获得焦点后按方向键仍应翻页。 */
+function isKeyboardHotkeyBlocked(): boolean {
+  const activeElement = document.activeElement as HTMLElement | null
+  const tagName = activeElement?.tagName?.toLowerCase()
+  return tagName === 'input' || tagName === 'textarea' || tagName === 'select'
+    || Boolean(activeElement?.isContentEditable)
+}
+
+/** 鼠标/滚轮: 事件落在可交互控件上时不当作快捷键(实现见 utils/readerHotkeys)。
+ *
+ *  中键/侧键用的是 isMouseButtonHotkeyBlocked —— 规则与滚轮不同, 原因见那里的说明。 */
+
+function handleKeydown(e: KeyboardEvent) {
+  if (isKeyboardHotkeyBlocked()) return
+
+  // 矩阵里没有换绑的按键不拦截: 用户在设置里把某键设为「不操作」后,
+  // 该键应彻底交还浏览器, 而不是被静默吞掉。
+  if (dispatchHotkey(hotkeyIdFromEvent(e))) e.preventDefault()
+}
+
+/** 该鼠标键在当前模式下是否有**可执行**的快捷键动作(仅解析, 不执行)。
+ *
+ *  判定逻辑在 utils/readerHotkeys 的 mouseButtonHotkeyAction —— 抽到那里是为了
+ *  能被单测直接锁住, 而不是让测试复刻一份同样的代码(改了实现测试也不失败)。 */
+function mouseButtonHotkeyAction(e: MouseEvent): HotkeyActionId | null {
+  return resolveMouseButtonHotkeyAction(store.hotkeyBindings, e, readingModeKind.value)
+}
+
+/** 鼠标键(中键/侧键)触发快捷键。
+ *
+ *  左右键不参与(见 utils/readerHotkeys 的说明): 它们是点击翻页与右键菜单的
+ *  载体。中键/侧键在浏览器里还有默认行为 —— 中键自动滚动在 mousedown 起步,
+ *  侧键前进/后退在松开时触发 —— 因此命中的按键要在 mousedown、mouseup、
+ *  auxclick 三处一致地拦掉。 */
+function handleReaderMouseDown(e: MouseEvent) {
+  if (isMouseButtonHotkeyBlocked(e.target)) return
+  if (!mouseButtonHotkeyAction(e)) return
+
+  // 鼠标键已绑定到一个真实动作 → 这一次按下归应用所有。
+  //
+  // 为什么不能只按 dispatchHotkey 的返回值来决定是否拦截:
+  //  弹层打开时翻页类动作会被**合法地拒绝**(返回 false), 但按键的默认行为
+  //  (侧键导航)仍必须拦掉, 否则对着目录按侧键会把整个页面导航走。
+  //
+  // 为什么必须 stopPropagation(用户反馈「侧键已录入但按了没反应」的根因):
+  //  事件先到 window 捕获阶段的这里, 执行 nextPage → 启动 rAF 翻页补间;
+  //  若不停止传播, 它会继续冒泡到滚动容器上的 @mousedown=
+  //  handleManualReadingInput, 后者调用 cancelPageScrollAnimation ——
+  //  补间每帧才写 scrollTop, 被取消后位置一帧都没动, 表现就是「按了没反应」。
+  //  键盘翻页不经过 @mousedown, 所以只有鼠标键会失灵。
+  //  实测: 不停止传播时补间被取消(位置 0 → 0), 停止后补间跑完 62 帧(0 → 200)。
+  e.preventDefault()
+  e.stopPropagation()
+  dispatchHotkey(hotkeyIdFromMouseEvent(e))
+}
+
+/** 中键点击链接会在新标签打开(auxclick 默认行为), 命中绑定时一并拦掉。 */
+function handleReaderAuxClick(e: MouseEvent) {
+  if (isMouseButtonHotkeyBlocked(e.target)) return
+  if (!mouseButtonHotkeyAction(e)) return
+  e.preventDefault()
+}
+
+/** 侧键的前进/后退导航在松开时触发(Chromium 行为, 见 MDN 与 three.js
+ *  issue #15713), 只拦 mousedown 不够。
+ *
+ *  用捕获阶段: 要抢在 document 冒泡阶段的选区菜单监听之前, 且中键/侧键的松开
+ *  本就不该被当成一次文本选择。 */
+function handleReaderMouseUpForHotkey(e: MouseEvent) {
+  if (isMouseButtonHotkeyBlocked(e.target)) return
+  if (!mouseButtonHotkeyAction(e)) return
+  e.preventDefault()
+  e.stopPropagation()
 }
 
 // Toolbar actions
@@ -2510,14 +2813,42 @@ async function waitForChapterListReady() {
 }
 
 let horizontalWheelLockUntil = 0
+/** 滚轮快捷键的节流: 一次物理滚动会产生一串 wheel 事件, 不节流会连续翻很多页。 */
+let wheelHotkeyLockUntil = 0
 
 function handleReaderWheel(event: WheelEvent) {
-  if (store.activePanel) return
+  if (isPointerHotkeyBlocked(event.target)) return
 
-  const target = event.target as HTMLElement | null
-  if (target?.closest('input, textarea, select, button, .reader-context-menu')) {
-    return
+  // 滚轮快捷键优先于内置滚轮行为(分页模式翻页 / Ctrl+滚轮改字号):
+  //  用户在设置里把滚轮绑成某个动作, 就该执行那个动作, 否则这个绑定永远
+  //  抢不过内置行为、形同虚设。Ctrl+滚轮已被字号缩放占用, 这里让路。
+  //
+  //  刻意跳过弹层打开的情形: 面板里滚轮必须归面板自己滚动(目录/设置都是长
+  //  列表)。键盘在弹层打开时仍放行目录/设置/搜索/全屏, 滚轮没跟这条规则对齐
+  //  —— 代价是把滚轮绑到「目录」后不能用滚轮关掉自己打开的面板, 但换来的是
+  //  面板内滚动始终可用, 这个取舍更划算。
+  //
+  //  只有在动作**真的执行了**才拦: 绑到「不操作」、或需要滚动容器而容器尚未
+  //  就绪时 dispatchHotkey 返回 false, 此时必须放行给下面的内置滚动 —— 否则
+  //  滚轮既没触发动作、又被 preventDefault 吞掉, 页面就再也滚不动了。
+  if (!store.activePanel) {
+    const wheelKeyId = hotkeyIdFromWheelEvent(event)
+    if (wheelKeyId && store.hotkeyBindings[wheelKeyId]?.length) {
+      const now = Date.now()
+      // 节流窗口内: 这次滚轮同属一串连续事件, 一并拦掉以免漏给内置行为。
+      if (now < wheelHotkeyLockUntil) {
+        event.preventDefault()
+        return
+      }
+      if (dispatchHotkey(wheelKeyId)) {
+        wheelHotkeyLockUntil = now + 180
+        event.preventDefault()
+        return
+      }
+    }
   }
+
+  if (store.activePanel) return
 
   // 左右分页模式: 滚轮/触控板横向滑动手势直接翻页。
   // 不受「点击翻页: 禁用」影响, 避免禁用后除键盘外无法翻页。
@@ -2559,6 +2890,11 @@ onMounted(async () => {
   loadSavedReadingPosition()
   window.addEventListener('keydown', handleKeydown)
   window.addEventListener('wheel', handleReaderWheel, { passive: false })
+  // 鼠标键(中键/侧键)可绑快捷键。捕获阶段: 要抢在 WebView2 的中键自动滚动与
+  // 侧键前进后退之前消费掉这次按下。
+  window.addEventListener('mousedown', handleReaderMouseDown, true)
+  window.addEventListener('auxclick', handleReaderAuxClick, true)
+  window.addEventListener('mouseup', handleReaderMouseUpForHotkey, true)
   window.addEventListener('click', closeReaderContextMenu)
   // 书源图片气泡的 click 脚本(捕获阶段, 抢在翻页逻辑之前)
   document.addEventListener('click', handleSourceImageClick, true)
@@ -2572,6 +2908,12 @@ onMounted(async () => {
     window.addEventListener('pagehide', handlePageHide)
     window.addEventListener('beforeunload', handleBeforeUnload)
     document.addEventListener('visibilitychange', handleVisibilityChange)
+    // 悬停展开: 桌面指针环境启用。迷你模式不启用(见 supportsHoverPointer 的注释),
+    // 因此还要监听 miniMode 变化 —— 切进小窗时退出悬停模式, 切回来再恢复。
+    hoverMediaQuery = window.matchMedia('(hover: hover) and (pointer: fine)')
+    hoverMediaQuery.addEventListener('change', syncHoverPointerSupport)
+    syncHoverPointerSupport()
+    hoverSupportStop = watch(() => appStore.miniMode, syncHoverPointerSupport)
     store.fetchVoices()
   applySystemTheme(store.isNight ? 'dark' : appStore.theme, store.currentTheme.body)
   if (typeof window !== 'undefined' && window.speechSynthesis) {
@@ -2602,6 +2944,9 @@ onUnmounted(() => {
   cancelPageScrollAnimation(scrollContainerRef.value)
   window.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('wheel', handleReaderWheel)
+  window.removeEventListener('mousedown', handleReaderMouseDown, true)
+  window.removeEventListener('auxclick', handleReaderAuxClick, true)
+  window.removeEventListener('mouseup', handleReaderMouseUpForHotkey, true)
   window.removeEventListener('click', closeReaderContextMenu)
   document.removeEventListener('click', handleSourceImageClick, true)
   window.removeEventListener('message', handleSourcePanelMessage)
@@ -2618,6 +2963,14 @@ onUnmounted(() => {
   if (persistPositionTimer) clearTimeout(persistPositionTimer)
   if (legadoPositionRestoreTimer) clearTimeout(legadoPositionRestoreTimer)
   if (refreshOfflineCacheStateTimer) clearTimeout(refreshOfflineCacheStateTimer)
+  hoverSupportStop?.()
+  hoverSupportStop = null
+  hoverMediaQuery?.removeEventListener('change', syncHoverPointerSupport)
+  hoverMediaQuery = null
+  hoverPointerInZone = false
+  hoverPointerOnControls = false
+  hoverRevealSuppressed = false
+  cancelHoverHide()
   clearRestoreStabilizers()
   disposeSelection()
   disposeContinuousReading()
@@ -3255,6 +3608,9 @@ watch(
   box-sizing: border-box;
   padding-top: var(--safe-area-top);
   z-index: 50;
+  /* 文字色由模板 inline style 给出(见 .reader-drawer 的 :style), 作为抽屉内
+   * currentColor 取色的兜底 —— 目前依赖"每个子组件自己设 color: theme.fontColor",
+   * 将来新增子组件忘记设置时, 文字色不会掉回应用主题的 --color-text。 */
   box-shadow: 4px 0 24px rgba(0,0,0,0.15);
   transition: background 0.3s;
 }
@@ -3292,13 +3648,19 @@ watch(
 }
 
 .selection-menu-actions button {
-  border: none;
+  border: 1px solid color-mix(in srgb, var(--color-primary) 34%, transparent);
   border-radius: 10px;
   padding: 10px 12px;
-  background: var(--color-primary);
-  color: #fff;
+  /* 划词菜单挂在 .reader-view 内, 文字的 color 来自 chromeTheme.fontColor
+   * (见模板 :style), 所以 currentColor 取到的就是阅读主题文字色。 */
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  color: currentColor;
   font-size: 13px;
   cursor: pointer;
+}
+
+.selection-menu-actions button:hover {
+  background: color-mix(in srgb, var(--color-primary) 20%, transparent);
 }
 
 .selection-menu-actions button:first-child {

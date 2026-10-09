@@ -82,6 +82,11 @@ export const HOTKEY_KEYS: HotkeyKeyDefinition[] = [
   { id: 'Escape', label: 'Esc' },
   { id: 'F11', label: 'F11' },
   { id: 'Control+f', label: 'Ctrl+F' },
+  { id: 'MouseMiddle', label: '鼠标中键' },
+  { id: 'Mouse4', label: '鼠标侧键1' },
+  { id: 'Mouse5', label: '鼠标侧键2' },
+  { id: 'WheelUp', label: '滚轮上' },
+  { id: 'WheelDown', label: '滚轮下' },
 ]
 
 export const HOTKEY_ACTION_MAP: Record<string, HotkeyAction> = Object.fromEntries(
@@ -117,6 +122,11 @@ const KEY_LABELS: Record<string, string> = {
   End: 'End',
   Tab: 'Tab',
   Control: 'Ctrl',
+  MouseMiddle: '鼠标中键',
+  Mouse4: '鼠标侧键1',
+  Mouse5: '鼠标侧键2',
+  WheelUp: '滚轮上',
+  WheelDown: '滚轮下',
 }
 
 /** 主键标准化: 空格统一成 Space, 单字符统一小写(避免 Shift 造成大小写抖动)。 */
@@ -153,6 +163,48 @@ export function hotkeyLabel(keyId: string): string {
   const modifiers = parts.slice(0, -1).map((name) => MODIFIER_LABELS[name] || name)
   return [...modifiers, label].join('+')
 }
+/** 事件目标的最小形状。抽成这样是为了在无 DOM 的环境里可测 —— 本仓库的 vitest
+ *  没有 jsdom, 而下面两个判定正是「侧键失灵」这类故障的根源, 必须锁住。
+ *
+ *  参数类型写成 EventTarget 的宽化形式: 真实调用点传的是 MouseEvent.target,
+ *  而它还有 appendChild 之类的成员, 用结构更窄的接口会让调用方过不了类型检查。 */
+interface HotkeyTargetLike {
+  isContentEditable?: boolean
+  closest?: (selectors: string) => unknown
+}
+
+/** 把任意事件目标收窄成可判定的形状(非元素目标如 window 直接当无匹配)。 */
+function asHotkeyTarget(target: unknown): HotkeyTargetLike | null {
+  if (!target || typeof target !== 'object') return null
+  return target as HotkeyTargetLike
+}
+
+/** 滚轮: 鼠标悬停在可交互控件上时不当作快捷键。
+ *
+ *  这里包含 button 是正确的 —— 鼠标停在面板/按钮上时, 滚动必须归它们自己
+ *  (目录与设置都是长列表), 否则弹出面板滚不动。 */
+export function isPointerHotkeyBlocked(target: unknown): boolean {
+  const element = asHotkeyTarget(target)
+  if (!element?.closest) return false
+  return Boolean(element.closest('input, textarea, select, button, .reader-context-menu'))
+}
+
+/** 中键/侧键: 只排除「正在输入文本」, **不**包含 button 与右键菜单。
+ *
+ *  与滚轮的规则刻意不同。中键/侧键是独立按键: 鼠标恰好停在某个按钮上, 并不表示
+ *  用户想操作那个按钮。若沿用滚轮那套规则, 会造成两个真实故障:
+ *    1. 设置面板里录入侧键时, 鼠标必然停在「录入按键」那个 <button> 上 —— 事件被
+ *       直接放弃, 于是**不阻止默认行为**, 侧键触发浏览器前进/后退; 本应用用 hash
+ *       路由, hash 一变就跳路由、设置面板被卸载, 用户根本录不完一个侧键。
+ *    2. 阅读页鼠标停在工具栏按钮上时, 已绑定的侧键快捷键整个失效。
+ *  只挡输入框与可编辑区 —— 那种场景下按键确实该归文本编辑。 */
+export function isMouseButtonHotkeyBlocked(target: unknown): boolean {
+  const element = asHotkeyTarget(target)
+  if (!element?.closest) return false
+  if (element.isContentEditable) return true
+  return Boolean(element.closest('input, textarea, select'))
+}
+
 /** 按键 → 已绑定动作列表。顺序有意义: 靠前的优先被选中。 */
 export type HotkeyBindings = Record<string, HotkeyActionId[]>
 
@@ -172,6 +224,20 @@ export const DEFAULT_HOTKEY_BINDINGS: HotkeyBindings = {
   'Control+f': ['search'],
 }
 
+/** 修饰键前缀 + 主键 → 标识。顺序固定(见上), 保证同一组合只有一种写法。 */
+function withModifiers(
+  base: string,
+  event: { ctrlKey?: boolean; metaKey?: boolean; altKey?: boolean; shiftKey?: boolean },
+): string | null {
+  const modifiers: string[] = []
+  if (event.ctrlKey) modifiers.push('Control')
+  if (event.altKey) modifiers.push('Alt')
+  if (event.shiftKey) modifiers.push('Shift')
+  if (event.metaKey) modifiers.push('Meta')
+  const id = [...modifiers, base].join('+')
+  return isValidHotkeyId(id) ? id : null
+}
+
 /** 从键盘事件取出按键标识。
  *
  *  接受**任意键**, 让用户能按自己的习惯录入(见设置界面的「录入按键」)。
@@ -188,13 +254,74 @@ export function hotkeyIdFromEvent(event: {
   if (!raw || BARE_MODIFIER_KEYS.has(raw)) return null
   const base = normalizeBaseKey(raw)
   if (!base) return null
-  const modifiers: string[] = []
-  if (event.ctrlKey) modifiers.push('Control')
-  if (event.altKey) modifiers.push('Alt')
-  if (event.shiftKey) modifiers.push('Shift')
-  if (event.metaKey) modifiers.push('Meta')
-  const id = [...modifiers, base].join('+')
-  return isValidHotkeyId(id) ? id : null
+  return withModifiers(base, event)
+}
+
+/* ─── 鼠标键位 ───
+ *  左键(button 0)与右键(button 2)刻意不参与: 它们是点击翻页、呼出控件与
+ *  自定义右键菜单的载体, 绑成快捷键会把日常操作全劫持掉。
+ *  可用的是中键、两个侧键与滚轮方向。 */
+
+/** DOM `MouseEvent.button` → 标识。未列出的按键(左/右/未知)返回 undefined。 */
+const MOUSE_BUTTON_IDS: Record<number, string> = {
+  1: 'MouseMiddle',
+  3: 'Mouse4',
+  4: 'Mouse5',
+}
+
+/** 会被"松开时触发默认行为"的鼠标键位(中键自动滚动、侧键前进后退)。
+ *
+ *  滚轮不在内 —— 它没有 mousedown/mouseup 语义, 不存在"按住改主意"的窗口。 */
+export const MOUSE_BUTTON_KEY_IDS = ['MouseMiddle', 'Mouse4', 'Mouse5'] as const
+
+/** 去掉修饰键前缀, 只留主键。`Control+Mouse4` → `Mouse4`。
+ *
+ *  为什么"录入鼠标键"的场景必须按裸键名处理:
+ *    用户按 Ctrl+侧键1 录入, 绑定的是 `Control+Mouse4`; 但松开时通常先松 Ctrl
+ *    再松侧键 —— 那一刻 mouseup 的标识退化成裸的 `Mouse4`。阅读页按 `Mouse4`
+ *    查绑定会查不到, 于是**不拦截**, 侧键照旧触发浏览器前进/后退; 本应用用 hash
+ *    路由, hash 一变就跳路由、设置面板被卸载。所以录制后的抑制窗口必须记裸键名,
+ *    否则永远匹配不上退化的标识。 */
+export function bareMouseButtonKeyId(keyId: string): string {
+  const parts = keyId.split('+')
+  return parts[parts.length - 1] || ''
+}
+
+/** 该键位是否属于鼠标键(中键/两侧键), 容忍修饰键前缀。 */
+export function isMouseButtonKeyId(keyId: string): boolean {
+  return (MOUSE_BUTTON_KEY_IDS as readonly string[]).includes(bareMouseButtonKeyId(keyId))
+}
+
+/** 从鼠标按下事件取出按键标识(中键 / 侧键)。 */
+export function hotkeyIdFromMouseEvent(event: {
+  button: number
+  ctrlKey?: boolean
+  metaKey?: boolean
+  altKey?: boolean
+  shiftKey?: boolean
+}): string | null {
+  const base = MOUSE_BUTTON_IDS[event.button]
+  if (!base) return null
+  return withModifiers(base, event)
+}
+
+/** 从滚轮事件取出方向标识。
+ *
+ *  Ctrl+滚轮已被阅读页的「字号缩放」占用(见 handleReaderFontSizeWheel),
+ *  这里必须让路, 否则设置字号会同时触发绑定的滚轮动作。 */
+export function hotkeyIdFromWheelEvent(event: {
+  deltaX: number
+  deltaY: number
+  ctrlKey?: boolean
+  metaKey?: boolean
+  altKey?: boolean
+  shiftKey?: boolean
+}): string | null {
+  if (event.ctrlKey) return null
+  // 触控板横向滑动取主轴: 两轴都非零时以绝对值大的为准。
+  const delta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX
+  if (!Number.isFinite(delta) || delta === 0) return null
+  return withModifiers(delta > 0 ? 'WheelDown' : 'WheelUp', event)
 }
 
 /** 弹层(目录/设置/书架/换源等)打开时, 哪些动作依然要执行。
@@ -217,6 +344,24 @@ export function isActionAllowedWhilePanelOpen(action: HotkeyActionId): boolean {
   return ACTIONS_ALLOWED_WHILE_PANEL_OPEN.includes(action)
 }
 
+/* ─── 录入态 ───
+ *  设置面板点开「录入按键」后, 运行时的快捷键派发必须整体让路。
+ *
+ *  为什么不能只靠「弹层打开」拦截: 面板开关类动作(catalog/settings/search/
+ *  fullscreen)在弹层打开时是**故意放行**的, 否则用同一个键关不掉自己打开的面板。
+ *  于是「把鼠标侧键改绑到目录」时, 按侧键会先被 ReaderView 的处理器(注册更早、
+ *  同为 window 捕获阶段)接走、顺手切换面板, 再把设置面板连根卸载。
+ *  录入与运行是两个互斥状态, 用显式标志表达, 比在允许列表里做特例更可靠。 */
+let hotkeyCaptureActive = false
+
+export function setHotkeyCaptureActive(active: boolean) {
+  hotkeyCaptureActive = active
+}
+
+export function isHotkeyCaptureActive(): boolean {
+  return hotkeyCaptureActive
+}
+
 /** 取出该按键在当前模式下应执行的动作(第一个适用者); 无适用动作返回 null。 */
 export function resolveHotkeyAction(
   bindings: HotkeyBindings,
@@ -231,6 +376,39 @@ export function resolveHotkeyAction(
     if (action.scope === 'both' || action.scope === mode) return id
   }
   return null
+}
+
+/** 该鼠标键在当前模式下是否有**可执行**的快捷键动作(仅解析, 不执行)。
+ *
+ *  用它决定是否接管鼠标键的默认行为: 只有用户真的把某个键绑上了动作才拦,
+ *  未绑定的键保留浏览器原本的行为(侧键前进/后退、中键自动滚动)。
+ *
+ *  抽成正式导出函数而不是在视图里内联, 是为了能被单测直接锁住 —— 否则测试只能
+ *  复刻一份同样的判定, 改了实现测试也不会失败(那种"复刻式测试"是自欺)。
+ *
+ *  刻意**不**用「最近一次消费的时间戳」做保护窗口。时间窗有两个绕不过去的
+ *  缺陷: 一是不区分按键 —— 中键被消费后同一窗口内松开未绑定的侧键也会被拦;
+ *  二是覆盖不了长按 —— 按住超过窗口长度再松开就直接漏掉, 侧键照旧触发导航。
+ *  绑定状态本身才是唯一可靠的依据。 */
+export function mouseButtonHotkeyAction(
+  bindings: HotkeyBindings,
+  event: {
+    button: number
+    ctrlKey?: boolean
+    metaKey?: boolean
+    altKey?: boolean
+    shiftKey?: boolean
+  },
+  mode: ReadingModeKind,
+): HotkeyActionId | null {
+  // 录入态: 这次的鼠标键属于「设置快捷键」, 不当作运行时快捷键。
+  if (hotkeyCaptureActive) return null
+  const keyId = hotkeyIdFromMouseEvent(event)
+  if (!keyId) return null
+  const action = resolveHotkeyAction(bindings, keyId, mode)
+  // 'none' = 用户显式要求该键不做事, 与键盘一致: 不拦截, 交还浏览器。
+  if (!action || action === 'none') return null
+  return action
 }
 
 /** 校验并归一化持久化的绑定。

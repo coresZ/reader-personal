@@ -219,8 +219,8 @@ watch(
 }
 
 .tab-btn.active {
-  background: var(--color-primary);
-  color: #fff;
+  background: var(--color-primary-soft-bg);
+  color: var(--color-primary-soft-text);
 }
 
 .overview-pane,
@@ -376,9 +376,9 @@ watch(
 }
 
 .mini-btn.primary {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
-  color: #fff;
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
 }
 
 .mini-btn:disabled {
@@ -391,7 +391,8 @@ watch(
 }
 
 .mini-btn.primary:hover:not(:disabled) {
-  background: var(--color-primary-dark);
+  background: var(--color-primary-soft-bg-hover);
+  border-color: var(--color-primary);
 }
 
 @media (max-width: 560px) {

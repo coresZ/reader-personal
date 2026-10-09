@@ -314,9 +314,14 @@ function setField(field: FieldDef, raw: string) {
 }
 
 .rule-tab.active {
-  background: var(--color-primary);
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
+}
+
+.rule-tab.active:hover {
+  background: var(--color-primary-soft-bg-hover);
   border-color: var(--color-primary);
-  color: #fff;
 }
 
 .rule-fields {
@@ -379,9 +384,14 @@ function setField(field: FieldDef, raw: string) {
 }
 
 .toggle-btn.on {
-  background: var(--color-primary);
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
+}
+
+.toggle-btn.on:hover {
+  background: var(--color-primary-soft-bg-hover);
   border-color: var(--color-primary);
-  color: #fff;
 }
 
 .rule-empty {

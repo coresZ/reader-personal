@@ -223,12 +223,15 @@ const emit = defineEmits<{
   transition: transform var(--duration-fast);
 }
 
+/* 开启态: 淡主色轨道 + 主色圆点(圆点原来固定白色, 会让淡橘底上的圆点消失)。 */
 .toggle input:checked + .toggle-slider {
-  background: var(--color-primary);
+  background: var(--color-primary-soft-bg);
+  box-shadow: inset 0 0 0 1px var(--color-primary-soft-border);
 }
 
 .toggle input:checked + .toggle-slider::before {
   transform: translateX(16px);
+  background: var(--color-primary-soft-text);
 }
 
 .icon-btn {

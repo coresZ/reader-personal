@@ -1290,13 +1290,14 @@ async function removeFromShelf() {
 }
 
 .action-btn.primary {
-  background: var(--color-primary);
-  color: white;
-  border-color: var(--color-primary);
+  background: var(--color-primary-soft-bg);
+  color: var(--color-primary-soft-text);
+  border-color: var(--color-primary-soft-border);
 }
 
 .action-btn.primary:hover {
-  background: var(--color-primary-dark);
+  background: var(--color-primary-soft-bg-hover);
+  border-color: var(--color-primary);
 }
 
 /* ─── 编辑书籍信息 ───

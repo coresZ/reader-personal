@@ -187,9 +187,9 @@ function formatTime(ts: number) {
 }
 
 .action-btn.primary {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
-  color: #fff;
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
 }
 
 .mini-btn {
@@ -216,10 +216,16 @@ function formatTime(ts: number) {
   height: 16px;
 }
 
-.action-btn:hover,
+.action-btn:hover:not(.primary),
 .mini-btn:hover,
 .icon-btn:hover {
   background: var(--color-bg-hover);
+}
+
+/* 同 SourceManagerHeader: 不给主按钮单独兜底, 它的淡橙底会被上面那条抹掉。 */
+.action-btn.primary:hover {
+  background: var(--color-primary-soft-bg-hover);
+  border-color: var(--color-primary);
 }
 
 .fade-enter-active,

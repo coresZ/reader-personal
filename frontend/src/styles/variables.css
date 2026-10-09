@@ -32,6 +32,26 @@
   --color-selected-bg-hover: color-mix(in srgb, var(--color-primary) 19%, transparent);
   --color-selected-border: color-mix(in srgb, var(--color-primary) 42%, transparent);
 
+  /* 主操作/选中按钮的"淡底 + 主色文字"三件套, 取代过去"整块主色填充 + 白字"。
+   * 旧做法白字压 #c56f35 只有约 3.7:1, 不到 WCAG AA; 且一整块高饱和橙在浅色
+   * 面板里分量过重, 会把周围浅色控件的层次压平。
+   * 混合比例 60/40 是算出来的: 浅色主题 #835131 在淡橙底上 5.3:1, 深色主题
+   * #e3bb9f 在暗底上 8.2:1, 两边都过 AA。比例再高会让浅色主题跌破 4.5:1
+   * (80% 只有约 3.8:1), 所以不要往上调。
+   * 注意: 这三个令牌依赖 --color-text, 只适用于**应用主题**下的界面。
+   * 阅读页有自己独立的 9 套主题(且会覆盖 --color-primary), 在那边必须改用
+   * currentColor 派生, 否则应用浅色主题 + 暗夜阅读主题的组合只剩 2.6:1。 */
+  --color-primary-soft-bg: var(--color-selected-bg);
+  --color-primary-soft-bg-hover: var(--color-selected-bg-hover);
+  --color-primary-soft-text: color-mix(in srgb, var(--color-primary) 60%, var(--color-text));
+  --color-primary-soft-border: var(--color-selected-border);
+  /* 阅读页不能复用上面四个: 那边有 9 套独立主题, 且 ReaderView 在 .reader-view
+   * 上覆盖 --color-primary、在容器上挂 color: theme.fontColor。
+   * 自定义属性是在**声明元素**上完成 var() 替换后才继承的 —— 在 :root 声明
+   * 一份派生值, 子树上再改 --color-primary 也不会让它重算。所以阅读页的按钮
+   * 一律就地写 color-mix(in srgb, var(--color-primary) 14%, transparent),
+   * 文字用 currentColor(跟随阅读主题 fontColor)。 */
+
   /* Accent */
   --color-accent: #347f92;
   --color-success: #27815f;

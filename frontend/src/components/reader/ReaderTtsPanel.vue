@@ -176,13 +176,24 @@ defineEmits<{
 }
 
 .tts-btns button {
-  background: var(--color-primary);
-  color: white;
-  border: none;
+  /* 同 ReaderSearchPanel: 淡主色底 + currentColor 文字, 跟随阅读主题。 */
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  color: currentColor;
+  border: 1px solid color-mix(in srgb, var(--color-primary) 34%, transparent);
   padding: 10px 18px;
   border-radius: 10px;
   cursor: pointer;
   min-width: 0;
+}
+
+.tts-btns button:hover {
+  background: color-mix(in srgb, var(--color-primary) 20%, transparent);
+}
+
+/* 模板里按钮有 :disabled="isLoading", 但没有对应用户可见的状态变化。 */
+.tts-btns button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .tts-progress {
@@ -232,11 +243,15 @@ defineEmits<{
 .tts-stepper button {
   width: 36px;
   height: 36px;
-  border: none;
+  border: 1px solid color-mix(in srgb, var(--color-primary) 34%, transparent);
   border-radius: 10px;
-  background: var(--color-primary);
-  color: #fff;
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  color: currentColor;
   cursor: pointer;
+}
+
+.tts-stepper button:hover {
+  background: color-mix(in srgb, var(--color-primary) 20%, transparent);
 }
 
 .tts-label {
@@ -267,9 +282,11 @@ defineEmits<{
 }
 
 .tts-timer-actions button.active {
-  background: var(--color-selected-bg);
-  border-color: var(--color-selected-border);
-  color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
+  /* 同 ReaderTtsPanel 其余按钮: 文字跟随阅读主题, 不能用主色(浅色阅读主题下
+   * 主色与底色亮度接近, 只有约 2.3:1)。 */
+  color: currentColor;
   font-weight: 600;
 }
 

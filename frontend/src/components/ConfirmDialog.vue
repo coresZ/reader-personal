@@ -82,14 +82,18 @@ function cancel() {
 }
 
 .confirm-btn.primary {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
-  color: #fff;
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
 }
 
 .confirm-dialog.danger .confirm-btn.primary {
-  background: var(--color-danger);
-  border-color: var(--color-danger);
+  /* 危险操作也要覆盖 color: 84-88 行把文字换成了主色系 soft-text, 若此处只换
+   * 底色, 就会得到"红底 + 深棕字"(浅色 1.5:1 / 深色 2.5:1, 几乎不可见)。
+   * 与主色按钮同风格: 淡红底 + 红字压深, 浅色 5.2:1 / 深色 4.5:1, 都过 AA。 */
+  background: color-mix(in srgb, var(--color-danger) 12%, transparent);
+  border-color: color-mix(in srgb, var(--color-danger) 34%, transparent);
+  color: color-mix(in srgb, var(--color-danger) 75%, var(--color-text));
 }
 
 .confirm-btn:hover {
@@ -97,12 +101,19 @@ function cancel() {
 }
 
 .confirm-btn.primary:hover {
-  background: var(--color-primary-dark);
+  background: var(--color-primary-soft-bg-hover);
+  border-color: var(--color-primary);
 }
 
 .confirm-dialog.danger .confirm-btn.primary:hover {
-  background: var(--color-danger);
-  opacity: 0.9;
+  /* 不能沿用"纯红底 + opacity": 上面的文字本身就是红系, 红底压红字读不出来。 */
+  background: color-mix(in srgb, var(--color-danger) 20%, transparent);
+  border-color: var(--color-danger);
+  /* hover 把文字里的正文色占比从 25% 提到 35%。底色压深后(20% 红底)原来的
+   * 75% 红字在暗色主题只有 4.13:1, 不到 AA; 提到 65% 红/35% 正文色后
+   * 浅色 5.40:1、暗色 4.73:1, 两个主题都过。常态(12% 底)仍用上面的 75% 配色,
+   * 浅色 5.2:1 / 暗色 4.5:1 已达标, 不必动。 */
+  color: color-mix(in srgb, var(--color-danger) 65%, var(--color-text));
 }
 
 .fade-enter-active,

@@ -199,6 +199,15 @@ pub fn merge(state: WindowState, geometry: Option<Geometry>, maximized: bool) ->
 
 /// 读取窗口当前状态并合并到已有状态上。
 pub fn capture(window: &WebviewWindow, previous: Option<WindowState>) -> Option<WindowState> {
+    // 全屏(阅读页 F11)时读到的是整屏尺寸, 与最大化同理, 记下来会让下次启动
+    // 直接以整屏尺寸建窗。全屏是临时的显示状态而非用户的窗口偏好, 因此整份
+    // 几何保持不动 —— 退出全屏后 Resized 事件会再把真实几何写回来。
+    // 返回 previous 本身(而不是 unwrap_or_default): 首次运行尚无历史状态时
+    // 不该凭空造一份默认几何去写盘。
+    if window.is_fullscreen().unwrap_or(false) {
+        return previous;
+    }
+
     let state = previous.unwrap_or_default();
     let maximized = window.is_maximized().unwrap_or(false);
     let geometry = read_geometry(window);

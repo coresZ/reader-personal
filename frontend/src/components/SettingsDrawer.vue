@@ -319,14 +319,26 @@
                 <label for="desktop-background-opacity">背景透明度</label>
                 <input
                   id="desktop-background-opacity"
+                  class="settings-slider"
                   type="range"
                   min="0"
                   max="1"
-                  step="0.05"
+                  :step="READER_BACKGROUND_OPACITY_STEP"
                   :value="readerStore.config.backgroundOpacity"
                   @input="handleBackgroundOpacityChange"
                 >
-                <output>{{ Math.round(readerStore.config.backgroundOpacity * 100) }}%</output>
+                <label class="opacity-input-wrap" title="可直接输入 0-100 的数值">
+                  <input
+                    class="opacity-input"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="1"
+                    :value="readerOpacityToPercent(readerStore.config.backgroundOpacity)"
+                    @change="applyBackgroundOpacityPercent(($event.target as HTMLInputElement).value, $event.target as HTMLInputElement)"
+                  >
+                  <span class="opacity-unit">%</span>
+                </label>
               </div>
             </div>
             <div class="setting-switch-row">
@@ -395,8 +407,11 @@ import { useAppStore } from '../stores/app'
 import { useBookshelfStore } from '../stores/bookshelf'
 import { useReaderStore } from '../stores/reader'
 import {
+  READER_BACKGROUND_OPACITY_STEP,
   normalizeReaderBackgroundOpacity,
+  percentToReaderOpacity,
   prepareReaderBackgroundImage,
+  readerOpacityToPercent,
 } from '../utils/readerBackground'
 import { captureBossKey, formatBossKey } from '../utils/bossKey'
 
@@ -619,6 +634,27 @@ async function handleBackgroundImageChange(event: Event) {
 function handleBackgroundOpacityChange(event: Event) {
   const value = (event.target as HTMLInputElement).valueAsNumber
   readerStore.updateConfig('backgroundOpacity', normalizeReaderBackgroundOpacity(value))
+}
+
+/** 百分比输入框: 非数字输入不写回(保持原值), 越界自动夹到 0-100。
+ *  与阅读页背景图共用 percentToReaderOpacity 的边界规则。
+ *
+ *  无论接受与否, 都把手动输入框重新对齐到真实值: 输入框是单向绑定(`:value`),
+ *  store 值没变时 Vue 不重写 DOM, 于是清空/输入 150/输入 -5 会让框里停着非法
+ *  文本而实际透明度没变, UI 与真实值脱节。 */
+function applyBackgroundOpacityPercent(raw: string, input: HTMLInputElement) {
+  const next = percentToReaderOpacity(raw)
+  if (next === null) {
+    syncBackgroundOpacityInput(input, readerStore.config.backgroundOpacity)
+    return
+  }
+  readerStore.updateConfig('backgroundOpacity', next)
+  syncBackgroundOpacityInput(input, next)
+}
+
+function syncBackgroundOpacityInput(input: HTMLInputElement, applied: number) {
+  const actual = String(readerOpacityToPercent(applied))
+  if (input.value !== actual) input.value = actual
 }
 
 function removeBackgroundImage() {
@@ -1024,14 +1060,24 @@ async function handleCheckVersionUpdate() {
   transform: scale(0.97);
 }
 
+/* 主操作走"淡底 + 主色文字/描边", 而不是一整块高饱和橙压白字。
+ * 两个理由: 一是整块纯主色在浅色面板里分量过重, 把周围浅色控件的层次全压平;
+ * 二是白字压在 #c56f35 上对比度只有约 4:1, 观感发闷、显脏。
+ * 权重靠"有彩度 vs 无彩度"区分(对比旁边的 .action-btn 白底灰边), 主次依旧清楚。
+ * 文字色用 primary 与 text 的混合色: 浅色主题下比纯 primary 更暗、深色主题下
+ * 自动偏向浅橙, 两个主题都能保证可读性, 不必分别写死。 */
 .action-btn.primary {
-  background: var(--color-primary);
-  color: white;
-  border-color: var(--color-primary);
+  background: var(--color-selected-bg);
+  /* 60% 主色 + 40% 正文色: 浅色主题 #835131 在淡橙底上 5.3:1, 深色主题 #e3bb9f
+   * 在暗底上 8.5:1, 两边都过 AA。调高比例会让浅色主题跌破 4.5:1
+   * (80% 只有 3.8:1), 所以这个值不要再往上抬。 */
+  color: color-mix(in srgb, var(--color-primary) 60%, var(--color-text));
+  border-color: var(--color-selected-border);
 }
 
 .action-btn.primary:hover {
-  background: var(--color-primary-dark);
+  background: var(--color-selected-bg-hover);
+  border-color: var(--color-primary);
 }
 
 .action-btn.danger {
@@ -1155,22 +1201,113 @@ async function handleCheckVersionUpdate() {
 
 .background-opacity-row {
   display: grid;
-  grid-template-columns: auto minmax(100px, 1fr) 38px;
+  grid-template-columns: auto minmax(100px, 1fr) auto;
   align-items: center;
   gap: var(--space-3);
   color: var(--color-text-secondary);
   font-size: var(--text-xs);
 }
 
-.background-opacity-row input {
+/* 与阅读页设置里的"字体大小"滑块同款: 4px 圆角轨道 + 14px 圆点。
+ * 不能复用 ReadSettings.vue 的 .settings-slider —— 那是 scoped 样式, 跨组件不生效,
+ * 所以这里必须复刻一份; 改其一记得同步另一处。 */
+.background-opacity-row .settings-slider {
   width: 100%;
-  accent-color: var(--color-primary);
+  appearance: none;
+  -webkit-appearance: none;
+  height: 18px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
 }
 
-.background-opacity-row output {
-  text-align: right;
-  color: var(--color-text-tertiary);
+.background-opacity-row .settings-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-text-primary) 20%, transparent);
+}
+
+.background-opacity-row .settings-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--color-text-primary);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+
+.background-opacity-row .settings-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-text-primary) 20%, transparent);
+}
+
+.background-opacity-row .settings-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 50%;
+  background: var(--color-text-primary);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+
+/* 透明度百分比: 平时就是一段右对齐的 "35%" 文本 —— 常驻的边框与底色会让它像
+ * 一颗按钮, 和左边的滑块抢注意力。悬停/聚焦时才显形, 提示这里可以直接输入。
+ * 与 % 之间不留 gap: 被撑开时读起来像两个分离的元素, 而它是一个数。
+ * 与阅读页设置里的同名控件保持一致的观感。 */
+.opacity-input-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  flex-shrink: 0;
+  padding: 3px 5px;
+  border-radius: 6px;
+  /* 透明边框占位: 悬停/聚焦只换颜色, 不会冒出 1px 的布局抖动。 */
+  border: 1px solid transparent;
+  cursor: text;
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+
+.opacity-input-wrap:hover {
+  background: var(--color-bg-hover);
+}
+
+.opacity-input-wrap:focus-within {
+  background: var(--color-bg-active);
+  border-color: var(--color-border);
+}
+
+.opacity-input {
+  /* 3.6ch ≈ 1.8em, 恰好容下三位数字(tabular-nums 下每位约 0.55em, "100" 要
+   * 1.65em)。再宽就会把数字推离 %, 再窄则三位数会顶格甚至被裁。 */
+  width: 3.6ch;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font: inherit;
   font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--color-text-secondary);
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.opacity-input:focus {
+  outline: none;
+  color: var(--color-text-primary);
+}
+
+/* number 输入的上下箭头在这么小的框里只会挤掉数字本身。 */
+.opacity-input::-webkit-outer-spin-button,
+.opacity-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.opacity-unit {
+  color: var(--color-text-tertiary);
 }
 
 .hidden-input {
@@ -1297,13 +1434,18 @@ async function handleCheckVersionUpdate() {
   transition: transform var(--duration-fast);
 }
 
+/* 开启态: 淡主色轨道 + 主色圆点, 与全应用的主按钮/选中态同一套语言。
+ * 圆点必须同时着色 —— 原来是"橙底 + 白圆点", 底改淡后白圆点会彻底看不见
+ * (白 on #e9d3c5 仅 1.2:1); 改为主色圆点后 5.7:1, 开/关靠圆点位置区分。
+ * 圆点用 primary 与正文色混合(而非纯 primary), 才能保证浅色主题下压得住底。 */
 .switch-control.on {
-  border-color: var(--color-primary);
-  background: var(--color-primary);
+  border-color: var(--color-primary-soft-border);
+  background: var(--color-primary-soft-bg);
 }
 
 .switch-control.on span {
   transform: translateX(20px);
+  background: var(--color-primary-soft-text);
 }
 
 .switch-control:disabled {

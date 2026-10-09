@@ -459,9 +459,9 @@ async function handleReorderBooks(payload: { draggedUrl: string; targetUrl: stri
 }
 
 .shelf-btn.active {
-  background: var(--color-primary);
-  color: white;
-  border-color: var(--color-primary);
+  background: var(--color-primary-soft-bg);
+  color: var(--color-primary-soft-text);
+  border-color: var(--color-primary-soft-border);
 }
 
 .shelf-btn .spinning {

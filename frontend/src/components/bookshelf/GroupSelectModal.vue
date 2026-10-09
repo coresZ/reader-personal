@@ -161,9 +161,14 @@ async function handleCreate() {
 
 .add-btn {
   padding: 0 var(--space-3); border-radius: var(--radius-md);
-  background: var(--color-primary); color: white;
-  border: none; font-size: var(--text-sm); font-weight: 500; cursor: pointer;
+  background: var(--color-primary-soft-bg); color: var(--color-primary-soft-text);
+  border: 1px solid var(--color-primary-soft-border); font-size: var(--text-sm); font-weight: 500; cursor: pointer;
 }
 
 .add-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.add-btn:hover:not(:disabled) {
+  background: var(--color-primary-soft-bg-hover);
+  border-color: var(--color-primary);
+}
 </style>

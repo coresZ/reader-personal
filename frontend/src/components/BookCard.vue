@@ -559,8 +559,9 @@ const sourceCount = computed(() => {
   flex: 0 0 auto;
   min-height: 30px;
   padding: 0 12px;
-  background: var(--color-primary);
-  color: white;
+  background: var(--color-primary-soft-bg);
+  color: var(--color-primary-soft-text);
+  border: 1px solid var(--color-primary-soft-border);
   border-radius: 999px;
   font-size: 12px;
   font-weight: 700;
@@ -569,7 +570,8 @@ const sourceCount = computed(() => {
 }
 
 .add-shelf-btn:hover {
-  background: var(--color-primary-dark);
+  background: var(--color-primary-soft-bg-hover);
+  border-color: var(--color-primary);
   transform: scale(1.02);
 }
 

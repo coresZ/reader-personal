@@ -10,10 +10,34 @@ const MAX_STORED_LENGTH = 2_000_000
 
 export const DEFAULT_READER_BACKGROUND_OPACITY = 0.35
 
+/** 透明度滑块的步长(1%)。旧版是 5%, 用户反馈太粗。 */
+export const READER_BACKGROUND_OPACITY_STEP = 0.01
+
 export function normalizeReaderBackgroundOpacity(value: unknown) {
   const numeric = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(numeric)) return DEFAULT_READER_BACKGROUND_OPACITY
   return Math.max(0, Math.min(1, numeric))
+}
+
+/** 存储值(0~1) → 界面上的百分比整数。 */
+export function readerOpacityToPercent(opacity: unknown): number {
+  return Math.round(normalizeReaderBackgroundOpacity(opacity) * 100)
+}
+
+/** 界面上的百分比 → 存储值(0~1, 保留两位小数)。
+ *
+ *  百分比输入框允许用户键入非法内容(空串、字母、"abc%"), 因此非数字一律返回
+ *  null 由调用方保持原值, 而不是回落到默认透明度 —— 那会让用户只是误敲一个
+ *  字符, 背景就突然变成 35%。 */
+export function percentToReaderOpacity(percent: unknown): number | null {
+  // 空串与纯空白必须先挡掉: Number('') === 0, 否则用户清空输入框时背景会
+  // 突然变成全透明, 而不是保持原值等用户重新输入。
+  if (typeof percent === 'string' && !percent.trim()) return null
+  if (percent === null || percent === undefined) return null
+  const numeric = typeof percent === 'number' ? percent : Number(String(percent).trim())
+  if (!Number.isFinite(numeric)) return null
+  const clamped = Math.max(0, Math.min(100, numeric))
+  return Math.round(clamped) / 100
 }
 
 export async function prepareReaderBackgroundImage(file: File) {

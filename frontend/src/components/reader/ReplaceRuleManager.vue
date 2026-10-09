@@ -215,13 +215,24 @@ async function handleDelete(rule: ReplaceRule) {
 .header-actions { display: flex; gap: 12px; align-items: center; }
 
 .add-btn {
-  background: var(--color-primary);
-  color: white;
-  border: none;
+  /* 阅读页: 淡主色底 + currentColor 文字(跟随阅读主题 fontColor)。
+   * 不要混入 --color-text —— 那是应用主题文字色, 与阅读主题无关。 */
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  color: currentColor;
+  border: 1px solid color-mix(in srgb, var(--color-primary) 34%, transparent);
   padding: 6px 12px;
   border-radius: 6px;
   font-size: 13px;
   cursor: pointer;
+}
+
+.add-btn:hover {
+  background: color-mix(in srgb, var(--color-primary) 20%, transparent);
+}
+
+.add-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .close-btn {
@@ -273,7 +284,13 @@ async function handleDelete(rule: ReplaceRule) {
 
 .rule-name-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
 .rule-name { font-weight: 600; font-size: 14px; }
-.rule-badge { font-size: 10px; background: var(--color-primary); color: white; padding: 1px 4px; border-radius: 3px; }
+/* 文字必须用 currentColor(跟随阅读主题 fontColor), 不能混 --color-primary。
+ * 底色已由实心主色改为 16% 淡底, 文字若仍是主色就成了"同色压同色":
+ * 实算默认主题 2.71:1、天蓝 2.39:1, 暗灰主题(#888 底)仅 1.10:1 —— 几乎不可见,
+ * 比改动前的"实心底 + 白字"3.19:1 还差。currentColor 在各主题下为 6.77~10.73:1
+ * (暗灰 3.04:1, 等于该主题纯文字的可读上限)。
+ * 与上面 .add-btn 同一条规则: 阅读页文字不混 --color-text。 */
+.rule-badge { font-size: 10px; background: color-mix(in srgb, var(--color-primary) 16%, transparent); color: currentColor; padding: 1px 4px; border-radius: 3px; }
 .rule-scope { font-size: 12px; color: var(--color-primary); opacity: 0.9; margin-bottom: 4px; }
 
 .rule-pattern, .rule-replace {
@@ -299,13 +316,15 @@ async function handleDelete(rule: ReplaceRule) {
 
 .op-btn.delete { color: #ef4444; border-color: rgba(239, 68, 68, 0.2); }
 
-/* Switch style */
+/* Switch style —— 阅读页: 底用就地 color-mix(不能复用 soft 令牌, 原因见
+ * .add-btn), 圆点用 currentColor 跟随阅读主题; 原来橙底白圆点在浅色阅读主题下
+ * 圆点与底几乎同亮。 */
 .switch { position: relative; display: inline-block; width: 34px; height: 18px; }
 .switch input { opacity: 0; width: 0; height: 0; }
-.slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 18px; }
-.slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; }
-input:checked + .slider { background-color: var(--color-primary); }
-input:checked + .slider:before { transform: translateX(16px); }
+.slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: color-mix(in srgb, currentColor 18%, transparent); transition: .4s; border-radius: 18px; }
+.slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 2px; bottom: 2px; background-color: currentColor; opacity: 0.55; transition: .4s; border-radius: 50%; }
+input:checked + .slider { background-color: color-mix(in srgb, var(--color-primary) 26%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-primary) 34%, transparent); }
+input:checked + .slider:before { transform: translateX(16px); opacity: 1; }
 
 /* Edit Overlay */
 .edit-overlay {
@@ -356,9 +375,9 @@ input:checked + .slider:before { transform: translateX(16px); }
 }
 
 .scope-btn.active {
-  background: var(--color-primary);
-  color: white;
-  border-color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  color: currentColor;
+  border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
 }
 
 .scope-preview {
@@ -388,5 +407,6 @@ input:checked + .slider:before { transform: translateX(16px); }
 
 .edit-footer { display: flex; justify-content: flex-end; gap: 12px; margin-top: 20px; }
 .edit-footer button { padding: 8px 20px; border-radius: 8px; border: 1px solid var(--color-border); background: transparent; color: inherit; cursor: pointer; }
-.edit-footer button.primary { background: var(--color-primary); color: white; border: none; }
+.edit-footer button.primary { background: color-mix(in srgb, var(--color-primary) 14%, transparent); color: currentColor; border: 1px solid color-mix(in srgb, var(--color-primary) 34%, transparent); }
+.edit-footer button.primary:hover { background: color-mix(in srgb, var(--color-primary) 20%, transparent); border-color: var(--color-primary); }
 </style>

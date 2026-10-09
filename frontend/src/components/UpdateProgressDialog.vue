@@ -228,9 +228,14 @@ function openReleasePage() {
 }
 
 .update-btn.primary {
-  background: var(--color-primary);
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
+}
+
+.update-btn.primary:hover:not(:disabled) {
+  background: var(--color-primary-soft-bg-hover);
   border-color: var(--color-primary);
-  color: #fff;
 }
 
 .update-btn:disabled {
@@ -238,13 +243,15 @@ function openReleasePage() {
   cursor: not-allowed;
 }
 
+/* 次级按钮(查看发行页/关闭)的悬停底色。 */
 .update-btn:hover:not(:disabled) {
   background: var(--color-bg-hover);
 }
 
-.update-btn.primary:hover:not(:disabled) {
-  background: var(--color-primary-dark);
-}
+/* 这里原本还有一条 .update-btn.primary:hover:not(:disabled) { background:
+ * var(--color-primary-dark) }, 与上面那条主色 hover 同特异度且更靠后, 于是把
+ * soft 底的 hover 覆写回高饱和实心橙 —— 而文字是 --color-primary-soft-text
+ * (深棕), 变成橙底深棕字, 对比度骤降。删除: 主色按钮的 hover 只由上面那条负责。 */
 
 .fade-enter-active,
 .fade-leave-active {

@@ -214,9 +214,14 @@ async function run() {
 }
 
 .step-btn.active {
-  background: var(--color-primary);
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
+}
+
+.step-btn.active:hover:not(:disabled) {
+  background: var(--color-primary-soft-bg-hover);
   border-color: var(--color-primary);
-  color: #fff;
 }
 
 .step-btn:disabled {
@@ -252,9 +257,14 @@ async function run() {
 }
 
 .mini-btn.primary {
-  background: var(--color-primary);
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
+}
+
+.mini-btn.primary:hover:not(:disabled) {
+  background: var(--color-primary-soft-bg-hover);
   border-color: var(--color-primary);
-  color: #fff;
 }
 
 .mini-btn:disabled {

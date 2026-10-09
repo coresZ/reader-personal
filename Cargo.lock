@@ -3916,7 +3916,7 @@ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
 name = "reader-desktop"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "anyhow",
  "reader-rust",
@@ -3932,7 +3932,7 @@ dependencies = [
 
 [[package]]
 name = "reader-rust"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "aes",
  "anyhow",
@@ -5233,8 +5233,6 @@ dependencies = [
 [[package]]
 name = "tao"
 version = "0.35.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1c93047acf68669466a34690ac58cca7010bd1b201e1ec86f1fd0a75d3dd4a9"
 dependencies = [
  "bitflags 2.11.0",
  "block2",

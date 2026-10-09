@@ -8,15 +8,200 @@ import {
   bindActionToKey,
   hasHotkeyConflict,
   hotkeyIdFromEvent,
+  hotkeyIdFromMouseEvent,
+  hotkeyIdFromWheelEvent,
   hotkeyLabel,
   isActionAllowedWhilePanelOpen,
   isDefaultHotkeyBindings,
+  isHotkeyCaptureActive,
+  isMouseButtonHotkeyBlocked,
+  isPointerHotkeyBlocked,
   isValidHotkeyId,
   listHotkeyConflicts,
+  mouseButtonHotkeyAction,
   normalizeHotkeyBindings,
   resolveHotkeyAction,
+  setHotkeyCaptureActive,
   unbindActionFromKey,
+  type HotkeyBindings,
 } from './readerHotkeys'
+
+/* ─── 事件目标的阻挡规则 ───
+ *
+ *  回归测试: 中键/侧键与滚轮**不能用同一套规则**。它们曾共用一套(含 button),
+ *  于是设置面板里录入侧键时, 鼠标必然停在「录入按键」那个 <button> 上 —— 事件被
+ *  直接放弃、不阻止默认行为, 侧键触发浏览器前进/后退; 本应用用 hash 路由, hash
+ *  一变就跳路由、面板被卸载, 侧键根本录不进去。 */
+describe('isMouseButtonHotkeyBlocked / isPointerHotkeyBlocked', () => {
+  /** 造一个只有 closest/isContentEditable 的假目标。matches 记录被查询的选择器。 */
+  function fakeTarget(matches: string[], { contentEditable = false } = {}) {
+    const queries: string[] = []
+    return {
+      queries,
+      target: {
+        isContentEditable: contentEditable,
+        closest(selector: string) {
+          queries.push(selector)
+          // 粗略模拟: 选择器里任一 token 命中即算匹配。
+          const tokens = selector.split(',').map((s) => s.trim())
+          return tokens.some((token) => matches.includes(token)) ? {} : null
+        },
+      },
+    }
+  }
+
+  it('blocks middle/side buttons only over text inputs and editors', () => {
+    for (const token of ['input', 'textarea', 'select']) {
+      const { target } = fakeTarget([token])
+      expect(isMouseButtonHotkeyBlocked(target)).toBe(true)
+    }
+    const { target: editor } = fakeTarget([], { contentEditable: true })
+    expect(isMouseButtonHotkeyBlocked(editor)).toBe(true)
+  })
+
+  it('does NOT block middle/side buttons over a button element', () => {
+    // 这正是「录入按键」那个按钮所处的情形 —— 必须放行, 否则录不进侧键。
+    const { target } = fakeTarget(['button'])
+    expect(isMouseButtonHotkeyBlocked(target)).toBe(false)
+  })
+
+  it('does NOT block middle/side buttons over the reader context menu', () => {
+    const { target } = fakeTarget(['.reader-context-menu'])
+    expect(isMouseButtonHotkeyBlocked(target)).toBe(false)
+  })
+
+  it('blocks wheel over buttons and the context menu, unlike mouse buttons', () => {
+    // 滚轮必须保留 button: 面板是长列表, 悬停在按钮上时滚动要归面板自己。
+    for (const token of ['input', 'textarea', 'select', 'button', '.reader-context-menu']) {
+      const { target } = fakeTarget([token])
+      expect(isPointerHotkeyBlocked(target)).toBe(true)
+    }
+  })
+
+  it('never queries button in the mouse-button rule', () => {
+    // 锁住实现细节: 一旦有人把 button 加回这条规则, 侧键录入会立刻再次失败。
+    const { target, queries } = fakeTarget(['button'])
+    isMouseButtonHotkeyBlocked(target)
+    expect(queries.join(' ')).not.toContain('button')
+    expect(queries.join(' ')).toContain('input')
+  })
+
+  it('treats a plain element as unblocked for both rules', () => {
+    const { target } = fakeTarget([])
+    expect(isMouseButtonHotkeyBlocked(target)).toBe(false)
+    expect(isPointerHotkeyBlocked(target)).toBe(false)
+  })
+
+  it('treats a missing target as unblocked', () => {
+    expect(isMouseButtonHotkeyBlocked(null)).toBe(false)
+    expect(isMouseButtonHotkeyBlocked(undefined)).toBe(false)
+    expect(isPointerHotkeyBlocked(null)).toBe(false)
+    // 没有 closest 的对象(如 window/document 的某些目标)不该抛错。
+    expect(isMouseButtonHotkeyBlocked({} as never)).toBe(false)
+    expect(isPointerHotkeyBlocked({} as never)).toBe(false)
+  })
+})
+
+/* ─── 鼠标键该不该被接管 ───
+ *
+ *  ReaderView 的 handleReaderMouseDown 用「已绑定」作为接管的唯一依据:
+ *  绑定了就拦掉默认行为(否则侧键会把整个页面导航走), 没绑定就完全放行
+ *  (用户习惯的侧键前进/后退必须保留)。
+ *
+ *  这里锁住那个判定 —— 它一旦写反, 要么绑定的键失效, 要么未绑定的键被吞掉。
+ *
+ *  **直接调用实现导出的 mouseButtonHotkeyAction**, 不复刻它的逻辑:
+ *  曾经这份测试在文件里重写了一遍同样的判定, 结果改动真实实现时测试照样通过 ——
+ *  那种"复刻式测试"只是把实现抄了两遍, 保护不了任何东西。 */
+describe('鼠标键的接管判定', () => {
+  /** 直接调实现; captureActive 通过 setHotkeyCaptureActive 走真实通路。 */
+  function shouldTakeOver(options: {
+    captureActive: boolean
+    button: number
+    bindings: HotkeyBindings
+    mode: 'paged' | 'scroll'
+  }): boolean {
+    setHotkeyCaptureActive(options.captureActive)
+    try {
+      return mouseButtonHotkeyAction(options.bindings, { button: options.button }, options.mode) !== null
+    } finally {
+      setHotkeyCaptureActive(false)
+    }
+  }
+
+  it('takes over a bound side button', () => {
+    expect(shouldTakeOver({
+      captureActive: false,
+      button: 3,
+      bindings: { Mouse4: ['nextPage'] },
+      mode: 'scroll',
+    })).toBe(true)
+  })
+
+  it('leaves an unbound side button alone so it can still navigate', () => {
+    // 这是刻意的设计: 没绑定的侧键要保留浏览器原本的前进/后退。
+    expect(shouldTakeOver({
+      captureActive: false,
+      button: 3,
+      bindings: { ArrowDown: ['nextPage'] },
+      mode: 'scroll',
+    })).toBe(false)
+  })
+
+  it('leaves the left and right buttons alone even if bound', () => {
+    // 左右键不参与快捷键(它们是点击翻页与右键菜单的载体), 因此查不到标识。
+    for (const button of [0, 2]) {
+      expect(shouldTakeOver({
+        captureActive: false,
+        button,
+        bindings: { Mouse4: ['nextPage'], Mouse5: ['prevPage'] },
+        mode: 'scroll',
+      })).toBe(false)
+    }
+  })
+
+  it('does not take over while recording a shortcut', () => {
+    // 录入态: 这次按键属于「设置快捷键」, 不能被运行时接走。
+    expect(shouldTakeOver({
+      captureActive: true,
+      button: 3,
+      bindings: { Mouse4: ['nextPage'] },
+      mode: 'scroll',
+    })).toBe(false)
+  })
+
+  it('does not take over when the user set the key to 不操作', () => {
+    expect(shouldTakeOver({
+      captureActive: false,
+      button: 3,
+      bindings: { Mouse4: ['none'] },
+      mode: 'scroll',
+    })).toBe(false)
+  })
+
+  it('绑定带修饰键的鼠标键后, 无修饰键的同一键不接管', () => {
+    // Ctrl+侧键1 被绑到某动作, 不等于裸侧键1 被绑 —— 后者必须放行,
+    // 否则用户会发现「绑了 Ctrl+侧键之后, 单按侧键也不导航了」。
+    expect(shouldTakeOver({
+      captureActive: false,
+      button: 3,
+      bindings: { 'Control+Mouse4': ['nextPage'] },
+      mode: 'scroll',
+    })).toBe(false)
+    // 按着 Ctrl 时才是被绑定的那个键 → 接管。
+    setHotkeyCaptureActive(false)
+    expect(mouseButtonHotkeyAction({ 'Control+Mouse4': ['nextPage'] }, { button: 3, ctrlKey: true }, 'scroll'))
+      .toBe('nextPage')
+  })
+
+  it('绑定只对同一个物理键生效, 不牵连另一个侧键', () => {
+    // button 3 = 侧键1(Mouse4), button 4 = 侧键2(Mouse5)。
+    const bindings: HotkeyBindings = { Mouse4: ['nextPage'] }
+    expect(shouldTakeOver({ captureActive: false, button: 3, bindings, mode: 'scroll' })).toBe(true)
+    // 侧键2 没绑定 → 必须放行, 保留浏览器原本的前进/后退。
+    expect(shouldTakeOver({ captureActive: false, button: 4, bindings, mode: 'scroll' })).toBe(false)
+  })
+})
 
 describe('hotkeyIdFromEvent', () => {
   it('maps the navigation keys the reader binds by default', () => {
@@ -72,12 +257,113 @@ describe('hotkeyIdFromEvent', () => {
   })
 })
 
+describe('hotkeyIdFromMouseEvent', () => {
+  it('maps the side buttons and the middle button', () => {
+    expect(hotkeyIdFromMouseEvent({ button: 1 })).toBe('MouseMiddle')
+    expect(hotkeyIdFromMouseEvent({ button: 3 })).toBe('Mouse4')
+    expect(hotkeyIdFromMouseEvent({ button: 4 })).toBe('Mouse5')
+  })
+
+  it('never treats the primary or secondary button as a hotkey', () => {
+    // 左键=点击翻页/呼出控件, 右键=自定义菜单, 绑成快捷键会把日常操作劫持掉。
+    expect(hotkeyIdFromMouseEvent({ button: 0 })).toBeNull()
+    expect(hotkeyIdFromMouseEvent({ button: 2 })).toBeNull()
+    expect(hotkeyIdFromMouseEvent({ button: 9 })).toBeNull()
+  })
+
+  it('keeps modifiers so a side button can form a chord', () => {
+    expect(hotkeyIdFromMouseEvent({ button: 3, ctrlKey: true })).toBe('Control+Mouse4')
+    expect(hotkeyIdFromMouseEvent({ button: 3, ctrlKey: true, shiftKey: true }))
+      .toBe('Control+Shift+Mouse4')
+  })
+
+  it('produces ids that survive the storage validator', () => {
+    for (const button of [1, 3, 4]) {
+      const id = hotkeyIdFromMouseEvent({ button })
+      expect(id).not.toBeNull()
+      expect(isValidHotkeyId(id)).toBe(true)
+    }
+  })
+})
+
+describe('hotkeyIdFromWheelEvent', () => {
+  it('maps the scroll direction', () => {
+    expect(hotkeyIdFromWheelEvent({ deltaX: 0, deltaY: 120 })).toBe('WheelDown')
+    expect(hotkeyIdFromWheelEvent({ deltaX: 0, deltaY: -120 })).toBe('WheelUp')
+  })
+
+  it('uses the dominant axis for trackpad diagonal gestures', () => {
+    expect(hotkeyIdFromWheelEvent({ deltaX: -40, deltaY: 5 })).toBe('WheelUp')
+    expect(hotkeyIdFromWheelEvent({ deltaX: 3, deltaY: 60 })).toBe('WheelDown')
+  })
+
+  it('yields Ctrl+wheel to the font-size zoom', () => {
+    // Ctrl+滚轮已被阅读页的「字号缩放」占用, 不能同时触发绑定的滚轮动作。
+    expect(hotkeyIdFromWheelEvent({ deltaX: 0, deltaY: 120, ctrlKey: true })).toBeNull()
+  })
+
+  it('ignores a zero or non-finite delta', () => {
+    expect(hotkeyIdFromWheelEvent({ deltaX: 0, deltaY: 0 })).toBeNull()
+    expect(hotkeyIdFromWheelEvent({ deltaX: 0, deltaY: Number.NaN })).toBeNull()
+  })
+
+  it('produces ids that survive the storage validator', () => {
+    for (const id of ['WheelUp', 'WheelDown']) {
+      expect(isValidHotkeyId(id)).toBe(true)
+    }
+  })
+})
+
+describe('鼠标键的默认行为接管判定', () => {
+  // ReaderView 靠「解析出可执行动作」决定是否拦掉鼠标键的默认行为
+  // (中键自动滚动 / 侧键前进后退)。这组用例锁住那个前提:
+  // 未绑定、或用户显式设成「不操作」时都必须放行, 否则会把用户习惯的
+  // 侧键导航与中键滚动一并杀掉。
+  //
+  // 这里直接调用**实现导出的** mouseButtonHotkeyAction, 不再复刻一份同样的
+  // 判定 —— 复刻版改实现不会失败, 那种测试是自欺。
+  const actionFor = (button: number, bindings: HotkeyBindings) =>
+    mouseButtonHotkeyAction(bindings, { button }, 'scroll')
+
+  it('leaves unbound mouse buttons to the browser', () => {
+    // 默认绑定里没有任何鼠标键。
+    expect(actionFor(1, DEFAULT_HOTKEY_BINDINGS)).toBeNull()
+    expect(actionFor(3, DEFAULT_HOTKEY_BINDINGS)).toBeNull()
+    expect(actionFor(4, DEFAULT_HOTKEY_BINDINGS)).toBeNull()
+  })
+
+  it('takes over once the user binds an action', () => {
+    const bindings = normalizeHotkeyBindings({ Mouse4: ['prevPage'] })
+    expect(actionFor(3, bindings)).toBe('prevPage')
+  })
+
+  it('keeps handing the button back when bound to「不操作」', () => {
+    const bindings = normalizeHotkeyBindings({ Mouse5: ['none'] })
+    expect(actionFor(4, bindings)).toBeNull()
+  })
+
+  it('never claims the primary or secondary button', () => {
+    const bindings = normalizeHotkeyBindings({ Mouse4: ['prevPage'], Mouse5: ['nextPage'] })
+    expect(actionFor(0, bindings)).toBeNull()
+    expect(actionFor(2, bindings)).toBeNull()
+  })
+})
+
 describe('hotkeyLabel', () => {
   it('renders friendly names for the well-known keys', () => {
     expect(hotkeyLabel('ArrowDown')).toBe('下键')
     expect(hotkeyLabel('Space')).toBe('空格')
     expect(hotkeyLabel('PageUp')).toBe('PgUp')
     expect(hotkeyLabel('Escape')).toBe('Esc')
+  })
+
+  it('renders mouse buttons and wheel directions readably', () => {
+    expect(hotkeyLabel('MouseMiddle')).toBe('鼠标中键')
+    expect(hotkeyLabel('Mouse4')).toBe('鼠标侧键1')
+    expect(hotkeyLabel('Mouse5')).toBe('鼠标侧键2')
+    expect(hotkeyLabel('WheelUp')).toBe('滚轮上')
+    expect(hotkeyLabel('WheelDown')).toBe('滚轮下')
+    expect(hotkeyLabel('Control+Mouse4')).toBe('Ctrl+鼠标侧键1')
   })
 
   it('renders a chord readably', () => {
@@ -130,6 +416,28 @@ describe('isActionAllowedWhilePanelOpen (弹层打开时的快捷键)', () => {
       'chapterStart', 'chapterEnd', 'speech', 'autoScroll', 'nightMode', 'none'] as const) {
       expect(isActionAllowedWhilePanelOpen(action)).toBe(false)
     }
+  })
+})
+
+describe('录入态 (hotkey capture)', () => {
+  // 回归测试: 面板开关类动作在弹层打开时是放行的, 因此「把侧键改绑到目录」时
+  // 按侧键会先被阅读页接走、顺手切走面板。录入期间必须整体让路。
+  it('is inactive by default so runtime dispatch is unaffected', () => {
+    expect(isHotkeyCaptureActive()).toBe(false)
+  })
+
+  it('flags capture on and back off', () => {
+    setHotkeyCaptureActive(true)
+    expect(isHotkeyCaptureActive()).toBe(true)
+    setHotkeyCaptureActive(false)
+    expect(isHotkeyCaptureActive()).toBe(false)
+  })
+
+  it('still reports panel-open allowance independently of capture state', () => {
+    // 两者是不同的概念: 录入态只是让运行时整体静音, 不改变允许列表本身。
+    setHotkeyCaptureActive(true)
+    expect(isActionAllowedWhilePanelOpen('catalog')).toBe(true)
+    setHotkeyCaptureActive(false)
   })
 })
 

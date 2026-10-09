@@ -1300,4 +1300,161 @@ describe('reader page background image', () => {
     expect(readerStore.config.fontSize).toBe(18)
     expect(readerStore.config.readerBackgroundImage).toBe('data:image/webp;base64,dGVzdA==')
   })
+
+  /* ─── 滚动进度的持久化成本 ───
+   * 回归测试: setChapterScrollProgress 由 handleScroll 在每次滚动事件里调用,
+   * 曾直接走 saveReaderSession —— 后者每次都把整个 chapters 数组序列化并写盘。
+   * 3000 章时实测单次 ~10ms, 一次翻页补间会因此阻塞主线程上百毫秒, 表现为掉帧
+   * 与上一页残留。这里锁住「高频路径不再写全量快照」这一行为。 */
+
+  /** 造一份足够大的目录, 让「是否序列化了目录」在体积上可见。 */
+  function bigChapters(count: number) {
+    return Array.from({ length: count }, (_, i) => ({
+      title: `第${i + 1}章 一个典型的章节标题`,
+      url: `https://example.com/book/1/chapter/${i}`,
+      index: i,
+    }))
+  }
+
+  function sessionWrites() {
+    return vi.mocked(localStorage.setItem).mock.calls.filter(([key]) => key === 'reader-last-session')
+  }
+
+  function progressWrites() {
+    return vi.mocked(localStorage.setItem).mock.calls.filter(([key]) => key === 'reader-last-progress')
+  }
+
+  it('does not rewrite the whole chapter list on every scroll progress update', () => {
+    const readerStore = useReaderStore()
+    readerStore.book = { name: '大书', author: '作者', origin: 'https://example.com', bookUrl: 'https://example.com/book/1' }
+    readerStore.chapters = bigChapters(300)
+    // 换章路径会写一次全量快照, 用来建立基线
+    readerStore.setActiveChapterState(0, '正文', 0)
+    const sessionWritesBeforeScroll = sessionWrites().length
+
+    // 模拟一次翻页补间产生的多次滚动事件
+    for (let i = 0; i < 30; i++) {
+      readerStore.setChapterScrollProgress(i / 30)
+    }
+
+    expect(sessionWrites().length).toBe(sessionWritesBeforeScroll)
+    expect(progressWrites().length).toBeGreaterThanOrEqual(30)
+  })
+
+  it('writes only the small progress payload on the hot path', () => {
+    const readerStore = useReaderStore()
+    readerStore.book = { name: '大书', author: '作者', origin: 'https://example.com', bookUrl: 'https://example.com/book/1' }
+    readerStore.chapters = bigChapters(300)
+
+    readerStore.setChapterScrollProgress(0.42)
+
+    const [, value] = progressWrites().at(-1)!
+    const payload = JSON.parse(value as string) as Record<string, unknown>
+    expect(payload.currentIndex).toBe(0)
+    expect(payload.chapterScrollProgress).toBe(0.42)
+    expect(payload.bookUrl).toBe('https://example.com/book/1')
+    // 关键: 轻量快照里不能出现目录 —— 它正是被优化的那部分。
+    expect(payload).not.toHaveProperty('chapters')
+    expect(payload).not.toHaveProperty('book')
+  })
+
+  it('restores the newer progress snapshot over a stale full session', async () => {
+    // 全量快照停留在旧进度, 轻量快照更新 —— 恢复时必须取轻量那个。
+    //
+    // 这条以前是假测试: 它只断言 getPersistedReaderSession()/readReaderProgress()
+    // 两个**存取函数**各自的返回值, 从未调用 restorePersistedSession ——
+    // 而"取 updatedAt 较新者"的决策就在那里。setUp 里那个只有 restore 才需要的
+    // getBookContent mock 是漏写调用的铁证。现在真的走恢复流程。
+    stubStorage({
+      'reader-last-session': JSON.stringify({
+        book: { name: '书', author: '作者', origin: 'o', bookUrl: 'https://example.com/book/1' },
+        chapters: bigChapters(10),
+        currentIndex: 3,
+        chapterScrollProgress: 0.1,
+        updatedAt: 1000,
+      }),
+      'reader-last-progress': JSON.stringify({
+        bookUrl: 'https://example.com/book/1',
+        currentIndex: 7,
+        chapterScrollProgress: 0.8,
+        updatedAt: 2000,
+      }),
+    })
+    vi.mocked(getBookContent).mockResolvedValue('正文')
+    const readerStore = useReaderStore()
+
+    await expect(readerStore.restorePersistedSession()).resolves.toBe(true)
+    // 关键断言: 用了轻量快照的索引(7)而不是全量快照的(3)。
+    expect(readerStore.currentIndex).toBe(7)
+    expect(readerStore.chapterScrollProgress).toBe(0.8)
+  })
+
+  it('falls back to the full session when the progress snapshot is older', async () => {
+    // 反向: 轻量快照反而更旧(例如它写在一次失败的滚动之后) —— 必须用全量快照。
+    stubStorage({
+      'reader-last-session': JSON.stringify({
+        book: { name: '书', author: '作者', origin: 'o', bookUrl: 'https://example.com/book/1' },
+        chapters: bigChapters(10),
+        currentIndex: 5,
+        chapterScrollProgress: 0.4,
+        updatedAt: 5000,
+      }),
+      'reader-last-progress': JSON.stringify({
+        bookUrl: 'https://example.com/book/1',
+        currentIndex: 1,
+        chapterScrollProgress: 0.05,
+        updatedAt: 1000,
+      }),
+    })
+    vi.mocked(getBookContent).mockResolvedValue('正文')
+    const readerStore = useReaderStore()
+
+    await expect(readerStore.restorePersistedSession()).resolves.toBe(true)
+    expect(readerStore.currentIndex).toBe(5)
+    expect(readerStore.chapterScrollProgress).toBe(0.4)
+  })
+
+  it('ignores a progress snapshot belonging to another book', async () => {
+    // 打开了 A 书, 但轻量进度是 B 书的 —— 不能拿 B 的进度定位 A。
+    //
+    // 这条以前也是假测试: 它只把 stub 里写死的两个 bookUrl 拿来比, 断言恒真。
+    // 现在真的走恢复流程, 断言 A 书用的是**自己**的索引(2)而不是 B 书的(9)。
+    stubStorage({
+      'reader-last-session': JSON.stringify({
+        book: { name: 'A书', author: '作者', origin: 'o', bookUrl: 'https://example.com/book/A' },
+        chapters: bigChapters(10),
+        currentIndex: 2,
+        chapterScrollProgress: 0.3,
+        updatedAt: 1000,
+      }),
+      'reader-last-progress': JSON.stringify({
+        bookUrl: 'https://example.com/book/B',
+        currentIndex: 9,
+        chapterScrollProgress: 0.95,
+        updatedAt: 9999,
+      }),
+    })
+    vi.mocked(getBookContent).mockResolvedValue('正文')
+    const readerStore = useReaderStore()
+
+    await expect(readerStore.restorePersistedSession()).resolves.toBe(true)
+    // B 书的 updatedAt 更新(9999 > 1000), 但 bookUrl 不匹配 → 必须回退 A 书自己的快照。
+    expect(readerStore.currentIndex).toBe(2)
+    expect(readerStore.chapterScrollProgress).toBe(0.3)
+    expect(readerStore.book?.bookUrl).toBe('https://example.com/book/A')
+  })
+
+  it('returns null for a corrupted progress snapshot instead of throwing', () => {
+    stubStorage({ 'reader-last-progress': '{ not json' })
+    const readerStore = useReaderStore()
+
+    expect(readerStore.readReaderProgress()).toBeNull()
+  })
+
+  it('rejects a progress snapshot without a book url', () => {
+    stubStorage({ 'reader-last-progress': JSON.stringify({ currentIndex: 1, chapterScrollProgress: 0.5 }) })
+    const readerStore = useReaderStore()
+
+    expect(readerStore.readReaderProgress()).toBeNull()
+  })
 })

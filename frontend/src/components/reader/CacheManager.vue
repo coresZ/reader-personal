@@ -307,10 +307,15 @@ function stopWorking() {
 }
 
 .cache-opt.primary {
-  background: var(--color-selected-bg);
-  border-color: var(--color-selected-border);
-  color: var(--color-primary, #c97f3a);
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
+  /* 文字跟随阅读主题: 主色文字在浅色阅读主题下与底几乎同亮(约 2.3:1)。 */
+  color: currentColor;
   font-weight: 600;
+}
+
+.cache-opt.primary:hover {
+  background: color-mix(in srgb, var(--color-primary) 20%, transparent);
 }
 
 .cache-opt.danger {

@@ -127,13 +127,21 @@ watch(() => props.show, (visible) => {
 }
 
 .search-submit {
-  border: none;
+  border: 1px solid color-mix(in srgb, var(--color-primary) 34%, transparent);
   border-radius: 12px;
-  background: var(--color-primary);
-  color: #fff;
+  /* 阅读页专用写法: 底色走 --color-primary 的淡色(该变量在 .reader-view 上被
+   * 覆盖成立即生效), 文字用 currentColor 跟随阅读主题的 fontColor。
+   * 不能像应用页面那样混入 --color-text —— 那是应用主题的文字色, 与阅读主题
+   * 无关; 两者错配时(浅色应用 + 暗夜阅读)对比度只剩 2.6:1。 */
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  color: currentColor;
   font-size: 13px;
   padding: 11px 14px;
   cursor: pointer;
+}
+
+.search-submit:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-primary) 20%, transparent);
 }
 
 .search-submit:disabled {

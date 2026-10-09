@@ -331,9 +331,15 @@ async function clearServer(book: Book) {
 }
 
 .scope-btn.active {
-  background: var(--color-primary);
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
+}
+
+/* 选中态从"透明描边"升级成实心淡橙块后, 必须补 hover: 否则整块没有交互反馈。 */
+.scope-btn.active:hover {
+  background: var(--color-primary-soft-bg-hover);
   border-color: var(--color-primary);
-  color: #fff;
 }
 
 .cache-overview {

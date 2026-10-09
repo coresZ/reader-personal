@@ -254,15 +254,15 @@ function openSourceManager() {
   align-items: center;
   justify-content: center;
   border-radius: var(--radius-md);
-  color: var(--color-text-inverse);
-  background: var(--color-primary);
+  color: var(--color-primary-soft-text);
+  background: var(--color-primary-soft-bg);
   flex-shrink: 0;
   padding: 0;
   transition: transform var(--duration-fast), opacity var(--duration-fast), background var(--duration-fast);
 }
 
 .search-submit:hover:not(:disabled) {
-  background: var(--color-primary-dark);
+  background: var(--color-primary-soft-bg-hover);
 }
 
 .search-submit:active:not(:disabled) {

@@ -864,12 +864,16 @@ async function restoreBackup(entry: EntryRow) {
   transition: transform 0.2s ease;
 }
 
+/* 与 SettingsDrawer 的 .switch-control 统一: 淡主色轨道 + 主色圆点。
+ * 这里原本是"橙底 + 白圆点", 底改淡后白圆点会消失, 所以圆点一并着色。 */
 .sync-progress-toggle .switch-control.on {
-  background: var(--color-primary);
+  background: var(--color-primary-soft-bg);
+  box-shadow: inset 0 0 0 1px var(--color-primary-soft-border);
 }
 
 .sync-progress-toggle .switch-control.on span {
   transform: translateX(18px);
+  background: var(--color-primary-soft-text);
 }
 
 .remote-backup-list {
@@ -1002,9 +1006,9 @@ async function restoreBackup(entry: EntryRow) {
 }
 
 .action-btn.primary {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
-  color: #fff;
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
 }
 
 .action-btn:hover:not(:disabled),
@@ -1014,8 +1018,8 @@ async function restoreBackup(entry: EntryRow) {
 }
 
 .action-btn.primary:hover:not(:disabled) {
-  background: var(--color-primary-dark);
-  border-color: var(--color-primary-dark);
+  background: var(--color-primary-soft-bg-hover);
+  border-color: var(--color-primary);
 }
 
 .action-btn:active:not(:disabled),

@@ -11,10 +11,12 @@ use reader_rust::api::protocol::handle_reader_scheme;
 use reader_rust::app::bootstrap;
 use reader_rust::app::config::AppConfig;
 use reader_rust::app::window_state::{capture, InitialGeometry, WindowStateStore};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::menu::MenuItemBuilder;
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
-use tauri::webview::NewWindowResponse;
+use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{
     App, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
@@ -49,6 +51,38 @@ fn host_allowed_in_app(url_host: Option<&str>) -> bool {
             | Some("qidian.gtimg.com")
             | Some("tcaptcha.qq.com")
     )
+}
+
+/// 窗口显示的兜底超时: 页面加载失败(WebView2 异常、资源损坏)时
+/// `on_page_load` 永远不触发, 窗口会一直隐藏着 —— 那比白屏更糟, 用户会以为
+/// 应用根本没启动。超过这个时间无论如何都显示窗口。
+const REVEAL_FALLBACK: Duration = Duration::from_secs(3);
+
+/// 首屏显示状态。
+///
+/// 窗口以隐藏方式建窗, 页面加载完成后再显示。`on_page_load` 与兜底超时会
+/// 竞争, `revealed` 保证只有先到的那次生效(显示动作必须幂等)。
+#[derive(Default)]
+struct RevealState {
+    revealed: AtomicBool,
+    /// 是否需要以最大化状态显示。不能在 `on_page_load` 之前调用 `maximize()`:
+    /// tao 在 Windows 上的 `set_maximized` 内部就是 `ShowWindow(SW_MAXIMIZE)`,
+    /// 隐藏窗口会因此立刻可见, 白屏又会露出来。
+    maximize: AtomicBool,
+}
+
+/// 显示主窗口。首次调用生效, 之后是空操作。
+fn reveal(window: &tauri::WebviewWindow, state: &RevealState) {
+    if state.revealed.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // 最大化必须在显示之前完成: 否则用户会先看到常规尺寸的窗口, 下一帧才跳成
+    // 整屏。(`set_maximized` 自身就会显示窗口, 随后的 `show` 是幂等的兜底。)
+    if state.maximize.load(Ordering::SeqCst) {
+        let _ = window.maximize();
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
 }
 
 fn main() {
@@ -142,6 +176,10 @@ fn start(app: &mut App) -> anyhow::Result<()> {
     let initial_mini = saved_state.map(|s| s.mini_mode).unwrap_or(false);
     let (min_width, min_height) = InitialGeometry::min_size_for(initial_mini);
 
+    // 首屏显示状态。窗口先隐藏建窗, 等页面加载完成(或兜底超时)再一次性显示,
+    // 避免用户在 WebView2 还没画出任何内容时看到一块白板 —— 见 reveal。
+    let reveal_state = Arc::new(RevealState::default());
+
     let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("阅读")
         .inner_size(InitialGeometry::DEFAULT_WIDTH, InitialGeometry::DEFAULT_HEIGHT)
@@ -149,6 +187,17 @@ fn start(app: &mut App) -> anyhow::Result<()> {
         // Custom title bar drawn by the frontend; this hides the native frame.
         .decorations(false)
         .center()
+        // 先不显示。Tauri 默认为 visible(true), 于是窗口在 WebView2 尚未渲染出
+        // 首帧时就弹出来, 用户先看到一块白板 —— 这正是启动白闪的第一段。
+        .visible(false)
+        .on_page_load({
+            let reveal_state = Arc::clone(&reveal_state);
+            move |window, payload| {
+                if payload.event() == PageLoadEvent::Finished {
+                    reveal(&window, &reveal_state);
+                }
+            }
+        })
         .on_navigation(|url| {
             match url.scheme() {
                 // Exporting book sources and downloading backup files navigate
@@ -188,6 +237,9 @@ fn start(app: &mut App) -> anyhow::Result<()> {
 
     // 用保存的尺寸/位置覆盖默认值。要在 `.center()` 之后应用, 否则会先居中
     // 再跳走, 用户能看到闪烁; 先建窗再调整是因为安全范围校验需要窗口句柄。
+    // 此时窗口尚未显示(见 `.visible(false)`), 这些调整都在用户看到窗口之前
+    // 完成 —— 早先窗口是可见的, 于是"先按默认尺寸弹出、再跳成保存的尺寸/整屏"
+    // 成了启动白闪的第二段。
     let geometry = InitialGeometry::resolve(&window, saved_state);
     let _ = window.set_size(geometry.size);
     match geometry.position {
@@ -200,11 +252,23 @@ fn start(app: &mut App) -> anyhow::Result<()> {
         }
     }
     if geometry.maximized {
-        let _ = window.maximize();
+        // 只记下意图, 显示时再最大化 —— 见 RevealState::maximize 的说明。
+        reveal_state.maximize.store(true, Ordering::SeqCst);
     }
     // 迷你模式: 自动置顶, 并在下次启动时仍以迷你尺寸建窗(见 resolve)。
     if geometry.mini_mode {
         let _ = window.set_always_on_top(true);
+    }
+
+    // 兜底: 页面加载失败(WebView2 异常、资源损坏)时 `on_page_load` 不会触发,
+    // 窗口会一直隐藏着。宁可露出白屏, 也不能让用户以为应用没启动。
+    {
+        let window = window.clone();
+        let reveal_state = Arc::clone(&reveal_state);
+        std::thread::spawn(move || {
+            std::thread::sleep(REVEAL_FALLBACK);
+            reveal(&window, &reveal_state);
+        });
     }
 
     app.manage(Mutex::new(store));
@@ -219,6 +283,25 @@ fn start(app: &mut App) -> anyhow::Result<()> {
             false
         }
     };
+
+    // 关闭时补写一次几何, 并跳过节流。
+    //
+    // 写盘只由 Resized/Moved 驱动, 而 1s 节流会丢掉拖动末尾那次事件 —— 拖动
+    // 结束时窗口的真实位置往往还没落盘。关闭之后窗口要么隐藏(托盘)要么被前端
+    // `destroy()`, 两者都不会再触发写盘, 于是"拖完随即关闭"保存的是拖动过程中
+    // 的中间位置(偏差可达节流窗口内的拖动距离), 表现为位置记录时对时错。
+    //
+    // 这里不拦截关闭本身, 因此与托盘无关: 托盘不可用时关闭会直接销毁窗口,
+    // 同样需要这次补写(此后 ExitRequested 已经取不到窗口)。
+    {
+        let app_handle = app.handle().clone();
+        let tracked = window.clone();
+        window.on_window_event(move |event| {
+            if matches!(event, WindowEvent::CloseRequested { .. }) {
+                persist_window_state(&app_handle, &tracked, true);
+            }
+        });
+    }
 
     if tray_available {
         // The frontend resolves each intercepted close request using the

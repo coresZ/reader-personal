@@ -317,7 +317,9 @@ watch(() => props.show, (visible) => {
   top: 0;
   left: 0;
   right: 0;
-  min-height: 56px;
+  /* 64px: 比原来的 56px 高一档, 让 13px 文字与 18px 图标上下更舒展, 点击目标也
+   * 更宽裕。竖向留白由 flex 居中 + 上下 8px padding 自动分配, 无需另调。 */
+  min-height: 64px;
   /* 不透明实色: 工具栏要始终看得清。与标题栏同取主题 popup 色, 两者拼成
    * 顶部一条完整的栏, 中间不留色差。 */
   background: var(--popup-bg);
@@ -472,6 +474,15 @@ watch(() => props.show, (visible) => {
 .mobile-controls.mini .m-top-item.active {
   color: inherit;
   opacity: 1;
+}
+
+/*
+ * 迷你模式顶栏保持原来的 56px: 小窗只有 240px 高, 顶栏加高 8px 就是正文少一行,
+ * 而小窗里顶栏只有"目录"一项, 本来就不挤。与上面选中态的处理同一理由 ——
+ * 常规窗口的观感改善不该让 320×240 的小窗买单。
+ */
+.mobile-controls.mini .m-top-bar {
+  min-height: 56px;
 }
 
 /*

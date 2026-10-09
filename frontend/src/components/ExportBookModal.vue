@@ -387,8 +387,8 @@ watch(chapterRanges, () => {
 .modal-foot { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 15px 20px; border-top: 1px solid var(--color-border); }
 .foot-summary { margin-right: auto; font-size: 12px; color: var(--color-text-tertiary); }
 .primary-btn, .ghost-btn { min-width: 96px; min-height: 38px; border-radius: var(--radius-md); cursor: pointer; font-size: 14px; }
-.primary-btn { border: none; background: var(--color-primary); color: #fff; }
-.primary-btn:hover:not(:disabled) { background: var(--color-primary-dark); }
+.primary-btn { border: 1px solid var(--color-primary-soft-border); background: var(--color-primary-soft-bg); color: var(--color-primary-soft-text); }
+.primary-btn:hover:not(:disabled) { background: var(--color-primary-soft-bg-hover); border-color: var(--color-primary); }
 .primary-btn:disabled { opacity: .48; cursor: not-allowed; }
 .ghost-btn { border: 1px solid var(--color-border); background: transparent; color: var(--color-text-secondary); }
 .ghost-btn:hover:not(:disabled) { border-color: var(--color-primary-border); color: var(--color-primary); }

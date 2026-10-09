@@ -614,8 +614,8 @@ defineEmits<{
 }
 
 .filter-tab.active {
-  color: white;
-  background: var(--color-primary);
+  color: var(--color-primary-soft-text);
+  background: var(--color-primary-soft-bg);
 }
 
 .filter-select-wrap {
@@ -679,9 +679,9 @@ defineEmits<{
 }
 
 .page-number.active {
-  color: #fff;
-  background: var(--color-primary);
-  border-color: var(--color-primary);
+  color: var(--color-primary-soft-text);
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
   font-weight: 600;
 }
 

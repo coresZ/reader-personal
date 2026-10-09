@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <div class="rss-manage-view">
     <header class="rss-manage-hero">
       <div>
@@ -961,12 +961,17 @@ watch(() => store.sources, pruneSelection)
   transition: transform var(--duration-fast) var(--ease-out);
 }
 
+/* 开启态与全应用开关统一: 淡主色轨道 + 主色圆点。
+ * 这里原来是 rgba(201,127,58,.38) 硬编码橙 + 白圆点 —— 白圆点在那层橙上只有
+ * 约 1.9:1, 换成主色圆点后 3.6:1。 */
 .toggle input:checked + .toggle-slider {
-  background: rgba(201, 127, 58, 0.38);
+  background: var(--color-primary-soft-bg);
+  box-shadow: inset 0 0 0 1px var(--color-primary-soft-border);
 }
 
 .toggle input:checked + .toggle-slider::after {
   transform: translateX(18px);
+  background: var(--color-primary-soft-text);
 }
 
 @media (max-width: 960px) {

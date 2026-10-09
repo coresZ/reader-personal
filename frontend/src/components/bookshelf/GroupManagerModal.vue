@@ -292,10 +292,10 @@ async function renameGroup(groupId: number) {
 .primary-btn {
   flex-shrink: 0;
   border-radius: var(--radius-md);
-  border: 1px solid var(--color-primary);
+  border: 1px solid var(--color-primary-soft-border);
   padding: 9px var(--space-5);
-  background: var(--color-primary);
-  color: var(--color-text-inverse);
+  background: var(--color-primary-soft-bg);
+  color: var(--color-primary-soft-text);
   font-weight: 600;
   transition:
     background-color 0.18s var(--ease-out),
@@ -304,8 +304,8 @@ async function renameGroup(groupId: number) {
 }
 
 .primary-btn:hover:not(:disabled) {
-  background: var(--color-primary-dark);
-  border-color: var(--color-primary-dark);
+  background: var(--color-primary-soft-bg-hover);
+  border-color: var(--color-primary);
 }
 
 .primary-btn:active:not(:disabled) {

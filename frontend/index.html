@@ -13,6 +13,46 @@
     <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <title>阅读</title>
+    <script>
+      // 首屏底色必须在样式表与 Vue 之前确定, 否则 WebView2 会先呈现自己的默认
+      // 白底再跳成本应用的底色。主题判定沿用 stores/app.ts 的规则(用户选择优先,
+      // 其次是旧版 reader-isNight), 保证首屏底色与挂载后的主题一致、不闪。
+      (function () {
+        var mode = 'light'
+        try {
+          var saved = localStorage.getItem('theme')
+          if (saved === 'dark' || saved === 'light') {
+            mode = saved
+          } else if (localStorage.getItem('reader-isNight') === 'true') {
+            mode = 'dark'
+          }
+        } catch (error) {
+          // 读不到 localStorage 时按浅色处理, 与 stores/app.ts 的默认值一致。
+        }
+        document.documentElement.setAttribute('data-theme', mode)
+        document.documentElement.style.colorScheme = mode
+      })()
+    </script>
+    <style>
+      /* 首屏底色。真正的样式由 global.css 提供(它把 html/body/#app 的底色设为
+         --color-bg), 但那份样式要等打包产物加载完才生效, 这中间的窗口期底色是
+         WebView2 的默认白 —— 深色主题下会白闪一下。这里用同色系值先垫上, 挂载
+         后由 global.css 接管。 */
+      :root {
+        --boot-bg: #f5f6f7;
+      }
+
+      :root[data-theme='dark'] {
+        --boot-bg: #151719;
+      }
+
+      html,
+      body {
+        margin: 0;
+        background: var(--boot-bg);
+        color-scheme: light dark;
+      }
+    </style>
   </head>
   <body>
     <div id="app"></div>

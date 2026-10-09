@@ -265,13 +265,18 @@ function handleBookInfo(book: Book | SearchBook) {
   color: var(--color-text-tertiary);
 }
 
-.category-tag:hover:not(.section) {
+.category-tag:hover:not(.section):not(.active) {
   background: var(--color-bg-hover);
 }
 
+/* 选中态: 淡主色底 + 跟随主题的主色文字。
+ * 这里**不能**用 --color-primary-soft-* 令牌: 本视图在根元素覆盖了
+ * --color-primary(#c97f3a), 而自定义属性是在声明元素上完成替换后就继承的,
+ * :root 里那份已按 #c56f35 固化, 不会重算 —— 会出现底与字两套色系。
+ * 就地 color-mix 才能取到本视图的 --color-primary。 */
 .category-tag.active {
-  background: rgba(201, 127, 58, 0.1);
-  color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  color: color-mix(in srgb, var(--color-primary) 55%, var(--color-text));
   font-weight: 600;
 }
 
@@ -348,10 +353,12 @@ function handleBookInfo(book: Book | SearchBook) {
     border-radius: 20px;
   }
   
+  /* 窄屏沿用桌面版的就地写法: 同样不能换成 soft 令牌(原因见上方 .category-tag.active),
+   * 且媒体查询不提升特异性, 若这里另起一套值, 桌面/窄屏会出现两种颜色。 */
   .category-tag.active {
-    background: var(--color-primary);
-    color: white;
-    border-color: var(--color-primary);
+    background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+    color: color-mix(in srgb, var(--color-primary) 55%, var(--color-text));
+    border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
   }
 
   .content-panel {

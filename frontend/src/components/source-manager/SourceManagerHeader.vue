@@ -140,9 +140,9 @@ defineEmits<{
 }
 
 .action-btn.primary {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
-  color: #fff;
+  background: var(--color-primary-soft-bg);
+  border-color: var(--color-primary-soft-border);
+  color: var(--color-primary-soft-text);
 }
 
 .action-btn.danger {
@@ -169,9 +169,16 @@ defineEmits<{
   height: 18px;
 }
 
-.action-btn:hover,
+.action-btn:hover:not(.primary),
 .icon-btn:hover {
   background: var(--color-bg-hover);
+}
+
+/* 主按钮的 hover 必须单独写: 上面那条与 .action-btn.primary 特异性相同(0,2,0),
+ * 而它更靠后, 会把主按钮的淡橙底换成中性灰, 主次视觉断裂。 */
+.action-btn.primary:hover {
+  background: var(--color-primary-soft-bg-hover);
+  border-color: var(--color-primary);
 }
 
 .icon-btn.spinning svg {

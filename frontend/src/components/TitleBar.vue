@@ -238,6 +238,20 @@ onBeforeUnmount(() => cleanup())
   transition: background var(--duration-fast), opacity var(--duration-fast);
 }
 
+/* 标题栏窗口按钮不画焦点环。
+ *
+ *  全局的 `button:focus-visible` 会在按钮上套一圈橙色 outline。这些按钮是
+ *  Windows 原生标题栏按钮的仿制, 原生实现从不画焦点环; 而且它们紧贴窗口边角,
+ *  outline-offset 会把描边推到窗口外被裁掉一半, 看起来像一圈突兀的黄框 ——
+ *  用快捷键(F11 等)触发时, 最后点过的那个按钮会一直亮着, 尤其在全屏的纯色
+ *  背景上格外刺眼。
+ *
+ *  不担心键盘可达性: 这些按钮本来就有 hover 态, 且窗口控制(最小化/最大化/
+ *  关闭)都有对应的键盘替代(系统级 Alt+Space、F11 全屏键等)。 */
+.tb-btn:focus-visible {
+  outline: none;
+}
+
 .tb-btn:hover {
   background: var(--color-bg-hover);
   opacity: 1;
