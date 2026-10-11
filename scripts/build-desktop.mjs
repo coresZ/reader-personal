@@ -9,8 +9,11 @@
 //   data/          <- created on first launch, next to the exe
 //
 // Outputs (in desktop/dist/):
-//   Reader_<ver>_x64-setup.exe   NSIS installer
+//   <productName>_<ver>_x64-setup.exe   NSIS installer
 //   reader-portable-v<ver>-win-x64.zip
+//
+// The installer filename is derived from the resolved `productName`, which the
+// Windows build overrides in tauri.windows.conf.json (see readProductName).
 //
 // NOTE: cargo release builds must be low-concurrency (`-j 4`) because Windows
 // antivirus real-time scanning races cargo's parallel .rlib writes and causes
@@ -51,8 +54,24 @@ function readVersion() {
   return match[1]
 }
 
+/// The NSIS installer is named `<productName>_<version>_x64-setup.exe`, so the
+/// name has to be read from the config rather than hardcoded: the Windows build
+/// overrides `productName` in tauri.windows.conf.json (it must stay unique in
+/// the Windows uninstall registry, see desktop/src-tauri/windows-hooks.nsh).
+function readProductName() {
+  const readJson = (file) =>
+    JSON.parse(readFileSync(join(tauriDir, file), 'utf8').replace(/^\uFEFF/, ''))
+  const base = readJson('tauri.conf.json')
+  const windowsConf = join(tauriDir, 'tauri.windows.conf.json')
+  const override = existsSync(windowsConf) ? readJson('tauri.windows.conf.json') : {}
+  const productName = override.productName ?? base.productName
+  if (!productName) throw new Error('无法从 tauri.conf.json 读取 productName')
+  return productName
+}
+
 const version = readVersion()
-console.log(`打包 阅读 桌面版 v${version}`)
+const productName = readProductName()
+console.log(`打包 阅读 桌面版 v${version}（productName: ${productName}）`)
 
 // `ci` rather than `install` so a release build can never drift the lockfile.
 runShell('npm ci', frontendDir)
@@ -69,11 +88,12 @@ run('node', [tauriCli, 'build'], tauriDir, { CARGO_BUILD_JOBS: '4' })
 // The workspace shares the repo-root target/ dir, so the bundle lands under
 // <repoRoot>/target/release/bundle/nsis, not desktop/src-tauri/target.
 const nsisDir = join(repoRoot, 'target', 'release', 'bundle', 'nsis')
-const nsisSrc = join(nsisDir, `Reader_${version}_x64-setup.exe`)
+const nsisName = `${productName}_${version}_x64-setup.exe`
+const nsisSrc = join(nsisDir, nsisName)
 if (!existsSync(nsisSrc)) {
   throw new Error(`未找到 NSIS 安装包: ${nsisSrc}`)
 }
-const nsisOut = join(outRoot, `Reader_${version}_x64-setup.exe`)
+const nsisOut = join(outRoot, nsisName)
 rmSync(nsisOut, { force: true })
 cpSync(nsisSrc, nsisOut)
 console.log(`\nNSIS 安装包: ${nsisOut}`)
