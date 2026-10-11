@@ -84,6 +84,7 @@ export interface AvailableBookSourceResult {
   books: SearchBook[]
   lastIndex: number
   hasMore: boolean
+  hasErrors?: boolean
 }
 
 function normalizeAvailableBookSourceResult(
@@ -94,6 +95,7 @@ function normalizeAvailableBookSourceResult(
       books: data,
       lastIndex: data.length - 1,
       hasMore: false,
+      hasErrors: false,
     }
   }
   return data

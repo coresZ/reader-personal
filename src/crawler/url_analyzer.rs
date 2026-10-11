@@ -1,7 +1,7 @@
 use crate::crawler::fetcher::{HttpMethod, RequestSpec};
 use crate::error::error::AppError;
 use crate::model::book_source::BookSource;
-use crate::parser::js::{eval_js, eval_js_url, with_source};
+use crate::parser::js::{eval_js, eval_js_url, with_source, login_headers};
 use crate::util::text::normalize_source_url;
 use encoding_rs::Encoding;
 use regex::Regex;
@@ -48,9 +48,11 @@ pub fn analyze_url(
         if let Some(options) = options {
             let options = parse_url_options(options)?;
             if let Some(raw_method) = options.get("method").and_then(Value::as_str) {
-                if raw_method.eq_ignore_ascii_case("POST") {
-                    method = HttpMethod::POST;
-                }
+                method = match raw_method.to_ascii_uppercase().as_str() {
+                    "POST" => HttpMethod::POST, "HEAD" => HttpMethod::HEAD,
+                    "PUT" => HttpMethod::PUT, "PATCH" => HttpMethod::PATCH,
+                    "DELETE" => HttpMethod::DELETE, _ => HttpMethod::GET,
+                };
             }
             if let Some(value) = options.get("charset").and_then(Value::as_str) {
                 if !value.trim().is_empty() {
@@ -178,6 +180,7 @@ pub fn source_header_spec(source: &BookSource) -> Result<HeaderSpec, AppError> {
         merge_headers(&mut spec, parse_source_headers(&header_text));
     }
     ensure_default_user_agent(&mut spec.headers);
+    merge_headers(&mut spec, login_headers());
     Ok(spec)
 }
 
@@ -265,8 +268,34 @@ fn headers_from_value(value: &Value) -> Result<Vec<(String, String)>, AppError> 
     }
 }
 
+/// 书源作者从网页复制请求头时可能混入 Unicode 连字符变体
+/// （如 `User‑Agent` 用 U+2011 非断行连字符），统一还原为 ASCII '-'。
+fn sanitize_header_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.trim().chars() {
+        out.push(match ch {
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            other => other,
+        });
+    }
+    out
+}
+
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 fn merge_headers(spec: &mut HeaderSpec, headers: Vec<(String, String)>) {
     for (name, value) in headers {
+        let name = sanitize_header_name(&name);
+        if !is_valid_header_name(&name) {
+            tracing::warn!("忽略非法书源请求头: {name:?}");
+            continue;
+        }
         if name.eq_ignore_ascii_case("proxy") {
             spec.proxy = Some(value);
             continue;
@@ -396,19 +425,44 @@ fn replace_page_choices(rule: &str, page: i32) -> String {
     .into_owned()
 }
 
-fn split_url_options(rule: &str) -> (&str, Option<&str>) {
-    for (idx, ch) in rule.char_indices() {
-        if ch != ',' {
+pub(crate) fn split_url_options(spec: &str) -> (&str, Option<&str>) {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut quote = '\0';
+    let mut escaped = false;
+    let mut data_separator = spec.starts_with("data:");
+
+    for (idx, ch) in spec.char_indices() {
+        if escaped {
+            escaped = false;
             continue;
         }
-        let after = &rule[idx + ch.len_utf8()..];
-        let trimmed = after.trim_start();
-        if trimmed.starts_with('{') {
-            let option_start = rule.len() - trimmed.len();
-            return (rule[..idx].trim_end(), Some(&rule[option_start..]));
+
+        match ch {
+            '\\' if in_string => {
+                escaped = true;
+            }
+            '"' | '\'' if in_string && ch == quote => {
+                in_string = false;
+                quote = '\0';
+            }
+            '"' | '\'' if !in_string => {
+                in_string = true;
+                quote = ch;
+            }
+            '{' | '[' if !in_string => depth += 1,
+            '}' | ']' if !in_string => depth -= 1,
+            ',' if !in_string && depth == 0 => {
+                if data_separator { data_separator = false; continue; }
+                let left = &spec[..idx];
+                let right = &spec[idx + ch.len_utf8()..];
+                if right.trim_start().starts_with('{') { return (left, Some(right.trim())); }
+            }
+            _ => {}
         }
     }
-    (rule, None)
+
+    (spec, None)
 }
 
 fn strip_url_options(rule: &str) -> &str {

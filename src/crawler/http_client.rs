@@ -2,6 +2,8 @@ use reqwest::{Client, NoProxy, Proxy};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use url::Url;
+use std::{collections::HashMap, path::PathBuf};
+use super::source_session::{SourceHttpContext, SourceSession};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyMode {
@@ -20,6 +22,9 @@ pub struct HttpClient {
     client: Arc<RwLock<Client>>,
     active_proxy: Arc<RwLock<Option<String>>>,
     timeout_secs: u64,
+    source_sessions: Arc<RwLock<HashMap<String, Arc<SourceSession>>>>,
+    source_clients: Arc<RwLock<HashMap<String, Client>>>,
+    source_storage_dir: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl HttpClient {
@@ -33,6 +38,9 @@ impl HttpClient {
             client: Arc::new(RwLock::new(client)),
             active_proxy: Arc::new(RwLock::new(configured_proxy)),
             timeout_secs,
+            source_sessions: Arc::default(),
+            source_clients: Arc::default(),
+            source_storage_dir: Arc::default(),
         })
     }
 
@@ -41,6 +49,37 @@ impl HttpClient {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub fn set_source_storage_dir(&self, path: PathBuf) {
+        *self.source_storage_dir.write().unwrap_or_else(|e| e.into_inner()) = Some(path);
+    }
+
+    pub fn source_context(&self, user_ns: &str, source_url: &str, proxy: Option<&str>) -> anyhow::Result<SourceHttpContext> {
+        let source_url = crate::util::text::normalize_source_url(source_url);
+        let key = format!("{user_ns}::{source_url}");
+        let session = {
+            let mut sessions = self.source_sessions.write().unwrap_or_else(|e| e.into_inner());
+            sessions.entry(key.clone()).or_insert_with(|| {
+                let root = self.source_storage_dir.read().unwrap_or_else(|e| e.into_inner());
+                Arc::new(SourceSession::new(user_ns, &source_url, root.as_deref()))
+            }).clone()
+        };
+        let proxy = match proxy.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) => resolve_manual_proxy(value)?,
+            None => self.active_proxy(),
+        };
+        let client_key = format!("{key}::proxy={}", proxy.as_deref().unwrap_or(""));
+        let mut clients = self.source_clients.write().unwrap_or_else(|e| e.into_inner());
+        let client = match clients.get(&client_key) {
+            Some(client) => client.clone(),
+            None => {
+                let client = build_source_client(self.timeout_secs, proxy.as_deref(), session.cookies.clone())?;
+                clients.insert(client_key, client.clone());
+                client
+            }
+        };
+        Ok(SourceHttpContext { session, client, proxy, timeout_secs: self.timeout_secs })
     }
 
     /// 当前是否有代理生效。
@@ -112,6 +151,7 @@ impl HttpClient {
                 .active_proxy
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = configured_proxy.clone();
+            self.source_clients.write().unwrap_or_else(|e| e.into_inner()).clear();
         }
 
         Ok(ProxyStatus {
@@ -140,9 +180,16 @@ impl HttpClient {
 }
 
 fn build_client(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<Client> {
+    build_client_builder(timeout_secs, proxy)?.cookie_store(true).build().map_err(Into::into)
+}
+
+pub(crate) fn build_source_client(timeout_secs: u64, proxy: Option<&str>, jar: Arc<super::source_session::SourceCookieJar>) -> anyhow::Result<Client> {
+    build_client_builder(timeout_secs, proxy)?.cookie_provider(jar).build().map_err(Into::into)
+}
+
+fn build_client_builder(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<reqwest::ClientBuilder> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
-        .cookie_store(true)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     if let Some(proxy) = proxy {
         let bypass = NoProxy::from_string("localhost,127.0.0.1,::1");
@@ -150,7 +197,7 @@ fn build_client(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<Client
     } else {
         builder = builder.no_proxy();
     }
-    Ok(builder.build()?)
+    Ok(builder)
 }
 
 fn resolve_manual_proxy(value: &str) -> anyhow::Result<Option<String>> {

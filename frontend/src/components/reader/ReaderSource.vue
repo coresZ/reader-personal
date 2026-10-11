@@ -42,12 +42,12 @@
         正在全网搜索同名书籍...
       </div>
 
-      <div v-else-if="!preparedResults.length" class="empty">未找到其他书源</div>
+      <div v-else-if="!preparedResults.length && !sourcesIncomplete" class="empty">未找到其他书源</div>
       
       <div
         v-else
         v-for="item in preparedResults"
-        :key="item.book.bookUrl + item.book.origin"
+        :key="sourceCandidateKey(item.book)"
         class="source-item"
         :class="{ selected: selectedCandidate?.book.bookUrl === item.book.bookUrl && selectedCandidate?.book.origin === item.book.origin }"
         @click="selectCandidate(item)"
@@ -106,6 +106,10 @@
         </div>
       </div>
 
+      <div v-if="sourcesIncomplete && !searching && !loadingMore" class="source-incomplete" role="status">
+        <span>部分书源访问失败，可重试。</span>
+        <button type="button" class="load-more-btn" @click="startSearch(true)">重试</button>
+      </div>
       <div v-if="hasMoreSources && !searching" class="load-more-wrap">
         <button class="load-more-btn" :disabled="loadingMore" @click="loadMoreSources">
           {{ loadingMore ? '加载中...' : '加载更多' }}
@@ -132,7 +136,7 @@ import { getAvailableBookSourceSSE } from '../../api/search'
 import type { SseLike } from '../../api/sse'
 import { getBookInfo } from '../../api/bookshelf'
 import { isLocalBook } from '../../utils/localBook'
-import { matchesSourceSwitchAuthor, normalizeSourceSwitchAuthor } from '../../utils/searchRank'
+import { matchesSourceSwitchTitle, mergeSourceCandidates, normalizeSourceSwitchAuthor, sourceCandidateKey } from '../../utils/searchRank'
 import type { Book, SearchBook } from '../../types'
 
 type CandidateItem = {
@@ -150,6 +154,7 @@ const sourceStore = useSourceStore()
 const theme = computed(() => store.chromeTheme)
 const isLocal = computed(() => isLocalBook(store.book))
 const searching = ref(false)
+const sourcesIncomplete = ref(false)
 const loadingMore = ref(false)
 const results = ref<SearchBook[]>([])
 const lastIndex = ref(-1)
@@ -214,33 +219,30 @@ onUnmounted(() => {
   closeAvailableSourceSSE()
 })
 
-function startSearch() {
+function startSearch(refresh = false) {
   if (!store.book || isLocal.value) return
   closeAvailableSourceSSE()
   searching.value = true
+  sourcesIncomplete.value = false
   loadingMore.value = false
   results.value = []
   lastIndex.value = -1
   hasMoreSources.value = true
   selectedCandidate.value = null
   candidatePreview.value = null
+  mergeCandidates(store.book.sourceCandidates || [])
 
-  openAvailableSourceSSE('initial')
+  openAvailableSourceSSE('initial', refresh)
 }
 
 function mergeCandidates(candidates: SearchBook[]) {
   if (!store.book || !candidates.length) return
   const currentBook = store.book
-  candidates.forEach((item) => {
-    if (item.origin === currentBook.origin) return
-    if (!matchesSourceSwitchAuthor(currentBook.author, item.author)) return
-    const existed = results.value.some((candidate) =>
-      candidate.origin === item.origin || (candidate.bookUrl === item.bookUrl && candidate.origin === item.origin),
-    )
-    if (!existed) {
-      results.value.push(item)
-    }
-  })
+  const currentKey = sourceCandidateKey(currentBook)
+  results.value = mergeSourceCandidates(results.value, candidates.filter((item) => (
+    sourceCandidateKey(item) !== currentKey
+    && matchesSourceSwitchTitle(currentBook.name, item.name)
+  )))
 }
 
 type AvailableSourceMode = 'initial' | 'loadMore'
@@ -249,6 +251,7 @@ type AvailableSourceSSEPayload = {
   books?: SearchBook[]
   lastIndex?: number
   hasMore?: boolean
+  hasErrors?: boolean
 }
 
 function closeAvailableSourceSSE() {
@@ -268,6 +271,7 @@ function parseAvailableSourcePayload(event: { data: unknown }): AvailableSourceS
 
 function applyAvailableSourcePayload(payload: AvailableSourceSSEPayload | null) {
   if (!payload) return
+  sourcesIncomplete.value ||= payload.hasErrors === true
   const incoming = Array.isArray(payload.data)
     ? payload.data
     : (Array.isArray(payload.books) ? payload.books : [])
@@ -285,7 +289,7 @@ function applyAvailableSourcePayload(payload: AvailableSourceSSEPayload | null) 
   }
 }
 
-function openAvailableSourceSSE(mode: AvailableSourceMode) {
+function openAvailableSourceSSE(mode: AvailableSourceMode, refresh = false) {
   if (!store.book) return
 
   const beforeCount = results.value.length
@@ -296,6 +300,7 @@ function openAvailableSourceSSE(mode: AvailableSourceMode) {
     origin: store.book.origin,
     lastIndex: mode === 'loadMore' ? lastIndex.value : -1,
     concurrentCount: AVAILABLE_CONCURRENT_COUNT,
+    refresh: refresh ? 1 : undefined,
   })
   availableSourceSSE = stream
 
@@ -338,6 +343,8 @@ function finishAvailableSourceSSE(
   }
 
   if (failed) {
+    sourcesIncomplete.value = true
+    hasMoreSources.value = false
     if (mode === 'loadMore') {
       appStore.showToast('加载更多书源失败', 'error')
     }
@@ -348,6 +355,8 @@ function finishAvailableSourceSSE(
     const addedCount = results.value.length - beforeCount
     if (addedCount > 0) {
       appStore.showToast(`已新增 ${addedCount} 个书源`, 'success')
+    } else if (sourcesIncomplete.value) {
+      return
     } else if (!hasMoreSources.value) {
       appStore.showToast('没有更多书源了', 'warning')
     } else {
@@ -413,6 +422,8 @@ async function handleSwitch(res: SearchBook) {
   border-radius: 8px; color: inherit; opacity: 0.6;
   background: transparent; border: none; cursor: pointer;
 }
+
+.source-incomplete { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; font-size: 12px; opacity: .85; }
 
 .source-list {
   flex: 1;

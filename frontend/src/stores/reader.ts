@@ -5,6 +5,7 @@ import { useAppStore } from './app'
 import { useBookshelfStore } from './bookshelf'
 import {
   getChapterList,
+  getBookInfo,
   getBookContent,
   saveBookProgress,
   setBookSource as apiSetBookSource,
@@ -549,17 +550,25 @@ export const useReaderStore = defineStore('reader', () => {
     config.readerBackgroundImage = ''
   }
 
-  const chineseConverter = ref<((text: string) => string) | null>(null)
+  /** 两个方向的转换函数。以前只加载 traditionalized, 「简体」档因此无从转换 ——
+   *  繁体内容(常见于本地导入的书)选「简体」时毫无变化, 就是 issue #6 第 6 条。 */
+  const chineseConverters = ref<{
+    traditional: (text: string) => string
+    simplified: (text: string) => string
+  } | null>(null)
   let chineseLoading: Promise<void> | null = null
 
   async function ensureChineseConverterLoaded() {
-    if (chineseConverter.value || chineseLoading) return chineseLoading || Promise.resolve()
+    if (chineseConverters.value || chineseLoading) return chineseLoading || Promise.resolve()
     chineseLoading = import('../utils/chinese.js')
       .then((module) => {
-        chineseConverter.value = module.traditionalized
+        chineseConverters.value = {
+          traditional: module.traditionalized,
+          simplified: module.simplified,
+        }
       })
       .catch(() => {
-        chineseConverter.value = null
+        chineseConverters.value = null
       })
       .finally(() => {
         chineseLoading = null
@@ -638,6 +647,7 @@ export const useReaderStore = defineStore('reader', () => {
     if (!text) return ''
     let result = text
     const currentBook = book.value
+    if (currentBook?.readConfig?.useReplaceRule === false) return text
 
     function matchRuleScope(rule: ReplaceRule) {
       const scope = (rule.scope || '').trim()
@@ -679,9 +689,18 @@ export const useReaderStore = defineStore('reader', () => {
     return result
   }
 
+  /** 按当前档位转换正文。
+   *
+   *  两档都真正转换(此前「简体」档直接返回原文, 繁体内容因此"无效"):
+   *    'traditional' → 简转繁; 'simplified' → 繁转简。
+   *  已经是目标字形的文本转换后不变, 所以对简体书选「简体」、繁体书选「繁体」
+   *  都不会有副作用。 */
   function convertContent(text: string) {
-    if (!text || config.chineseMode !== 'traditional' || !chineseConverter.value) return text
-    return chineseConverter.value(text)
+    if (!text || !chineseConverters.value) return text
+    const convert = config.chineseMode === 'traditional'
+      ? chineseConverters.value.traditional
+      : chineseConverters.value.simplified
+    return convert(text)
   }
 
   function processContentForDisplay(text: string) {
@@ -692,12 +711,11 @@ export const useReaderStore = defineStore('reader', () => {
     return processContentForDisplay(content.value)
   })
 
+  // 两个档位都要加载转换器: 「简体」档现在也要真的做繁→简(此前它什么都不做)。
   watch(
     () => config.chineseMode,
-    (mode) => {
-      if (mode === 'traditional') {
-        void ensureChineseConverterLoaded()
-      }
+    () => {
+      void ensureChineseConverterLoaded()
     },
     { immediate: true },
   )
@@ -1848,15 +1866,31 @@ export const useReaderStore = defineStore('reader', () => {
     lastServerProgressKey.value = ''
     chaptersLoading.value = true
     try {
+      let tocUrl = b.tocUrl
+      if (!tocUrl && !isLocalBook(b)) {
+        // 搜索结果还没有详情；取回书源脚本设置的每书配置，再用详情中的目录地址加载。
+        const detail = await getBookInfo(b.bookUrl, b.origin).catch(() => null)
+        if (requestId !== bookLoadRequestId || book.value?.bookUrl !== b.bookUrl) return
+        if (detail) {
+          tocUrl = detail.tocUrl || tocUrl
+          book.value = {
+            ...b,
+            tocUrl,
+            readConfig: detail.readConfig
+              ? { ...b.readConfig, ...detail.readConfig }
+              : b.readConfig,
+          }
+        }
+      }
       // 先取初始章正文并恢复手机端进度，再设置当前章节，
       // 避免 setActiveChapterState 更新阅读时间后遮蔽手机端进度。
-      const chapterListPromise = getChapterList({
+      const chapterList = await getChapterList({
         bookUrl: b.bookUrl,
         bookSourceUrl: b.origin,
-        tocUrl: b.tocUrl,
+        tocUrl,
       })
-      chapters.value = await chapterListPromise
       if (requestId !== bookLoadRequestId || book.value?.bookUrl !== b.bookUrl) return
+      chapters.value = chapterList
 
       const initialIndex = chapters.value.length
         ? Math.max(0, Math.min(chapters.value.length - 1, currentIndex.value))
@@ -2072,6 +2106,14 @@ export const useReaderStore = defineStore('reader', () => {
 
       if (config.enablePreload) {
         void preloadAroundChapter(index)
+      }
+    } catch (error) {
+      // 章节加载失败必须让用户看到原因(如书源提示"VIP专属内容"、正文规则为空、
+      // 网络失败)。此前错误只向上抛: 目录/跳章的调用点没有 catch, 变成未处理
+      // 的 Promise 拒绝, 界面上什么提示都没有, 用户只觉得"点了没反应"。
+      if (requestId === chapterLoadRequestId) {
+        const message = error instanceof Error ? error.message : String(error ?? '')
+        appStore.showToast(message.trim() || '章节加载失败，请稍后重试', 'error')
       }
     } finally {
       // 只收尾 loading：阶段提示由 fetchChapterContent 的持有者机制管理，

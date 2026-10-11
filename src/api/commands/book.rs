@@ -23,15 +23,11 @@ use std::sync::{
 };
 use tokio::task::JoinSet;
 
-const DEFAULT_AVAILABLE_RESULT_LIMIT: usize = 20;
 const MAX_AVAILABLE_RESULT_LIMIT: usize = 100;
 const DEFAULT_AVAILABLE_CONCURRENT_COUNT: usize = 16;
 const MAX_AVAILABLE_CONCURRENT_COUNT: usize = 20;
-const AVAILABLE_SOURCE_SSE_RESULT_LIMIT: usize = 20;
-/// 后台扫描软上限: 全扫描不再硬截断, 但当累计找到的有效候选达到此阈值时,
-/// 即使还有源没扫也提前停止。该值远大于前端展示上限(AVAILABLE_SOURCE_SSE_RESULT_LIMIT),
-/// 保证缓存里的候选数足够多、不会被「只有前 20 个」的残缺结果固化, 同时避免
-/// 在源很多(数百个)时把全部启用源都扫一遍造成过大后台开销。
+/// 达到候选软上限后停止派发新的书源，已派发书源的结果完整返回。
+/// `lastIndex` 始终停在完整书源边界，客户端通过 `hasMore` 继续扫描。
 const AVAILABLE_SOURCE_SSE_SCAN_SOFT_LIMIT: usize = 60;
 
 #[derive(Debug, Deserialize)]
@@ -364,6 +360,7 @@ pub struct GetAvailableBookSourceRequest {
     refresh: Option<i32>,
     #[serde(rename = "lastIndex")]
     last_index: Option<i32>,
+    /// Preferred candidate count; a source's complete list is returned together.
     #[serde(rename = "resultLimit")]
     result_limit: Option<i32>,
     #[serde(rename = "concurrentCount")]
@@ -378,6 +375,7 @@ pub struct AvailableBookSourceResponse {
     books: Vec<SearchBook>,
     last_index: i32,
     has_more: bool,
+    has_errors: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1411,7 +1409,7 @@ pub async fn set_book_source(
     let mut seeded: Vec<SearchBook> = Vec::new();
     let mut seen_seed = std::collections::HashSet::new();
     for candidate in candidates_for_seed {
-        if candidate.book_url == saved.book_url {
+        if is_current_source_candidate(&candidate, &saved) {
             continue;
         }
         if seen_seed.insert(available_source_sse_result_key(&candidate)) {
@@ -2164,6 +2162,8 @@ pub async fn search_book_source_sse(
         let mut total = 0usize;
         let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
         let mut all_results: Vec<crate::model::search::SearchBook> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut search_failed = false;
 
         while (idx as usize) < sources.len() || !tasks.is_empty() {
             if cancel_guard.is_cancelled() {
@@ -2174,7 +2174,7 @@ pub async fn search_book_source_sse(
                 let _ = on_event.send(json_end(last_idx));
                 return;
             }
-            while tasks.len() < concurrent && (idx as usize) < sources.len() {
+            while tasks.len() < concurrent && (idx as usize) < sources.len() && total < search_size {
                 let source = sources[idx as usize].clone();
                 let svc = state_clone.book_service.clone();
                 let target_name = book.name.clone();
@@ -2187,7 +2187,6 @@ pub async fn search_book_source_sse(
                         .await;
                     (cur_idx, res, target_name, target_author)
                 }));
-                last_idx = idx;
                 idx += 1;
             }
 
@@ -2197,34 +2196,37 @@ pub async fn search_book_source_sse(
             };
             if let Some(res) = next {
                 if let Ok((cur_idx, Ok(list), target_name, target_author)) = res {
-                    let mut batch = Vec::new();
-                    for b in list {
-                        if b.name == target_name && b.author == target_author {
-                            batch.push(b);
-                        }
-                    }
+                    last_idx = last_idx.max(cur_idx);
+                    let batch = take_available_source_sse_matches(
+                        list, &target_name, &target_author, &mut seen, usize::MAX,
+                    );
                     if !batch.is_empty() {
                         total += batch.len();
                         all_results.extend(batch.clone());
                         let payload = serde_json::json!({"event": "data", "lastIndex": cur_idx, "data": batch});
                         let _ = on_event.send(payload);
                     }
-                    if total >= search_size {
-                        break;
-                    }
+                } else {
+                    search_failed = true;
                 }
             } else {
                 break;
             }
         }
 
-        if refresh || !all_results.is_empty() {
+        last_idx = last_idx.max(idx - 1);
+        if last_index < 0 && idx as usize >= sources.len() && tasks.is_empty()
+            && !search_failed && (refresh || !all_results.is_empty())
+        {
             let _ = state_clone
                 .book_service
                 .save_book_sources_cache(&user_ns, &book.book_url, &all_results)
                 .await;
         }
-        let _ = on_event.send(json_end(last_idx));
+        let _ = on_event.send(serde_json::json!({
+            "event": "end", "lastIndex": last_idx,
+            "hasMore": (idx as usize) < sources.len(), "hasErrors": search_failed
+        }));
     });
 
     Ok(())
@@ -2297,7 +2299,7 @@ pub async fn get_available_book_source(
                     Vec::new(),
                     req.last_index.unwrap_or(-1),
                     false,
-                    req.result_limit,
+                    false,
                 ))
                 .unwrap_or_default(),
             ));
@@ -2306,6 +2308,7 @@ pub async fn get_available_book_source(
     }
 
     let mut result: Vec<SearchBook> = Vec::new();
+    let mut search_failed = false;
     let mut cursor = (req.last_index.unwrap_or(-1) + 1).max(0) as usize;
     let mut last_index = req.last_index.unwrap_or(-1);
 
@@ -2333,6 +2336,7 @@ pub async fn get_available_book_source(
                         .filter(|b| available_source_matches_target(b, &name, &author))
                         .collect::<Vec<_>>(),
                     Err(err) => {
+                        search_failed = true;
                         tracing::debug!(
                             "getAvailableBookSource search failed at source index {}: {:?}",
                             source_index,
@@ -2342,6 +2346,8 @@ pub async fn get_available_book_source(
                     }
                 };
                 batch_results.push((source_index, matches));
+            } else {
+                search_failed = true;
             }
         }
 
@@ -2351,26 +2357,23 @@ pub async fn get_available_book_source(
                 break;
             }
             last_index = source_index;
-            for book in matches {
-                if result.len() >= result_limit {
-                    break;
-                }
-                result.push(book);
-            }
+            result.extend(matches);
         }
 
         cursor = batch_end;
         if result.len() >= result_limit {
             break;
         }
+        // Failed parsing tasks also consume their source index.
+        last_index = batch_end as i32 - 1;
     }
 
     let has_more = (last_index + 1).max(0) < sources.len() as i32;
-    if !has_more && req.last_index.unwrap_or(-1) < 0 {
-        // 缓存剔除「恰好是当前书源」的条目, 完整列表才会在换源面板再次打开时命中。
+    if !has_more && !search_failed && req.last_index.unwrap_or(-1) < 0 {
+        // 缓存保留聚合源的其他书籍地址，完整列表才在再次打开面板时复用。
         let cache_list: Vec<SearchBook> = result
             .iter()
-            .filter(|candidate| candidate.origin != book.origin)
+            .filter(|candidate| !is_current_source_candidate(candidate, &book))
             .cloned()
             .collect();
         match state.book_source_service.list_enabled(&user_ns).await {
@@ -2394,9 +2397,9 @@ pub async fn get_available_book_source(
         }
     }
 
-    if paged_request {
+    if paged_request || search_failed {
         let response =
-            build_available_book_source_response(result, last_index, has_more, req.result_limit);
+            build_available_book_source_response(result, last_index, has_more, search_failed);
         return Ok(ApiResponse::ok(
             serde_json::to_value(response).unwrap_or_default(),
         ));
@@ -2507,37 +2510,23 @@ pub async fn get_available_book_source_sse(
 
         let mut next_index = (last_index_start + 1).max(0) as usize;
         let mut last_idx = last_index_start;
-        let mut emitted = 0usize;
-        let emit_limit = req
-            .result_limit
-            .map(|limit| effective_available_result_limit(Some(limit)))
-            .unwrap_or(AVAILABLE_SOURCE_SSE_RESULT_LIMIT);
+        let scan_limit = effective_available_result_limit(req.result_limit)
+            .min(AVAILABLE_SOURCE_SSE_SCAN_SOFT_LIMIT);
         let mut all_results: Vec<SearchBook> = Vec::new();
         let mut seen = std::collections::HashSet::<String>::new();
         let mut tasks = JoinSet::new();
-        // 用户离开换源面板时前端只关 channel, 后端感知不到; 登记取消后才能停下,
-        // 否则剩余启用源仍会被逐个请求完。
         let mut cancelled = false;
+        let mut search_failed = false;
 
-        // 搜索不再因「前端推送满 20 个」就提前截断(否则靠前的源占满名额、后续
-        // 源永远不被扫描、缓存还会固化这份残缺列表)。`emitted` 只控制前端推送。
-        // 但也不无条件扫完全部启用源: 当累计有效候选达到软上限(远大于前端 20)
-        // 时提前停止, 在「缓存足够完整」与「后台扫描开销」间取平衡。
         while next_index < sources.len() || !tasks.is_empty() {
             if cancel_guard.is_cancelled() {
                 cancelled = true;
                 tasks.abort_all();
                 break;
             }
-            // 已收集足够多候选且无在途任务时提前结束, 不再派发新搜索
-            if all_results.len() >= AVAILABLE_SOURCE_SSE_SCAN_SOFT_LIMIT
-                && tasks.is_empty()
-            {
-                break;
-            }
             while tasks.len() < concurrent_count
                 && next_index < sources.len()
-                && all_results.len() < AVAILABLE_SOURCE_SSE_SCAN_SOFT_LIMIT
+                && all_results.len() < scan_limit
             {
                 let source_index = next_index;
                 let source = sources[source_index].clone();
@@ -2553,7 +2542,6 @@ pub async fn get_available_book_source_sse(
                 });
                 next_index += 1;
             }
-
             if tasks.is_empty() {
                 break;
             }
@@ -2567,7 +2555,6 @@ pub async fn get_available_book_source_sse(
                     last_idx = last_idx.max(source_index);
                     match search_result {
                         Ok(list) => {
-                            // 匹配全部取回用于缓存; 只有给前端推送时才受结果上限约束。
                             let matches = take_available_source_sse_matches(
                                 list,
                                 &target_name,
@@ -2575,30 +2562,24 @@ pub async fn get_available_book_source_sse(
                                 &mut seen,
                                 usize::MAX,
                             );
-                            // 先全部追加到缓存结果, 再克隆出前 budget 个推送前端。
-                            // 不能用 drain: 它会从 all_results 移除已推送的条目,
-                            // 导致最终缓存只剩未推送部分(少于 20 个结果时缓存几乎为空)。
-                            let push_start = all_results.len();
-                            all_results.extend(matches);
-                            if emitted < emit_limit {
-                                let budget = emit_limit - emitted;
-                                let end = (push_start + budget).min(all_results.len());
-                                for book in all_results[push_start..end].iter().cloned() {
-                                    emitted += 1;
-                                    let payload = serde_json::json!({
-                                        "event": "data",
-                                        "lastIndex": source_index,
-                                        "hasMore": next_index < sources.len() || !tasks.is_empty(),
-                                        "data": [book]
-                                    });
-                                    if on_event.send(payload).is_err() {
-                                        tasks.abort_all();
-                                        return;
-                                    }
+                            // Return every candidate from each completed source. A
+                            // source-index cursor cannot resume halfway through its list.
+                            for candidate in matches {
+                                all_results.push(candidate.clone());
+                                let payload = serde_json::json!({
+                                    "event": "data",
+                                    "lastIndex": source_index,
+                                    "hasMore": next_index < sources.len() || !tasks.is_empty(),
+                                    "data": [candidate]
+                                });
+                                if on_event.send(payload).is_err() {
+                                    tasks.abort_all();
+                                    return;
                                 }
                             }
                         }
                         Err(err) => {
+                            search_failed = true;
                             tracing::debug!(
                                 "getAvailableBookSourceSSE search failed at source index {}: {:?}",
                                 source_index,
@@ -2608,10 +2589,14 @@ pub async fn get_available_book_source_sse(
                     }
                 }
                 Some(Err(err)) => {
+                    search_failed = true;
                     tracing::debug!("getAvailableBookSourceSSE task join failed: {:?}", err);
                 }
                 None => break,
             }
+        }
+        if !cancelled {
+            last_idx = next_index as i32 - 1;
         }
 
         // 达到后台软上限时，仍可能有尚未扫描的书源；保留“加载更多”，
@@ -2619,15 +2604,13 @@ pub async fn get_available_book_source_sse(
         let has_more = next_index < sources.len();
         let final_last_idx = last_idx;
 
-        // 全扫描(或达到软上限)完成后才写缓存, 缓存里是「能搜到这本书的源」而非
-        // 被前端结果上限截断的前 20 个。保存前剔除「恰好是当前书源」的条目, 避免
-        // 缓存被「只有当前源」的假阴性结果固化, 导致换源面板查不到其他源。
+        // 完整扫描后保存全部候选。仅排除当前书籍地址，聚合源内的其他地址保留。
         // 被取消时同样不写: 这份结果是半截的, 写进去会把「还没扫到的源」当成
         // 「搜不到这本书」固化下来 (与 `has_more` 同理)。
-        if last_index_start < 0 && !has_more && !cancelled {
+        if last_index_start < 0 && !has_more && !cancelled && !search_failed {
             let cache_list: Vec<SearchBook> = all_results
                 .iter()
-                .filter(|candidate| candidate.origin != book.origin)
+                .filter(|candidate| !is_current_source_candidate(candidate, &book))
                 .cloned()
                 .collect();
             match state_clone.book_source_service.list_enabled(&user_ns).await {
@@ -2654,7 +2637,8 @@ pub async fn get_available_book_source_sse(
         let _ = on_event.send(serde_json::json!({
             "event": "end",
             "lastIndex": final_last_idx,
-            "hasMore": has_more
+            "hasMore": has_more,
+            "hasErrors": search_failed
         }));
     });
 
@@ -2975,8 +2959,8 @@ fn book_matches_delete_target(shelf_book: &Book, target: &Book) -> bool {
 
 fn effective_available_result_limit(result_limit: Option<i32>) -> usize {
     result_limit
-        .unwrap_or(DEFAULT_AVAILABLE_RESULT_LIMIT as i32)
-        .clamp(1, MAX_AVAILABLE_RESULT_LIMIT as i32) as usize
+        .map(|limit| limit.clamp(1, MAX_AVAILABLE_RESULT_LIMIT as i32) as usize)
+        .unwrap_or(usize::MAX)
 }
 
 fn effective_available_concurrent_count(concurrent_count: Option<i32>) -> usize {
@@ -3015,18 +2999,18 @@ fn fallback_available_book(req: &GetAvailableBookSourceRequest) -> Option<Book> 
 }
 
 fn build_available_book_source_response(
-    mut books: Vec<SearchBook>,
+    books: Vec<SearchBook>,
     last_index: i32,
     has_more: bool,
-    result_limit: Option<i32>,
+    has_errors: bool,
 ) -> AvailableBookSourceResponse {
-    let limit = effective_available_result_limit(result_limit);
-    let has_more = has_more || books.len() > limit;
-    books.truncate(limit);
+    // lastIndex addresses sources, so trimming a source's candidates here
+    // would make the omitted books unreachable on the next request.
     AvailableBookSourceResponse {
         books,
         last_index,
         has_more,
+        has_errors,
     }
 }
 
@@ -3061,6 +3045,11 @@ fn is_local_book(book: &Book) -> bool {
         || is_local_epub_url(&book.book_url)
         || is_local_pdf_origin(&book.origin)
         || is_local_pdf_url(&book.book_url)
+}
+
+fn is_current_source_candidate(candidate: &SearchBook, current: &Book) -> bool {
+    source_identity_url(&candidate.origin) == source_identity_url(&current.origin)
+        && candidate.book_url == current.book_url
 }
 
 fn available_source_sse_result_key(book: &SearchBook) -> String {
@@ -3157,7 +3146,8 @@ mod tests {
         book_matches_delete_target, build_available_book_source_response,
         cache_count_for_shelf_display, dedup_chapters, fallback_available_book,
         resolve_cache_start_index, retain_enabled_source_books, run_cache_tasks,
-        should_use_available_source_cache,
+        should_use_available_source_cache, is_current_source_candidate,
+        effective_available_result_limit,
         take_available_source_cached_matches,
         take_available_source_sse_matches, GetAvailableBookSourceRequest,
         SearchCancellationGuard, SEARCH_CANCELLATIONS, SEARCH_CANCEL_REQUESTS,
@@ -3553,7 +3543,7 @@ mod tests {
     }
 
     #[test]
-    fn available_book_source_limits_result_count_and_reports_more() {
+    fn available_book_source_response_preserves_complete_source_results() {
         let books: Vec<SearchBook> = (0..25)
             .map(|index| SearchBook {
                 name: format!("Book {index}"),
@@ -3566,13 +3556,14 @@ mod tests {
             })
             .collect();
 
-        let response = build_available_book_source_response(books, 11, true, Some(20));
+        let response = build_available_book_source_response(books, 11, false, true);
 
-        assert_eq!(response.books.len(), 20);
+        assert_eq!(response.books.len(), 25);
         assert_eq!(response.books[0].name, "Book 0");
-        assert_eq!(response.books[19].name, "Book 19");
+        assert_eq!(response.books[24].name, "Book 24");
         assert_eq!(response.last_index, 11);
-        assert!(response.has_more);
+        assert!(!response.has_more);
+        assert!(response.has_errors);
     }
 
     #[test]
@@ -3635,6 +3626,31 @@ mod tests {
         assert_eq!(book.name, "深空彼岸");
         assert_eq!(book.author, "另一作者");
         assert_eq!(book.origin, "https://source.test");
+    }
+
+    #[test]
+    fn available_source_candidates_keep_each_aggregate_station() {
+        let books: Vec<SearchBook> = (0..35).map(|index| SearchBook {
+            name: "斗破苍穹".to_string(),
+            author: if index % 2 == 0 { String::new() } else { "天蚕土豆_qd22".to_string() },
+            origin: "聚合测试".to_string(),
+            book_url: format!("data:;base64,station-{index}"),
+            ..SearchBook::default()
+        }).collect();
+        let mut seen = HashSet::new();
+        let matches = take_available_source_sse_matches(books.clone(), "斗破 苍穹", "天蚕土豆", &mut seen, usize::MAX);
+        assert_eq!(matches.len(), 35);
+        assert!(take_available_source_sse_matches(books, "斗破苍穹", "天蚕土豆", &mut seen, usize::MAX).is_empty());
+        assert_eq!(effective_available_result_limit(None), usize::MAX);
+    }
+
+    #[test]
+    fn current_candidate_filter_preserves_other_addresses_from_same_source() {
+        let current = Book { origin: "https://aggregate.test/".to_string(), book_url: "data:;base64,current".to_string(), ..Book::default() };
+        let mut candidate = SearchBook { origin: "https://aggregate.test".to_string(), book_url: current.book_url.clone(), ..SearchBook::default() };
+        assert!(is_current_source_candidate(&candidate, &current));
+        candidate.book_url = "data:;base64,other".to_string();
+        assert!(!is_current_source_candidate(&candidate, &current));
     }
 
     #[test]

@@ -7,6 +7,50 @@ use reader_rust::storage::cache::file_cache::FileCache;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_and_panel_requests_evaluate_headers_with_current_source_state() {
+    use reader_rust::parser::js::{eval_js, run_panel_fetch, with_http_context, with_source};
+    let app = Router::new().route("/headers", get(|headers: HeaderMap| async move {
+        Json(json!({
+            "token": headers.get("authorization").and_then(|value| value.to_str().ok()).unwrap_or_default(),
+            "ua": headers.get("user-agent").and_then(|value| value.to_str().ok()).unwrap_or_default(),
+        }))
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let source = BookSource {
+        book_source_url: format!("moyue://rapid/{}", Uuid::new_v4()),
+        header: Some("@js:var v=JSON.parse(source.getVariable()||'{}');JSON.stringify(v.token?{'Authorization':'Bearer '+v.token,'User-Agent':'Legado/3.0'}:{'User-Agent':'Legado/3.0'})".into()),
+        ..Default::default()
+    };
+    let http = HttpClient::new(3, None).unwrap();
+    let context = http.source_context("dynamic-headers", &source.book_source_url, None).unwrap();
+    let results = tokio::task::spawn_blocking(move || with_http_context(context, || with_source(&source, || {
+        let url = json!(format!("{base}/headers"));
+        let script = format!(r#"
+            var out=[];
+            out.push(JSON.parse(java.ajax({url})));
+            source.setVariable(JSON.stringify({{token:'first'}}));
+            out.push(JSON.parse(java.connect({url}).body()));
+            source.setVariable(JSON.stringify({{token:'second'}}));
+            out.push(JSON.parse(java.get({url},{{authorization:'explicit'}}).body()));
+            JSON.stringify(out)
+        "#);
+        let script_result = eval_js(&script, "", &base).unwrap();
+        let panel_result = run_panel_fetch(&source, &base, "fetch", &json!({"url":"/headers","method":"GET"})).unwrap();
+        (serde_json::from_str::<Value>(&script_result).unwrap(), panel_result)
+    }))).await.unwrap();
+    assert_eq!(results.0, json!([
+        {"token":"","ua":"Legado/3.0"},
+        {"token":"Bearer first","ua":"Legado/3.0"},
+        {"token":"explicit","ua":"Legado/3.0"},
+    ]));
+    assert_eq!(results.1["code"], 200);
+    assert_eq!(serde_json::from_str::<Value>(results.1["body"].as_str().unwrap()).unwrap(), json!({"token":"Bearer second","ua":"Legado/3.0"}));
+    server.abort();
+}
+
 async fn protected_toc(headers: HeaderMap) -> Json<Value> {
     let has_source_token = headers
         .get("x-source-token")

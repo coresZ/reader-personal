@@ -1,7 +1,9 @@
 use crate::crawler::url_analyzer::parse_source_headers;
+use crate::crawler::{http_client::HttpClient, source_session::SourceHttpContext};
+use crate::crawler::fetcher::{HttpMethod, RequestSpec};
 use crate::model::book_source::BookSource;
 use crate::util::hash::md5_hex;
-use crate::util::text::{apply_regex_replace, strip_whitespace};
+use crate::util::text::{apply_regex_replace, normalize_source_url, strip_whitespace};
 use base64::Engine;
 use cbc::cipher::{
     block_padding::{NoPadding, Pkcs7, ZeroPadding},
@@ -14,7 +16,6 @@ use once_cell::sync::Lazy;
 use sha1::Sha1;
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use reqwest::blocking::Client;
-use reqwest::Method;
 use rquickjs::context::EvalOptions;
 use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
@@ -22,6 +23,7 @@ use serde_json::{json, Value as JsonValue};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -31,10 +33,16 @@ static JS_KV: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(Has
 /// 持久 KV: `cache.put`、`source/book/chapter.putVariable` 等, 落盘到 `{storage}/js_store.json`。
 static JS_STORE: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(load_js_store()));
 static JS_STORAGE_DIR: OnceLock<PathBuf> = OnceLock::new();
+static JS_DEFAULT_HTTP: OnceLock<HttpClient> = OnceLock::new();
+static JS_FALLBACK_HTTP: Lazy<HttpClient> = Lazy::new(|| HttpClient::new(30, None).expect("JS HTTP client"));
+static JS_HTTP_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("JS HTTP runtime"));
 /// 组装好的 jsLib 源码, 按 jsLib 文本 md5 缓存; `Some(Instant)` 表示含下载失败项, 到期后重试。
 static JS_LIB_CACHE: Lazy<Mutex<HashMap<String, (String, Option<Instant>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 const JS_LIB_RETRY_AFTER: Duration = Duration::from_secs(60);
+// Signature helpers can nest JS and Rust crypto calls beyond QuickJS's 256 KiB
+// default. Keep the limit below the native worker thread's stack allocation.
+const JS_MAX_STACK_SIZE: usize = 1024 * 1024;
 const DEFAULT_JS_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 /// blocking client 只能在无 tokio runtime 的线程上构建/使用, 所有访问都走 `run_blocking_http`。
 static JS_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
@@ -63,6 +71,18 @@ struct JsSourceInfo {
     url: String,
     name: String,
     headers: Vec<(String, String)>,
+    header_script: Option<String>,
+    http: Option<SourceHttpContext>,
+    concurrent_rate: Option<String>,
+}
+
+#[derive(Default, Clone, serde::Serialize)]
+pub struct LoginEffects {
+    pub values: serde_json::Map<String, JsonValue>,
+    pub refresh: bool,
+    pub reset: bool,
+    /// `source.login()` 被脚本调用: 调用方应重跑 loginUrl 并重取响应。
+    pub login: bool,
 }
 
 /// 正文/目录解析时的书籍与章节上下文, 对应 legado JS 里的 `book` / `chapter`。
@@ -78,6 +98,11 @@ thread_local! {
     static ACTIVE_SOURCE: RefCell<Option<JsSourceInfo>> = const { RefCell::new(None) };
     static ACTIVE_BOOK_CTX: RefCell<Option<JsBookContext>> = const { RefCell::new(None) };
     static JS_LOGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static ACTIVE_HTTP: RefCell<Option<SourceHttpContext>> = const { RefCell::new(None) };
+    static ACTIVE_SEARCH: RefCell<Option<(String, i32)>> = const { RefCell::new(None) };
+    static LOGIN_EFFECTS: RefCell<LoginEffects> = RefCell::new(LoginEffects::default());
+    /// `java.getStrResponse()`: 最近一次 HTTP 请求的响应信封。
+    static LAST_RESPONSE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 const MAX_JS_LOGS: usize = 200;
@@ -87,15 +112,64 @@ pub fn set_js_storage_dir(dir: impl Into<PathBuf>) {
     let _ = JS_STORAGE_DIR.set(dir.into());
 }
 
+pub fn set_js_http_client(http: HttpClient) { let _ = JS_DEFAULT_HTTP.set(http); }
+
+pub fn with_http_context<T>(http: SourceHttpContext, f: impl FnOnce() -> T) -> T {
+    with_thread_local(&ACTIVE_HTTP, Some(http), f)
+}
+
+pub fn with_search_context<T>(key: &str, page: i32, f: impl FnOnce() -> T) -> T {
+    with_thread_local(&ACTIVE_SEARCH, Some((key.to_string(), page)), f)
+}
+
+pub fn source_http_context(source_url: &str) -> anyhow::Result<SourceHttpContext> {
+    if let Some(http) = ACTIVE_HTTP.with(|cell| cell.borrow().clone()) {
+        if http.session.source_url == source_url.trim() { return Ok(http); }
+    }
+    JS_DEFAULT_HTTP.get().unwrap_or(&JS_FALLBACK_HTTP).source_context("default", source_url, None)
+}
+
+pub fn take_login_effects() -> LoginEffects {
+    LOGIN_EFFECTS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+/// 把某个响应设为 `java.getStrResponse()` 的"最近响应"。
+/// loginCheckJs 在执行前用当前响应初始化这个槽位（legado 语义）。
+pub fn set_last_response(raw: &str) {
+    LAST_RESPONSE.with(|cell| cell.replace(Some(raw.to_string())));
+}
+
+fn cookie_tag_url(tag: &str) -> Option<url::Url> {
+    let tag = tag.trim();
+    if tag.is_empty() { return None; }
+    let absolute = if tag.contains("://") {
+        tag.to_string()
+    } else if tag.starts_with("//") {
+        format!("https:{tag}")
+    } else {
+        format!("https://{tag}")
+    };
+    url::Url::parse(&absolute).ok().filter(|url| {
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+    })
+}
+
+pub fn login_headers() -> Vec<(String, String)> {
+    active_source().http.and_then(|http| http.session.get("loginHeader"))
+        .map(|raw| parse_source_headers(&raw)).unwrap_or_default()
+}
+
 fn with_thread_local<V: 'static, T>(
     key: &'static std::thread::LocalKey<RefCell<Option<V>>>,
     value: Option<V>,
     f: impl FnOnce() -> T,
 ) -> T {
-    let previous = key.with(|cell| cell.replace(value));
-    let result = f();
-    key.with(|cell| cell.replace(previous));
-    result
+    struct Restore<V: 'static> { key: &'static std::thread::LocalKey<RefCell<Option<V>>>, previous: Option<V> }
+    impl<V: 'static> Drop for Restore<V> {
+        fn drop(&mut self) { self.key.with(|cell| cell.replace(self.previous.take())); }
+    }
+    let _restore = Restore { key, previous: key.with(|cell| cell.replace(value)) };
+    f()
 }
 
 pub fn with_js_lib<T>(js_lib: Option<&str>, f: impl FnOnce() -> T) -> T {
@@ -104,15 +178,24 @@ pub fn with_js_lib<T>(js_lib: Option<&str>, f: impl FnOnce() -> T) -> T {
 
 /// 设置当前书源(jsLib + `source` 信息 + 默认请求头)后执行 f。
 pub fn with_source<T>(source: &BookSource, f: impl FnOnce() -> T) -> T {
+    let raw_header = source.header.as_deref().unwrap_or_default().trim();
+    let header_script = raw_header.strip_prefix("@js:")
+        .or_else(|| raw_header.strip_prefix("<js>").and_then(|text| text.strip_suffix("</js>")))
+        .map(str::to_string);
     let headers = source
         .header
         .as_deref()
+        .filter(|_| header_script.is_none())
         .map(parse_source_headers)
         .unwrap_or_default();
+    let http = source_http_context(&source.book_source_url).ok();
     let info = JsSourceInfo {
         url: source.book_source_url.clone(),
         name: source.book_source_name.clone(),
         headers,
+        header_script,
+        http,
+        concurrent_rate: source.concurrent_rate.clone(),
     };
     with_thread_local(&ACTIVE_SOURCE, Some(info), || {
         with_js_lib(source.js_lib.as_deref(), f)
@@ -186,6 +269,19 @@ fn store_get(key: &str) -> Option<String> {
         .cloned()
 }
 
+/// Source-script reading preferences for this book. Merge these into a Book's
+/// readConfig when returning metadata or creating a later JavaScript context.
+pub fn book_read_config_override(source_url: &str, book_url: &str) -> Option<JsonValue> {
+    if book_url.trim().is_empty() { return None; }
+    let source_url = normalize_source_url(source_url);
+    let source_url = source_url.trim_end_matches('/');
+    match store_get(&format!("brc:{source_url}:{book_url}")).as_deref() {
+        Some("true") => Some(json!({"useReplaceRule": true})),
+        Some("false") => Some(json!({"useReplaceRule": false})),
+        _ => None,
+    }
+}
+
 fn store_write(update: impl FnOnce(&mut HashMap<String, String>)) {
     let mut map = JS_STORE.lock().unwrap_or_else(|e| e.into_inner());
     update(&mut map);
@@ -218,6 +314,19 @@ fn memory_put(key: String, value: String) {
 
 pub fn eval_js(script: &str, input: &str, base_url: &str) -> anyhow::Result<String> {
     eval_js_inner(script, Some(input), Some(base_url), None, None, None)
+}
+
+/// `eval_js_with_bindings` 中绑定值的标记前缀: 值为 JSON 响应文本,
+/// 注入时用 `Resp()` 包装成 legado `StrResponse` 语义(带 `code()`/`body()`
+/// 等方法的对象), 供 `loginCheckJs` 这类按方法调用响应的脚本使用。
+pub const RESP_BINDING_PREFIX: &str = "@resp:";
+
+/// 构造 `Resp()` 语义的绑定值(JSON 文本 + 标记前缀)。
+pub fn resp_binding(value: &serde_json::Value) -> JsonValue {
+    JsonValue::String(format!(
+        "{RESP_BINDING_PREFIX}{}",
+        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+    ))
 }
 
 pub fn eval_js_with_bindings(
@@ -315,26 +424,131 @@ const JS_PRELUDE: &str = r#"(function (g) {
     if (h.__m) return JSON.stringify(h.__m);
     return JSON.stringify(h);
   }
+  var evaluatingHeaders = false;
+  function requestHeaders(extra) {
+    var raw = headerJson(extra);
+    if (!g.__source_header_script || evaluatingHeaders) return raw;
+    evaluatingHeaders = true;
+    try {
+      var defaults = (function () { return eval('{\n' + g.__source_header_script + '\n}'); }).call(g);
+      if (typeof defaults === 'string') defaults = JSON.parse(defaults || '{}');
+      if (!defaults || typeof defaults !== 'object') defaults = {};
+      var supplied = JSON.parse(raw);
+      Object.keys(supplied).forEach(function (key) {
+        Object.keys(defaults).forEach(function (name) { if (name.toLowerCase() === key.toLowerCase()) delete defaults[name]; });
+        defaults[key] = supplied[key];
+      });
+      return JSON.stringify(defaults);
+    } finally { evaluatingHeaders = false; }
+  }
+  // 双形态值: legado 的 `result` 是 Kotlin 对象经 Rhino 绑定, `result.body`
+  // (属性) 与 `result.body()` (方法) 都成立。这里用 Proxy 让同一个值既能
+  // 当值用(参与比较/取成员), 又能被调用。
+  function dual(get) {
+    var fn = function () { return get(); };
+    return new Proxy(fn, {
+      apply: function () { return get(); },
+      get: function (target, prop) {
+        if (prop === 'toString' || prop === 'valueOf' || prop === Symbol.toPrimitive) {
+          return function () { return get(); };
+        }
+        // function 默认不会被 JSON.stringify 序列化; toJSON 让 `body`/`code`
+        // 这类"既当方法又当值"的成员在对象里也保持原值。
+        if (prop === 'toJSON') return function () { return get(); };
+        if (prop === 'then') return undefined;
+        var value = get();
+        if (value === null || value === undefined) return undefined;
+        if (prop === 'length' && typeof value === 'string') return value.length;
+        var member = value[prop];
+        return typeof member === 'function' ? member.bind(value) : member;
+      }
+    });
+  }
+  // 响应头: legado 的 Map 语义, 既支持 `headers['x']` / `headers.get('x')`,
+  // 也要能 JSON.stringify(保持对象类型)。
+  function headerMap(raw) {
+    var map = {};
+    if (Array.isArray(raw)) {
+      for (var i = 0; i < raw.length; i++) {
+        if (raw[i] && raw[i].length >= 2) { map[S(raw[i][0]).toLowerCase()] = raw[i][1]; }
+      }
+    } else if (raw && typeof raw === 'object') {
+      for (var k in raw) { if (Object.prototype.hasOwnProperty.call(raw, k)) map[S(k).toLowerCase()] = raw[k]; }
+    }
+    Object.defineProperty(map, 'get', { value: function (k) { var v = map[S(k).toLowerCase()]; return v === undefined ? null : v; }, enumerable: false });
+    return map;
+  }
   function Resp(raw) {
     var o;
     try { o = JSON.parse(raw); } catch (e) { o = { body: '', code: 0, url: '', headers: {} }; }
-    return {
-      __isResp: true,
-      body: function () { return o.body; },
-      statusCode: function () { return o.code; },
-      code: function () { return o.code; },
-      url: function () { return o.url; },
-      headers: function () { return o.headers; },
-      header: function (k) { var v = o.headers[S(k).toLowerCase()]; return v === undefined ? null : v; },
-      toString: function () { return o.body; }
-    };
+    if (o === null || typeof o !== 'object') o = { body: S(o), code: 0, url: '', headers: {} };
+    var headers = headerMap(o.headers);
+    var target = function () { return o.body; };
+    return new Proxy(target, {
+      apply: function () { return o.body; },
+      get: function (t, prop) {
+        if (prop === '__isResp') return true;
+        // 宿主把 Resp 对象作为脚本返回值时用它取完整 StrResponse 信封
+        // (body/url/code/headers/isSuccessful), 而非只有正文。
+        if (prop === '__respJson') {
+          return function () {
+            return JSON.stringify({
+              // 标记: 让宿主区分"Resp 信封"与书源数据本身就是这种形状的情况。
+              __respEnvelope: true,
+              body: o.body === undefined || o.body === null ? '' : String(o.body),
+              url: o.url === undefined || o.url === null ? '' : String(o.url),
+              code: o.code === undefined || o.code === null ? 0 : o.code,
+              headers: headers,
+              isSuccessful: o.isSuccessful === undefined ? o.code >= 200 && o.code < 300 : o.isSuccessful
+            });
+          };
+        }
+        if (prop === 'toString' || prop === 'valueOf' || prop === Symbol.toPrimitive) {
+          return function () { return o.body; };
+        }
+        if (prop === 'headers') return headers;
+        if (prop === 'header') {
+          return function (k) { var v = headers[S(k).toLowerCase()]; return v === undefined ? null : v; };
+        }
+        if (prop === 'statusCode' || prop === 'code') return dual(function () { return o.code; });
+        if (prop === 'body') return dual(function () { return o.body; });
+        if (prop === 'url') return dual(function () { return o.url; });
+        if (prop === 'isSuccessful') return dual(function () { return o.isSuccessful; });
+        if (prop in o) return o[prop];
+        return undefined;
+      }
+    });
   }
-  J.ajax = function (u) { return Resp(g.__connect(S(u), '{}')).body(); };
-  J.connect = function (u, h) { return Resp(g.__connect(S(u), headerJson(h))); };
-  J.get = function (u, h) { return Resp(g.__http('GET', S(u), '', headerJson(h))); };
-  J.head = function (u, h) { return Resp(g.__http('HEAD', S(u), '', headerJson(h))); };
-  J.post = function (u, b, h) { return Resp(g.__http('POST', S(u), S(b), headerJson(h))); };
-  J.put = function (u, b, h) { return Resp(g.__http('PUT', S(u), S(b), headerJson(h))); };
+  // 宿主注入绑定(如 loginCheckJs 的 `result`)时需要按 StrResponse 语义包装,
+  // 在全局暴露构造器供注入脚本使用。
+  g.Resp = Resp;
+  J.ajax = function (u) { return Resp(g.__connect(S(u), requestHeaders())).body(); };
+  J.connect = function (u, h) { return Resp(g.__connect(S(u), requestHeaders(h))); };
+  J.get = function (u, h) {
+    // AnalyzeRule.get(key) reads variables; explicit HTTP URLs retain the
+    // existing one-argument HTTP convenience, and headers select HTTP too.
+    if (arguments.length === 1 && !/^(?:https?:)?\/\//i.test(S(u))) return ruleGet(S(u));
+    return Resp(g.__http('GET', S(u), '', requestHeaders(h)));
+  };
+  J.head = function (u, h) { return Resp(g.__http('HEAD', S(u), '', requestHeaders(h))); };
+  J.post = function (u, b, h) { return Resp(g.__http('POST', S(u), S(b), requestHeaders(h))); };
+  J.put = function (u, b, h) {
+    if (arguments.length < 3) return rulePut(S(u), S(b));
+    return Resp(g.__http('PUT', S(u), S(b), requestHeaders(h)));
+  };
+  J.getCookie = function (tag, key) {
+    var raw = S(g.cookie.getCookie(S(tag)));
+    if (key == null) return raw;
+    key = S(key);
+    var pairs = raw.split(';');
+    for (var i = 0; i < pairs.length; i++) {
+      var separator = pairs[i].indexOf('=');
+      if (separator >= 0 && pairs[i].slice(0, separator).trim() === key) {
+        return pairs[i].slice(separator + 1).trim();
+      }
+    }
+    return '';
+  };
 
   function symmetric(t, k, iv) {
     t = S(t); k = S(k); iv = S(iv);
@@ -366,19 +580,32 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.logType = function (m) { g.__log('log', typeof m); };
   J.toast = function (m) { g.__log('toast', S(m)); };
   J.longToast = J.toast;
-  J.showBrowser = function (u, html, preloadJs) {
+  J.showBrowser = function (u, html, preloadJs, options) {
     g.__show_browser(S(u), html === undefined || html === null ? '' : S(html),
-                     preloadJs === undefined || preloadJs === null ? '' : S(preloadJs));
+                     preloadJs === undefined || preloadJs === null ? '' : S(preloadJs),
+                     options == null ? '' : typeof options === 'string' ? options : JSON.stringify(options), '');
     return true;
   };
-  J.startBrowser = function (u, title) {
-    g.__show_browser(S(u), '', '');
+  J.startBrowser = function (u, title, html) {
+    g.__show_browser(S(u), html == null ? '' : S(html), '', '', S(title));
     return true;
   };
-  // legado 的 startBrowserAwait 会等面板关闭; 桌面端不阻塞, 返回空响应对象
-  J.startBrowserAwait = function (u, title) {
-    g.__show_browser(S(u), '', '');
-    return Resp('{}');
+  J.startBrowserAwait = function (u, title, refetchAfterSuccess, html) {
+    var r = JSON.parse(g.__await_browser(S(u), S(title), html == null ? '' : S(html)));
+    if (!r.ok) throw new Error(r.error);
+    if (refetchAfterSuccess !== false) return J.connect(r.page.url || S(u));
+    return Resp(JSON.stringify({ body: r.page.body, url: r.page.url || S(u), code: 200, headers: {} }));
+  };
+  // legado 浏览器族兼容别名: startBrowserDp(url, title[, w, h]) 与
+  // showReadingBrowser(url, title)（段评页）签名与 startBrowser 兼容。
+  J.startBrowserDp = J.startBrowser;
+  J.showReadingBrowser = function (u, title) { return J.startBrowser(u, title); };
+  // legado 并发请求; 串行执行功能等价（返回 StrResponse 数组）。
+  J.ajaxAll = function (urls) {
+    if (typeof urls === 'string') urls = urls.split(',');
+    var out = [];
+    for (var i = 0; i < urls.length; i++) out.push(Resp(g.__connect(S(urls[i]), requestHeaders())));
+    return out;
   };
 
   // ── legado `AnalyzeRule`: 用规则解析当前页面内容 ──
@@ -432,6 +659,20 @@ const JS_PRELUDE: &str = r#"(function (g) {
     var list = wrapElements(g.__rule_get(S(rule), '', 'elements'));
     return list.length ? list[0] : null;
   };
+  // legado AnalyzeRule.setContent: 替换后续 getString/getElement 的解析对象。
+  J.setContent = function (content) { g.__rule_set_content(content == null ? '' : S(content)); };
+
+  // 纯工具方法（与网络/环境无关，实现即可，不影响任何能力探测）
+  J.encodeURI = function (v) { return encodeURIComponent(S(v)); };
+  J.encodeURIComponent = J.encodeURI;
+  J.toURL = function (v) {
+    // legado 返回 java.net.URL, 源主要取 .origin/.host/.path/.protocol。
+    // QuickJS 没有 Web 的 URL 构造器, 解析交给宿主。
+    var o = JSON.parse(g.__to_url(S(v), S(baseUrl)));
+    o.toString = function () { return this.href; };
+    return o;
+  };
+  // 简→繁/繁→简 (`java.t2s` / `java.s2t`) 由宿主直接注册在 java 对象上。
 
   function HashMap() { this.__m = {}; }
   HashMap.prototype = {
@@ -463,6 +704,27 @@ const JS_PRELUDE: &str = r#"(function (g) {
   };
   g.Packages = { java: J };
 
+  // Rhino 的 JavaImporter + with(importer) 语法（大灰狼聚合等 jsLib 顶层使用）。
+  // 把传入的包/类展开为实例属性, with 语句按属性名解析裸类名。
+  function JavaImporter() {
+    var self = this;
+    function absorb(value, fallbackName) {
+      if (!value) return;
+      if (typeof value === 'function') {
+        var name = value.name || fallbackName || '';
+        if (name) self[name] = value;
+        return;
+      }
+      if (typeof value === 'object') {
+        Object.keys(value).forEach(function (k) { self[k] = value[k]; });
+      }
+    }
+    for (var i = 0; i < arguments.length; i++) absorb(arguments[i]);
+    this.importClass = function (cls) { absorb(cls, ''); return this; };
+    this.importPackage = function (pkg) { absorb(pkg); return this; };
+  }
+  g.JavaImporter = JavaImporter;
+
   g.cache = {
     get: function (k) { return g.__store_get(S(k)); },
     put: function (k, v) { g.__store_put(S(k), S(v)); return v; },
@@ -482,8 +744,35 @@ const JS_PRELUDE: &str = r#"(function (g) {
   var src = g.source;
   src.bookSourceUrl = si.url;
   src.bookSourceName = si.name;
-  src.getVariable = function () { return g.__store_get('sv:' + si.url) || ''; };
-  src.setVariable = function (v) { g.__store_put('sv:' + si.url, S(v)); };
+  src.getVariable = function () { var v = g.__source_get('variable'); return v === null ? g.__store_get('sv:' + si.url) || '' : v; };
+  src.setVariable = function (v) { if (!g.__source_set('variable', S(v))) throw new Error('保存书源变量失败'); };
+  src.putVariable = src.setVariable;
+  src.getLoginInfo = function () { return g.__source_get('loginInfo'); };
+  src.getLoginInfoMap = function () { try { return JSON.parse(src.getLoginInfo() || '{}'); } catch (e) { return {}; } };
+  src.putLoginInfo = function (v) { return g.__source_set('loginInfo', S(v)); };
+  src.removeLoginInfo = function () { g.__source_del('loginInfo'); };
+  src.getLoginHeader = function () { return g.__source_get('loginHeader'); };
+  src.getLoginHeaderMap = function () { try { return JSON.parse(src.getLoginHeader() || '{}'); } catch (e) { return {}; } };
+  src.putLoginHeader = function (v) {
+    var text = typeof v === 'string' ? v : JSON.stringify(v), headers = JSON.parse(text);
+    if (!g.__source_set('loginHeader', text)) throw new Error('保存登录请求头失败');
+    Object.keys(headers).forEach(function (key) { if (key.toLowerCase() === 'cookie') g.cookie.setCookie(si.url, S(headers[key])); });
+  };
+  src.removeLoginHeader = function () { g.__source_del('loginHeader'); g.cookie.removeCookie(si.url); };
+  // legado: source.login() 用已保存的登录信息重跑登录脚本。
+  // 这里登记一个 effect, 由宿主(loginCheckJs 流程)真正执行 loginUrl。
+  src.login = function () { g.__login_request(); return true; };
+  J.getStrResponse = function (url, method, body, headers) {
+    // 无参: 返回最近一次请求的响应(StrResponse 语义); 带参: 直接发一次请求。
+    if (arguments.length === 0) return Resp(g.__last_response());
+    if (arguments.length === 1 && typeof url === 'string') return Resp(g.__last_response());
+    var m = S(method || 'GET').toUpperCase();
+    var h = headers == null ? '' : (typeof headers === 'string' ? headers : JSON.stringify(headers));
+    return Resp(g.__http(m, S(url), body == null ? '' : S(body), requestHeaders(h)));
+  };
+  J.upLoginData = function (data) { g.__login_update(JSON.stringify(data == null ? null : data)); };
+  J.reLoginView = function () { g.__login_refresh(); };
+  J.refreshExplore = J.reLoginView;
   src.put = function (k, v) { g.__store_put('sp:' + si.url + ':' + S(k), S(v)); return v; };
   src.get = function (k) { return g.__store_get('sp:' + si.url + ':' + S(k)) || ''; };
 
@@ -502,8 +791,39 @@ const JS_PRELUDE: &str = r#"(function (g) {
     o.getKey = function () { return S(o[keyField]); };
     return o;
   }
+  function rulePut(key, value) {
+    if (g.chapter && g.chapter.url) g.chapter.putVariable(key, value);
+    else if (g.book && g.book.bookUrl) g.book.putVariable(key, value);
+    else src.put(key, value);
+    return value;
+  }
+  function ruleGet(key) {
+    if (key === 'bookName' && g.book && g.book.bookUrl) return S(g.book.name);
+    if (key === 'title' && g.chapter && g.chapter.url) return S(g.chapter.title);
+    return (g.chapter && g.chapter.url && g.chapter.getVariable(key)) ||
+      (g.book && g.book.bookUrl && g.book.getVariable(key)) || src.get(key) || '';
+  }
+  function withReadConfig(book) {
+    var sourceKey = S(si.url).trim().replace(/\/+$/, '');
+    var storageKey = book.bookUrl ? 'brc:' + sourceKey + ':' + S(book.bookUrl) : '';
+    var saved = storageKey ? g.__store_get(storageKey) : null;
+    function config() {
+      if (!book.readConfig || typeof book.readConfig !== 'object') book.readConfig = {};
+      return book.readConfig;
+    }
+    if (saved === 'true' || saved === 'false') config().useReplaceRule = saved === 'true';
+    book.setUseReplaceRule = function (enabled) {
+      config().useReplaceRule = !!enabled;
+      if (storageKey) g.__store_put(storageKey, enabled ? 'true' : 'false');
+    };
+    book.getUseReplaceRule = function () {
+      var enabled = config().useReplaceRule;
+      return enabled == null ? true : !!enabled;
+    };
+    return book;
+  }
   var bc = JSON.parse(g.__book_ctx());
-  g.book = withVariables(bc.book || {}, 'bv:', 'bookUrl');
+  g.book = withReadConfig(withVariables(bc.book || {}, 'bv:', 'bookUrl'));
   g.chapter = withVariables(bc.chapter || {}, 'cv:', 'url');
   g.title = S(g.chapter.title);
 })(globalThis);
@@ -547,8 +867,8 @@ impl Drop for EvalDepthGuard {
 /// 避免闭包内部再次进入时重复借用而 panic。
 fn with_reusable_context<T>(
     lib_key: &str,
-    shared_js: &str,
-    f: impl FnOnce(rquickjs::Ctx<'_>) -> anyhow::Result<T>,
+    _shared_js: &str,
+    f: impl FnOnce(rquickjs::Ctx<'_>, bool) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let nested = JS_EVAL_DEPTH.with(|depth| depth.get() > 0);
     JS_EVAL_DEPTH.with(|depth| depth.set(depth.get() + 1));
@@ -558,15 +878,9 @@ fn with_reusable_context<T>(
     // 否则嵌套脚本里的 jsLib 函数不可用)。
     if nested {
         let runtime = Runtime::new()?;
+        runtime.set_max_stack_size(JS_MAX_STACK_SIZE);
         let context = Context::full(&runtime)?;
-        if !shared_js.trim().is_empty() {
-            context.with(|ctx| {
-                if let Err(e) = eval_script(ctx.clone(), shared_js) {
-                    push_js_log(format!("[jsLib] 执行失败: {e}"));
-                }
-            });
-        }
-        return context.with(f);
+        return context.with(|ctx| f(ctx, true));
     }
 
     let cached = JS_CONTEXT.with(|cell| {
@@ -577,30 +891,25 @@ fn with_reusable_context<T>(
         }
     });
 
-    let context = match cached {
-        Some(context) => context,
+    let (context, initialize) = match cached {
+        Some(context) => (context, false),
         None => {
             let runtime = Runtime::new()?;
+            runtime.set_max_stack_size(JS_MAX_STACK_SIZE);
             let context = Context::full(&runtime)?;
-            // jsLib 出错不拖垮规则本身: 记日志后继续(与 legado 共享作用域加载失败一致)
-            if !shared_js.trim().is_empty() {
-                context.with(|ctx| {
-                    if let Err(e) = eval_script(ctx.clone(), shared_js) {
-                        push_js_log(format!("[jsLib] 执行失败: {e}"));
-                    }
-                });
-            }
             JS_CONTEXT.with(|cell| {
                 *cell.borrow_mut() = Some(CachedJsContext {
                     lib_key: lib_key.to_string(),
                     context: context.clone(),
                 });
             });
-            context
+            (context, true)
         }
     };
 
-    context.with(f)
+    let result = context.with(|ctx| f(ctx, initialize));
+    if result.is_err() { JS_CONTEXT.with(|cell| { *cell.borrow_mut() = None; }); }
+    result
 }
 
 fn eval_js_inner_with_source(
@@ -618,8 +927,9 @@ fn eval_js_inner_with_source(
 
     // 复用键必须带上书源: 不同书源(尤其都没有 jsLib 时)不能共用同一个上下文,
     // 否则规则脚本声明的全局变量会互相可见。同一书源的连续章节仍能命中复用。
-    let lib_key = format!("{}\u{1}{}", source_info.url, md5_hex(&shared_js));
-    with_reusable_context(&lib_key, &shared_js, |ctx| {
+    let identity = source_info.http.as_ref().map(|http| http.session.identity.as_str()).unwrap_or(&source_info.url);
+    let lib_key = format!("{}\u{1}{}", identity, md5_hex(&shared_js));
+    with_reusable_context(&lib_key, &shared_js, |ctx, initialize| {
         let globals = ctx.globals();
         let input_value = input.unwrap_or("");
         let base_url_value = base_url.unwrap_or("");
@@ -629,12 +939,9 @@ fn eval_js_inner_with_source(
         globals.set("src", input_value)?;
         globals.set("base_url", base_url_value)?;
         globals.set("baseUrl", base_url_value)?;
-        if let Some(key) = key {
-            globals.set("key", key)?;
-        }
-        if let Some(page) = page {
-            globals.set("page", page)?;
-        }
+        let search = ACTIVE_SEARCH.with(|cell| cell.borrow().clone());
+        globals.set("key", key.or_else(|| search.as_ref().map(|(key, _)| key.as_str())).unwrap_or(""))?;
+        globals.set("page", page.or_else(|| search.as_ref().map(|(_, page)| *page)).unwrap_or(1))?;
 
         // Default url variable for Legado compatibility
         globals.set("url", base_url_value)?;
@@ -642,6 +949,7 @@ fn eval_js_inner_with_source(
         let source_key_val = source_key.unwrap_or("").to_string();
         let source_obj = Object::new(ctx.clone())?;
         let key_clone = source_key_val.clone();
+        let source_url = source_info.url.clone();
         source_obj.set("key", source_key_val)?;
         // getKey: 优先返回显式传入的 source_key; 否则回退到解析期 thread-local 的书籍 URL
         source_obj.set(
@@ -650,22 +958,58 @@ fn eval_js_inner_with_source(
                 if !key_clone.is_empty() {
                     key_clone.clone()
                 } else {
-                    active_source_key().unwrap_or_default()
+                    active_source_key().unwrap_or_else(|| source_url.clone())
                 }
             }),
         )?;
         globals.set("source", source_obj)?;
 
         let cookie_obj = Object::new(ctx.clone())?;
+        let cookie_http = source_info.http.clone();
         cookie_obj.set(
             "getCookie",
-            Func::new(|_key: String| -> String { String::new() }),
+            Func::new(move |url: String| -> String {
+                cookie_http.as_ref().and_then(|http| cookie_tag_url(&url).map(|url| http.session.cookies.get(&url))).unwrap_or_default()
+            }),
         )?;
+        let cookie_http = source_info.http.clone();
         cookie_obj.set(
             "removeCookie",
-            Func::new(|_key: String| -> String { "".to_string() }),
+            Func::new(move |url: String| -> bool {
+                cookie_http.as_ref().and_then(|http| cookie_tag_url(&url).map(|url| http.session.cookies.clear_url(&url).is_ok())).unwrap_or(false)
+            }),
         )?;
+        let cookie_http = source_info.http.clone();
+        cookie_obj.set("setCookie", Func::new(move |url: String, value: String| -> bool {
+            cookie_http.as_ref().and_then(|http| cookie_tag_url(&url).map(|url| http.session.cookies.set(&url, &value).is_ok())).unwrap_or(false)
+        }))?;
         globals.set("cookie", cookie_obj)?;
+        globals.set("__source_header_script", source_info.header_script.as_deref().unwrap_or_default())?;
+
+        let state = source_info.http.clone();
+        globals.set("__source_get", Func::new(move |key: String| -> Option<String> { state.as_ref().and_then(|http| http.session.get(&key)) }))?;
+        let state = source_info.http.clone();
+        globals.set("__source_set", Func::new(move |key: String, value: String| -> bool { state.as_ref().is_some_and(|http| http.session.put(&key, Some(&value)).is_ok()) }))?;
+        let state = source_info.http.clone();
+        globals.set("__source_del", Func::new(move |key: String| -> bool { state.as_ref().is_some_and(|http| http.session.put(&key, None).is_ok()) }))?;
+        globals.set("__login_update", Func::new(|raw: String| {
+            match serde_json::from_str(&raw) {
+                Ok(JsonValue::Object(values)) => LOGIN_EFFECTS.with(|cell| cell.borrow_mut().values.extend(values)),
+                Ok(JsonValue::Null) => LOGIN_EFFECTS.with(|cell| { let mut effects = cell.borrow_mut(); effects.reset = true; effects.values.clear(); }),
+                _ => (),
+            }
+        }))?;
+        globals.set("__login_refresh", Func::new(|| { LOGIN_EFFECTS.with(|cell| cell.borrow_mut().refresh = true); }))?;
+        globals.set("__login_request", Func::new(|| { LOGIN_EFFECTS.with(|cell| cell.borrow_mut().login = true); }))?;
+        globals.set("__last_response", Func::new(|| -> String {
+            LAST_RESPONSE.with(|cell| cell.borrow().clone())
+                .unwrap_or_else(|| json!({"body": "", "code": 0, "url": "", "headers": {}}).to_string())
+        }))?;
+        globals.set("__binary", Func::new(|op: String, raw: String| -> String {
+            let result = serde_json::from_str(&raw).map_err(anyhow::Error::from).and_then(|payload| super::js_binary::run(&op, &payload));
+            match result { Ok(value) => json!({"value":value}), Err(err) => json!({"error":err.to_string()}) }.to_string()
+        }))?;
+        globals.set("__sleep", Func::new(|ms: f64| { if ms.is_finite() && ms > 0.0 { std::thread::sleep(Duration::from_millis(ms.min(60_000.0) as u64)); } }))?;
 
         // 原生原语, 由 JS_PRELUDE 组装成 legado API
         let default_headers = source_info.headers.clone();
@@ -710,62 +1054,118 @@ fn eval_js_inner_with_source(
                 push_js_log(format!("[{kind}] {message}"));
             }),
         )?;
-        // java.showBrowser(url, html, preloadJs): 捕获请求交给前端弹面板(legado 的 BottomWebViewDialog)
+        // Keep all four showBrowser arguments; startBrowser also supplies a title.
         globals.set(
             "__show_browser",
-            Func::new(|url: String, html: String, preload_js: String| {
-                let html = (!html.trim().is_empty()).then(|| html.clone());
-                let preload_js = (!preload_js.trim().is_empty()).then(|| preload_js.clone());
-                push_js_log(format!("[browser] showBrowser: {url}"));
+            Func::new(|url: String, html: String, preload_js: String, options: String, title: String| {
+                let html = (!html.is_empty()).then_some(html);
+                let preload_js = (!preload_js.is_empty()).then_some(preload_js);
                 crate::service::book_service::set_show_browser_request(
                     crate::service::book_service::ShowBrowserRequest {
                         url,
                         html,
                         preload_js,
+                        options: serde_json::from_str::<JsonValue>(&options).ok().filter(|v| v.is_object()),
+                        title: (!title.is_empty()).then_some(title),
+                        await_result: false,
                         panel_id: None,
                     },
                 );
             }),
         )?;
+        globals.set("__await_browser", Func::new(|url: String, title: String, html: String| {
+            let request = crate::service::book_service::ShowBrowserRequest {
+                url, title: (!title.is_empty()).then_some(title),
+                html: (!html.is_empty()).then_some(html), preload_js: None,
+                options: None, await_result: true, panel_id: None,
+            };
+            match crate::service::source_browser::await_browser(request) {
+                Ok(page) => json!({"ok":true,"page":page}),
+                Err(error) => json!({"ok":false,"error":error}),
+            }.to_string()
+        }))?;
         // 规则解析原语: 供 `java.getString` / `getStringList` / `getElement(s)` 使用
         // (legado `AnalyzeRule` 是 `bindings["java"]`, 这些方法用规则解析当前页面内容)
-        let rule_input = input_value.to_string();
+        //
+        // 内容必须**可变**: `java.setContent(x)` 会替换后续 `java.getString(rule)`
+        // 的解析对象（legado `AnalyzeRule.setContent`），源常用它把上一步取到的
+        // 片段交给下一步规则解析。
+        let rule_input = Rc::new(RefCell::new(input_value.to_string()));
         let rule_base_url = base_url_value.to_string();
-        globals.set(
-            "__rule_get",
-            Func::new(move |rule: String, override_input: String, mode: String| -> String {
-                // override_input 为空时用当前页面内容(元素内部查询会显式传入片段)
-                let content = if override_input.is_empty() {
-                    rule_input.clone()
-                } else {
-                    override_input
-                };
-                match mode.as_str() {
-                    "elements" => serde_json::Value::Array(
-                        crate::parser::rule_engine::RuleEngine::eval_rule_elements(&rule, &content),
-                    )
-                    .to_string(),
-                    "list" => {
-                        let values = crate::parser::rule_engine::RuleEngine::eval_rule_on(
+        {
+            let rule_input = rule_input.clone();
+            let rule_base_url = rule_base_url.clone();
+            globals.set(
+                "__rule_get",
+                Func::new(move |rule: String, override_input: String, mode: String| -> String {
+                    // override_input 为空时用当前内容(元素内部查询会显式传入片段)
+                    let content = if override_input.is_empty() {
+                        rule_input.borrow().clone()
+                    } else {
+                        override_input
+                    };
+                    match mode.as_str() {
+                        "elements" => serde_json::Value::Array(
+                            crate::parser::rule_engine::RuleEngine::eval_rule_elements(&rule, &content),
+                        )
+                        .to_string(),
+                        "list" => {
+                            let values = crate::parser::rule_engine::RuleEngine::eval_rule_on(
+                                &rule,
+                                &content,
+                                &rule_base_url,
+                                true,
+                            );
+                            serde_json::Value::Array(
+                                values.into_iter().map(serde_json::Value::String).collect(),
+                            )
+                            .to_string()
+                        }
+                        _ => crate::parser::rule_engine::RuleEngine::eval_rule_on(
                             &rule,
                             &content,
                             &rule_base_url,
-                            true,
-                        );
-                        serde_json::Value::Array(
-                            values.into_iter().map(serde_json::Value::String).collect(),
+                            false,
                         )
-                        .to_string()
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default(),
                     }
-                    _ => crate::parser::rule_engine::RuleEngine::eval_rule_on(
-                        &rule,
-                        &content,
-                        &rule_base_url,
-                        false,
-                    )
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default(),
+                }),
+            )?;
+        }
+        {
+            let rule_input = rule_input.clone();
+            globals.set(
+                "__rule_set_content",
+                Func::new(move |content: String| { *rule_input.borrow_mut() = content; }),
+            )?;
+        }
+        globals.set(
+            "__to_url",
+            Func::new(move |raw: String, base: String| -> String {
+                let base = if base.is_empty() { rule_base_url.clone() } else { base };
+                match url::Url::parse(&raw).or_else(|_| url::Url::parse(&base)?.join(&raw)) {
+                    Ok(parsed) => json!({
+                        "origin": parsed.origin().ascii_serialization(),
+                        "host": parsed.host_str().map(|h| match parsed.port() {
+                            Some(port) => format!("{h}:{port}"), None => h.to_string(),
+                        }).unwrap_or_default(),
+                        "hostname": parsed.host_str().unwrap_or_default(),
+                        "port": parsed.port().map(|p| p.to_string()).unwrap_or_default(),
+                        "protocol": format!("{}:", parsed.scheme()),
+                        "pathname": parsed.path(),
+                        "href": parsed.as_str(),
+                        "search": parsed.query().map(|q| format!("?{q}")).unwrap_or_default(),
+                        "hash": parsed.fragment().map(|f| format!("#{f}")).unwrap_or_default(),
+                    })
+                    .to_string(),
+                    Err(_) => json!({
+                        "origin": "", "host": "", "hostname": "", "port": "",
+                        "protocol": "", "pathname": "", "href": raw,
+                        "search": "", "hash": "",
+                    })
+                    .to_string(),
                 }
             }),
         )?;
@@ -821,7 +1221,10 @@ fn eval_js_inner_with_source(
             "androidId",
             Func::new(|| -> String { JS_DEVICE_ID.clone() }),
         )?;
-        java_obj.set("deviceID", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
+        java_obj.set("getAndroidId", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
+        java_obj.set("getWebViewUA", Func::new(|| -> String { DEFAULT_JS_USER_AGENT.to_string() }))?;
+        // deviceID is an iOS capability probe in shared book sources. Exposing
+        // it here would select iOS-only paragraph-comment markup on desktop.
         // Legado 书源常用 `java.getContent()` 取当前页面内容(等同全局 `input`)
         let content_input = input_value.to_string();
         java_obj.set(
@@ -957,6 +1360,8 @@ fn eval_js_inner_with_source(
             "toNumChapter",
             Func::new(|input: String| -> String { java_to_num_chapter(&input) }),
         )?;
+        java_obj.set("t2s", Func::new(|input: String| -> String { java_t2s(&input) }))?;
+        java_obj.set("s2t", Func::new(|input: String| -> String { java_s2t(&input) }))?;
         java_obj.set(
             "timeFormatUTC",
             Func::new(|timestamp: i64, format: String, sh: i64| -> String {
@@ -1002,21 +1407,51 @@ fn eval_js_inner_with_source(
 
         // prelude 每次都要跑: 它包装的是本次新建的 java 对象与本次的 source/book/chapter
         eval_script(ctx.clone(), JS_PRELUDE)?;
-        // 注意: jsLib 已在 with_reusable_context 建立上下文时执行过一次, 这里不重复执行。
+        eval_script(ctx.clone(), include_str!("java_compat.js"))?;
+        if initialize && !shared_js.trim().is_empty() {
+            if let Err(err) = eval_script(ctx.clone(), &shared_js) {
+                push_js_log(format!("[jsLib] {err}"));
+                return Err(err);
+            }
+        }
         // 调用方显式绑定放在 jsLib 之后, 避免被 jsLib 顶层同名变量覆盖
         if let Some(bindings) = bindings {
             for (key, value) in bindings {
+                // `@resp:` 前缀: legado 的 `result` 是 StrResponse 对象,
+                // 脚本里按方法调用 (`result.code()`/`body()`)。这里用 Resp()
+                // 包装, 保持方法语义而不是纯 JSON 数据。
+                if let Some(raw) = value.as_str().filter(|raw| raw.starts_with(RESP_BINDING_PREFIX)) {
+                    let literal = serde_json::to_string(raw.trim_start_matches(RESP_BINDING_PREFIX))
+                        .unwrap_or_else(|_| "\"\"".to_string());
+                    let js_value = eval_script(ctx.clone(), &format!("Resp({literal})"))?;
+                    globals.set(key.as_str(), js_value)?;
+                    continue;
+                }
                 let js_value = ctx.json_parse(value.to_string())?;
                 globals.set(key.as_str(), js_value)?;
             }
         }
 
-        let v = eval_script(ctx.clone(), script)?;
+        // Block scope lets consecutive rules redeclare let/const, while var
+        // bindings such as `var result = result || {}` retain the host value.
+        let v = eval_script(ctx.clone(), &format!("{{\n{script}\n}}"))?;
         globals.set("__result", v)?;
         // String 包装对象 / java.get 响应对象按 legado 语义转成字符串
+        // String 包装对象按 legado 语义转成字符串。
+        //
+        // `Resp` 对象（java.ajax 的返回、`java.getStrResponse()` 的结果）作为
+        // **脚本返回值**时必须序列化成完整的 StrResponse 信封
+        // (`{body,url,code,headers,isSuccessful}`): loginCheckJs 用
+        // `source.login();java.getStrResponse();` 替换响应，只交出 body 会让
+        // 调用方反序列化出 code=0/空 body 的假响应。仅在需要字符串的场合
+        // (模板拼接、String(...)) 才解包成 body。
         let v: Value = eval_script(
             ctx.clone(),
-            "(function (v) { if (v instanceof String) return v.valueOf(); if (v && v.__isResp) return v.body(); return v; })(__result)",
+            "(function (v) {\n\
+             if (v instanceof String) return v.valueOf();\n\
+             if (v && v.__isResp) return JSON.parse(v.__respJson());\n\
+             return v;\n\
+             })(__result)",
         )?;
 
         let result = if v.is_null() || v.is_undefined() {
@@ -1033,7 +1468,7 @@ fn eval_js_inner_with_source(
             }
         };
         Ok(result)
-    })
+    }).map_err(|err| { push_js_log(format!("[脚本] {err}")); err })
 }
 
 #[derive(Clone, Copy)]
@@ -1088,7 +1523,7 @@ macro_rules! block_crypt {
 
 /// Java `Cipher` 风格的对称加解密: `AES|DES|DESede[/ECB|CBC[/PKCS5Padding|NoPadding|ZeroPadding]]`。
 /// 密钥/IV 按 UTF-8 字节解释(与 legado 传字符串时一致)。
-fn symmetric_crypt(
+pub(super) fn symmetric_crypt(
     encrypt: bool,
     transformation: &str,
     key: &[u8],
@@ -1174,6 +1609,9 @@ fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Val
                 return Err(anyhow::anyhow!("JS 异常: {message}\n{stack}"));
             }
             if !caught.is_undefined() && !caught.is_null() {
+                if let Some(message) = caught.as_string() {
+                    return Err(anyhow::anyhow!("JS 异常: {}", message.to_string().unwrap_or_default()));
+                }
                 return Err(anyhow::anyhow!("JS 异常: {caught:?}"));
             }
             Err(e.into())
@@ -1380,9 +1818,165 @@ fn normalize_digest_name(algorithm: &str) -> String {
     }
 }
 
+/// 繁 → 简映射对（`T2S_PAIRS` 按「繁体简体」两两成对排列）。
+///
+/// 数据源: Windows `LCMapStringEx(zh-TW, LCMAP_SIMPLIFIED_CHINESE)` 逐字转换
+/// 生成（2473 对，覆盖 CJK 基本区），因此无需引入 OpenCC 依赖。
+/// legado 的 `java.t2s` 用它把繁体源站的章节名/正文转成简体。
+const T2S_PAIRS: &str = concat!(
+    "丟丢並并亂乱亙亘亞亚伋汲伕夫佇伫佈布佔占佪徊併并來来侖仑侶侣侷局俁俣係系俠侠倀伥",
+    "倆俩倉仓個个們们倖幸倣仿倫伦偉伟側侧偵侦偺咱偽伪傑杰傖伧傘伞備备傢家傭佣傯偬傳传",
+    "傴伛債债傷伤傾倾僂偻僅仅僇戮僉佥僑侨僕仆僥侥僨偾僱雇價价儀仪儂侬億亿儅当儈侩儉俭",
+    "儐傧儔俦儕侪儘尽償偿優优儲储儷俪儸罗儺傩儻傥儼俨兇凶兌兑兒儿兗兖內内兩两冊册冑胄",
+    "冪幂凈净凍冻凜凛凱凯別别刪删剄刭則则剋克剎刹剛刚剝剥剮剐剴剀創创剷铲劃划劇剧劉刘",
+    "劊刽劌刿劍剑劑剂劻匡勁劲動动勗勖務务勛勋勝胜勞劳勢势勣积勦剿勱劢勵励勸劝勻匀匭匦",
+    "匯汇匱匮區区協协卹恤卻却厙厍厭厌厲厉厴厣參参叢丛吋寸吳吴吶呐呂吕呎尺咼呙員员唄呗",
+    "唸念問问啞哑啟启啣衔喚唤喪丧喫吃喬乔單单喲哟嗆呛嗇啬嗎吗嗚呜嗩唢嗶哔嘆叹嘍喽嘔呕",
+    "嘖啧嘗尝嘜唛嘩哗嘮唠嘯啸嘰叽嘵哓嘸呒噁恶噓嘘噠哒噥哝噦哕噯嗳噲哙噴喷噸吨噹当嚀咛",
+    "嚇吓嚌哜嚕噜嚙啮嚥咽嚦呖嚨咙嚮向嚳喾嚴严嚶嘤囀啭囁嗫囂嚣囅冁囈呓囉罗囌苏囑嘱囪囱",
+    "圇囵國国圍围園园圓圆圖图團团坰垧埡垭執执堅坚堊垩堝埚堯尧報报場场堿碱塊块塋茔塏垲",
+    "塒埘塗涂塢坞塤埙塵尘塹堑墊垫墑墒墜坠墮堕墳坟墻墙墾垦壇坛壎埙壓压壘垒壙圹壚垆壞坏",
+    "壟垄壢坜壩坝壯壮壺壶壽寿夠够夢梦夾夹奐奂奧奥奩奁奪夺奮奋妝妆妳你姍姗姦奸姪侄娛娱",
+    "婁娄婦妇婭娅媧娲媯妫媼媪媽妈嫗妪嫵妩嫻娴嬈娆嬋婵嬌娇嬙嫱嬝袅嬡嫒嬤嬷嬪嫔嬰婴嬸婶",
+    "孃娘孌娈孫孙學学孿孪宮宫寢寝實实寧宁審审寫写寬宽寵宠寶宝將将專专尋寻對对導导尷尴",
+    "屆届屜屉屝扉屢屡層层屨屦屬属岡冈岧迢峴岘島岛峽峡崍崃崗岗崙仑崠岽崢峥崳嵛嵐岚嵒岩",
+    "嶁嵝嶄崭嶇岖嶗崂嶠峤嶧峄嶸嵘嶺岭嶼屿嶽岳巋岿巑漓巒峦巔巅巖岩巰巯巹卺帥帅師师帳帐",
+    "帶带幀帧幃帏幗帼幘帻幟帜幣币幫帮幬帱幹干幾几庂仄庫库廁厕廂厢廄厩廈厦廚厨廝厮廟庙",
+    "廠厂廡庑廢废廣广廩廪廬庐廱痈廳厅弒弑弔吊弳弪張张強强彆别彈弹彊强彌弥彎弯彙汇彥彦",
+    "彫雕彿佛徑径從从徠徕復复徬旁徹彻恆恒恥耻悅悦悵怅悶闷悽凄惡恶惱恼惲恽惻恻愛爱愜惬",
+    "愨悫愴怆愷恺愾忾慄栗慇殷態态慍愠慘惨慚惭慟恸慣惯慪怄慫怂慮虑慳悭慶庆慼戚憂忧憊惫",
+    "憐怜憑凭憒愦憚惮憤愤憫悯憮怃憲宪憶忆懇恳應应懌怿懍檩懞蒙懟怼懣懑懨恹懲惩懶懒懷怀",
+    "懸悬懺忏懼惧懾慑戀恋戇戆戉钺戔戋戧戗戩戬戰战戲戏戶户扐仂扠叉扢扦扺抵抃拚抆擦抎殒",
+    "抴曳拋抛挶局挾挟捍扞捨舍捫扪捲卷掃扫掄抡掙挣掛挂採采揀拣揚扬換换揮挥揹背搆构損损",
+    "搖摇搗捣搟擀搶抢摑掴摜掼摟搂摯挚摳抠摶抟摻掺撈捞撐撑撓挠撚捻撟挢撢掸撣掸撥拨撫抚",
+    "撲扑撳揿撻挞撾挝撿捡擁拥擄掳擇择擊击擋挡擔担據据擠挤擣捣擬拟擯摈擰拧擱搁擲掷擴扩",
+    "擷撷擺摆擻擞擼撸擾扰攄摅攆撵攏拢攔拦攖撄攙搀攛撺攜携攝摄攢攒攣挛攤摊攪搅攬揽攷考",
+    "敗败敘叙敵敌數数斂敛斃毙斕斓斬斩斷断旂旗時时晉晋晝昼晞曦暈晕暉晖暘阳暢畅暫暂暱昵",
+    "暸了曄晔曆历曇昙曉晓曖暧曠旷曬晒書书會会朧胧朮术杇圬東东枙栀枴拐柵栅桿杆梔栀條条",
+    "梟枭棄弃棖枨棗枣棟栋棧栈棲栖椏桠楊杨楓枫楨桢業业極极榦干榪杩榮荣榿桤槃盘構构槍枪",
+    "槓杠槧椠槨椁槳桨樁桩樂乐樅枞樑梁樓楼標标樞枢樣样樸朴樹树樺桦橈桡橋桥機机橢椭橫横",
+    "檁檩檉柽檔档檜桧檢检檣樯檯台檳槟檸柠檻槛櫃柜櫓橹櫚榈櫛栉櫝椟櫞橼櫟栎櫥橱櫧槠櫨栌",
+    "櫪枥櫬榇櫳栊櫸榉櫺棂櫻樱欄栏權权欏椤欒栾欖榄欞棂欽钦歎叹歐欧歟欤歡欢歲岁歷历歸归",
+    "歿殁殘残殞殒殤殇殫殚殮殓殯殡殲歼殺杀殼壳毀毁毆殴毌毋毬球毿毵氈毡氌氇氣气氫氢氬氩",
+    "氳氲氾泛汍丸汎泛汙污決决沒没沖冲況况洩泄洶汹浬里浹浃涇泾涼凉淒凄淚泪淥渌淨净淪沦",
+    "淵渊淶涞淺浅渙涣減减渦涡測测渾浑湊凑湞浈湧涌湯汤溈沩準准溝沟溫温溼湿滄沧滅灭滌涤",
+    "滎荥滬沪滯滞滲渗滷卤滸浒滾滚滿满漁渔漚沤漢汉漣涟漬渍漲涨漸渐漿浆潁颍潑泼潔洁潛潜",
+    "潟泻潤润潯浔潰溃潷滗潿涠澀涩澆浇澇涝澗涧澠渑澤泽澩泶澮浍澱淀濁浊濃浓濕湿濘泞濛蒙",
+    "濟济濤涛濫滥濰潍濱滨濺溅濼泺濾滤瀅滢瀆渎瀉泻瀋渖瀏浏瀕濒瀘泸瀝沥瀟潇瀠潆瀧泷瀨濑",
+    "瀰弥瀲潋瀾澜灃沣灄滠灑洒灕漓灘滩灝灏灣湾灤滦災灾為为烏乌烴烃無无煉炼煒炜煙烟煢茕",
+    "煥焕煩烦煬炀熒荧熗炝熱热熾炽燁烨燄焰燈灯燉炖燐磷燒烧燙烫燜焖營营燦灿燬毁燭烛燴烩",
+    "燼烬燾焘爍烁爐炉爛烂爭争爺爷爾尔牆墙牘牍牪瘪牴抵牽牵犖荦犛犁犢犊犧牺狀状狹狭狽狈",
+    "猙狰猶犹猻狲獄狱獅狮獎奖獨独獪狯獫猃獮猕獰狞獲获獵猎獷犷獸兽獺獭獻献獼猕玀猡玆兹",
+    "玨珏珮佩現现琺珐琿珲瑋玮瑣琐瑤瑶瑩莹瑪玛瑯琅璉琏璣玑璦瑷環环璽玺瓊琼瓏珑瓔璎瓖镶",
+    "瓚瓒甌瓯甕瓮產产甦苏畝亩畢毕畫画畬畲異异當当疇畴疊叠疿痱痙痉痠酸痲麻痳麻痺痹瘋疯",
+    "瘍疡瘓痪瘞瘗瘡疮瘧疟瘺瘘療疗癆痨癇痫癉瘅癘疠癟瘪癡痴癢痒癤疖癥症癩癞癬癣癭瘿癮瘾",
+    "癰痈癱瘫癲癫發发皚皑皰疱皸皲皺皱皻隳盜盗盞盏盡尽監监盤盘盧卢盪荡眥眦眾众睏困睜睁",
+    "睞睐睪睾瞇眯瞞瞒瞭了瞼睑矇蒙矓胧矚瞩矯矫砲炮硃朱硤硖硨砗硯砚碩硕碭砀確确碼码磚砖",
+    "磣碜磧碛磯矶磽硗礎础礙碍礦矿礪砺礫砾礬矾礱砻祅祆祇只祐佑祕秘祿禄禍祸禎祯禦御禪禅",
+    "禮礼禰祢禱祷禿秃秈籼稅税稈秆稜棱稟禀種种稱称穀谷穌稣積积穎颖穡穑穢秽穩稳穫获窩窝",
+    "窪洼窮穷窯窑窶窭窺窥竄窜竅窍竇窦竊窃競竞笻筇筆笔筍笋筧笕箄箅箇个箋笺箏筝節节範范",
+    "築筑篋箧篠筱篤笃篩筛篳筚簀箦簍篓簑蓑簞箪簡简簣篑簫箫簷檐簽签簾帘籃篮籌筹籐藤籜箨",
+    "籟籁籠笼籤签籥龠籩笾籪簖籬篱籮箩籲吁粵粤糝糁糞粪糢馍糧粮糰团糲粝糴籴糶粜糾纠紀纪",
+    "紂纣約约紅红紆纡紇纥紈纨紉纫紋纹納纳紐纽紓纾純纯紕纰紗纱紙纸級级紛纷紜纭紡纺細细",
+    "紱绂紲绁紳绅紹绍紺绀紼绋紿绐絀绌終终絃弦組组絆绊絎绗結结絕绝絛绦絞绞絡络絢绚給给",
+    "絨绒統统絲丝絳绦絹绢綁绑綃绡綆绠綈绨綏绥經经綜综綞缍綠绿綢绸綣绻綬绶維维綰绾綱纲",
+    "網网綴缀綵彩綸纶綹绺綺绮綻绽綽绰綾绫綿绵緄绲緇缁緊紧緋绯緒绪緗缃緘缄緙缂線线緝缉",
+    "緞缎締缔緡缗緣缘緦缌編编緩缓緬缅緯纬緱缑緲缈練练緶缏緹缇緻致縈萦縉缙縊缢縋缒縐绉",
+    "縑缣縚绦縛缚縝缜縞缟縟缛縣县縫缝縭缡縮缩縯演縱纵縲缧縳缚縴纤縵缦縶絷縷缕縹缥總总",
+    "績绩繃绷繅缫繆缪繈襁繒缯織织繕缮繚缭繞绕繡绣繢缋繩绳繪绘繫系繭茧繯缳繰缲繳缴繹绎",
+    "繼继繽缤繾缱纈缬纊纩續续纍累纏缠纓缨纔才纖纤纘缵纜缆缽钵罈坛罌罂罰罚罵骂罷罢羅罗",
+    "羆罴羈羁羋芈羥羟羨羡義义習习翹翘耑端耬耧聖圣聞闻聯联聰聪聲声聳耸聵聩聶聂職职聹聍",
+    "聽听聾聋肅肃脅胁脈脉脛胫脣唇脧睃脩修脫脱脹胀腎肾腡脶腦脑腫肿腳脚腸肠膃腽膚肤膠胶",
+    "膩腻膽胆膾脍膿脓臉脸臍脐臏膑臘腊臚胪臟脏臠脔臥卧臨临臺台與与興兴舉举舊旧艙舱艣橹",
+    "艤舣艦舰艫舻艱艰艷艳艸艹芐苄芻刍苧苎茍苟茲兹荊荆莊庄莖茎莢荚莧苋華华菴庵萇苌萊莱",
+    "萬万萵莴葉叶葒荭著着葦苇葯药葷荤蒔莳蒞莅蒼苍蓀荪蓋盖蓮莲蓯苁蓽荜蔆菱蔔卜蔞蒌蔣蒋",
+    "蔥葱蔦茑蔭荫蕁荨蕆蒇蕎荞蕓芸蕕莸蕘荛蕢蒉蕩荡蕪芜蕭萧蕷蓣薈荟薊蓟薌芗薑姜薔蔷薟莶",
+    "薦荐薧槁薩萨薺荠藍蓝藎荩藝艺藥药藪薮藶苈藷薯藹蔼藺蔺蘄蕲蘆芦蘇苏蘊蕴蘋苹蘗蘖蘚藓",
+    "蘞蔹蘢茏蘭兰蘺蓠蘿萝處处虛虚虜虏號号虧亏蛺蛱蛻蜕蜆蚬蝕蚀蝦虾蝸蜗螄蛳螞蚂螢萤螻蝼",
+    "蟄蛰蟈蝈蟣虮蟬蝉蟯蛲蟲虫蟶蛏蟻蚁蠅蝇蠆虿蠐蛴蠑蝾蠔蚝蠟蜡蠣蛎蠱蛊蠶蚕蠻蛮衊蔑術术",
+    "衛卫衝冲衹只袞衮裊袅裏里補补裝装裡里製制複复褲裤褳裢褸褛褻亵襖袄襝裣襠裆襤褴襪袜",
+    "襬摆襯衬襲袭覈核見见規规覓觅視视覘觇覡觋覦觎親亲覬觊覯觏覲觐覷觑覺觉覽览覿觌觀观",
+    "觔筋觴觞觶觯觸触訂订訃讣計计訊讯訌讧討讨訐讦訓训訕讪訖讫託托記记訛讹訝讶訟讼訢欣",
+    "訣诀訥讷訪访設设許许訴诉訶诃診诊註注証证詁诂詆诋詎讵詐诈詒诒詔诏評评詘诎詛诅詞词",
+    "詠咏詡诩詢询詣诣試试詩诗詫诧詬诟詭诡詮诠詰诘話话該该詳详詵诜詼诙詿诖誄诔誅诛誆诓",
+    "誇夸誌志認认誑诳誒诶誕诞誘诱誚诮語语誠诚誡诫誣诬誤误誥诰誦诵誨诲說说誰谁課课誶谇",
+    "誹诽誼谊調调諂谄諄谆談谈諉诿請请諍诤諏诹諑诼諒谅論论諗谂諛谀諜谍諞谝諢诨諤谔諦谛",
+    "諧谐諫谏諭谕諮谘諱讳諳谙諶谌諷讽諸诸諺谚諼谖諾诺謀谋謁谒謂谓謄誊謅诌謊谎謎谜謐谧",
+    "謔谑謖谡謗谤謙谦謚谥講讲謝谢謠谣謨谟謫谪謬谬謳讴謹谨謾谩證证譎谲譏讥譖谮識识譙谯",
+    "譚谭譜谱譟噪譫谵譯译議议譴谴護护譽誉讀读變变讎雠讒谗讓让讕谰讖谶讚赞讜谠讞谳豈岂",
+    "豎竖豐丰豔艳豬猪貍狸貓猫貝贝貞贞負负財财貢贡貧贫貨货販贩貪贪貫贯責责貯贮貰贳貲赀",
+    "貳贰貴贵貶贬買买貸贷貺贶費费貼贴貽贻貿贸賀贺賁贲賂赂賃赁賄贿賅赅資资賈贾賊贼賑赈",
+    "賒赊賓宾賕赇賚赉賜赐賞赏賠赔賡赓賢贤賣卖賤贱賦赋賧赕質质賬账賭赌賴赖賺赚賻赙購购",
+    "賽赛賾赜贄贽贅赘贈赠贊赞贍赡贏赢贐赆贓赃贖赎贗赝贛赣趕赶趙赵趨趋趲趱跡迹跼局踐践",
+    "踡蜷踫碰踴踊蹌跄蹕跸蹠跖蹣蹒蹤踪蹺跷躉趸躊踌躋跻躍跃躑踯躒跞躓踬躕蹰躚跹躡蹑躥蹿",
+    "躦躜躪躏軀躯車车軋轧軌轨軍军軒轩軔轫軛轭軟软軫轸軸轴軹轵軺轺軻轲軼轶軾轼較较輅辂",
+    "輇辁載载輊轾輒辄輓挽輔辅輕轻輛辆輜辎輝辉輞辋輟辍輥辊輦辇輩辈輪轮輯辑輳辏輸输輻辐",
+    "輾辗輿舆轂毂轄辖轅辕轆辘轉转轍辙轎轿轔辚轟轰轡辔轢轹轤轳辦办辭辞辮辫辯辩農农迆迤",
+    "迴回迺乃逕迳這这連连週周進进遊游運运過过達达違违遙遥遜逊遞递遠远適适遲迟遷迁選选",
+    "遺遗遼辽邁迈還还邇迩邊边邏逻邐逦郃合郟郏郵邮鄆郓鄉乡鄒邹鄔邬鄖郧鄧邓鄭郑鄰邻鄲郸",
+    "鄴邺鄶郐鄺邝酈郦醃腌醜丑醞酝醫医醬酱釀酿釁衅釃酾釅酽釋释釐厘釓钆釔钇釕钌釗钊釘钉",
+    "釙钋針针釣钓釤钐釦扣釧钏釩钒釬钎釵钗釷钍釹钕鈀钯鈁钫鈄钭鈉钠鈍钝鈐钤鈑钣鈔钞鈕钮",
+    "鈞钧鈣钙鈥钬鈦钛鈧钪鈮铌鈰铈鈳钶鈴铃鈷钴鈸钹鈹铍鈺钰鈽钸鈾铀鈿钿鉀钾鉅钜鉆钻鉈铊",
+    "鉉铉鉋刨鉍铋鉑铂鉗钳鉚铆鉛铅鉞钺鉤钩鉦钲鉬钼鉭钽鉸铰鉺铒鉻铬鉿铪銀银銃铳銅铜銑铣",
+    "銓铨銖铢銘铭銚铫銜衔銠铑銣铷銥铱銦铟銨铵銩铥銪铕銫铯銬铐銲焊銳锐銷销銹锈銻锑銼锉",
+    "鋁铝鋃锒鋅锌鋇钡鋌铤鋏铗鋒锋鋝锊鋟锓鋤锄鋦锔鋨锇鋪铺鋮铖鋯锆鋰锂鋱铽鋸锯鋼钢錁锞",
+    "錄录錆锖錈锩錐锥錒锕錕锟錘锤錙锱錚铮錛锛錟锬錠锭錢钱錦锦錨锚錫锡錮锢錯错錳锰錶表",
+    "錸铼鍆钔鍇锴鍊链鍋锅鍍镀鍔锷鍘铡鍛锻鍤锸鍥锲鍬锹鍰锾鍵键鍶锶鍺锗鍾锺鎂镁鎊镑鎔熔",
+    "鎖锁鎗枪鎘镉鎢钨鎣蓥鎦镏鎧铠鎩铩鎪锼鎬镐鎮镇鎰镒鎳镍鎵镓鏃镞鏇镟鏈链鏌镆鏍镙鏑镝",
+    "鏗铿鏘锵鏜镗鏝镘鏞镛鏟铲鏡镜鏢镖鏤镂鏨錾鏵铧鏷镤鏹镪鏽锈鐃铙鐉铣鐋铴鐐镣鐒铹鐓镦",
+    "鐔镡鐘钟鐙镫鐠镨鐨镄鐫镌鐮镰鐲镯鐳镭鐵铁鐸铎鐺铛鐽钽鐿镱鑄铸鑊镬鑌镔鑑监鑒鉴鑠铄",
+    "鑣镳鑤刨鑭镧鑰钥鑲镶鑷镊鑼锣鑽钻鑾銮鑿凿長长門门閂闩閃闪閆闫閉闭開开閌闶閎闳閏闰",
+    "閑闲閒闲間间閔闵閘闸閡阂閣阁閤合閥阀閨闺閩闽閫阃閬阆閭闾閱阅閶阊閹阉閻阎閼阏閽阍",
+    "閾阈閿阌闃阒闆板闈闱闊阔闋阕闌阑闐阗闔阖闕阙闖闯關关闞阚闡阐闢辟闥闼阨厄阯址陘陉",
+    "陜陕陝陕陣阵陰阴陳陈陸陆陽阳隄堤隉陧隊队階阶隕陨際际隨随險险隱隐隴陇隸隶隻只雋隽",
+    "雖虽雙双雛雏雜杂雞鸡離离難难雲云電电霑沾霤溜霧雾霽霁靂雳靄霭靈灵靚靓靜静靦腼靨靥",
+    "鞏巩鞦秋韁缰韃鞑韆千韉鞯韋韦韌韧韓韩韙韪韜韬韞韫韻韵響响頁页頂顶頃顷項项順顺頇顸",
+    "須须頊顼頌颂頎颀頏颃預预頑顽頒颁頓顿頗颇領领頜颌頡颉頤颐頦颏頭头頰颊頷颔頸颈頹颓",
+    "頻频顆颗題题額额顎颚顏颜顓颛願愿顙颡顛颠類类顢颟顥颢顧顾顫颤顯显顰颦顱颅顳颞顴颧",
+    "風风颮飑颯飒颱台颳刮颶飓颺扬颼飕飄飘飆飙飛飞飢饥飩饨飪饪飫饫飭饬飯饭飲饮飴饴飼饲",
+    "飽饱飾饰餃饺餅饼餉饷養养餌饵餑饽餒馁餓饿餘余餚肴餛馄餞饯餡馅館馆餳饧餵喂餼饩餽馈",
+    "餾馏餿馊饃馍饅馒饈馐饉馑饋馈饌馔饑饥饒饶饗飨饜餍饞馋馬马馭驭馮冯馱驮馳驰馴驯駁驳",
+    "駐驻駑驽駒驹駔驵駕驾駘骀駙驸駛驶駝驼駟驷駢骈駭骇駱骆駿骏騁骋騅骓騍骒騎骑騏骐騖骛",
+    "騙骗騫骞騭骘騮骝騰腾騶驺騷骚騸骟騾骡驀蓦驁骜驂骖驃骠驄骢驅驱驊骅驍骁驏骣驕骄驗验",
+    "驚惊驛驿驟骤驢驴驤骧驥骥驪骊骯肮髏髅髒脏體体髕髌髖髋髮发鬆松鬍胡鬚须鬢鬓鬥斗鬧闹",
+    "鬨哄鬩阋鬮阄鬱郁魎魉魘魇魚鱼魯鲁魴鲂魷鱿鮐鲐鮑鲍鮒鲋鮚鲒鮞鲕鮪鲔鮫鲛鮭鲑鮮鲜鯀鲧",
+    "鯁鲠鯇鲩鯉鲤鯊鲨鯔鲻鯖鲭鯛鲷鯡鲱鯢鲵鯤鲲鯧鲳鯨鲸鯪鲮鯫鲰鯰鲶鯽鲫鰈鲽鰉鳇鰍鳅鰒鳆",
+    "鰓鳃鰣鲥鰥鳏鰨鳎鰩鳐鰭鳍鰱鲢鰲鳌鰳鳓鰷鲦鰹鲣鰻鳗鰾鳔鱈鳕鱉鳖鱒鳟鱔鳝鱖鳜鱗鳞鱘鲟",
+    "鱟鲎鱧鳢鱭鲚鱷鳄鱸鲈鱺鲡鳥鸟鳧凫鳩鸠鳳凤鳴鸣鳶鸢鴆鸩鴇鸨鴉鸦鴕鸵鴛鸳鴝鸲鴟鸱鴣鸪",
+    "鴦鸯鴨鸭鴯鸸鴰鸹鴻鸿鴿鸽鵂鸺鵑鹃鵒鹆鵓鹁鵜鹈鵝鹅鵠鹄鵡鹉鵪鹌鵬鹏鵯鹎鵲鹊鶇鸫鶉鹑",
+    "鶘鹕鶚鹗鶩鹜鶯莺鶱骞鶴鹤鶻鹘鶼鹣鶿鹚鷂鹞鷓鹧鷗鸥鷙鸷鷚鹨鷥鸶鷦鹪鷯鹩鷲鹫鷳鹇鷴鹇",
+    "鷸鹬鷹鹰鷺鹭鸕鸬鸚鹦鸛鹳鸝鹂鸞鸾鹵卤鹹咸鹺鹾鹼硷鹽盐麗丽麥麦麩麸麵面麼麽黃黄黌黉",
+    "點点黨党黲黪黴霉黷黩黽黾黿鼋鼇鳌鼉鼍鼕冬鼴鼹齊齐齋斋齏齑齒齿齔龀齙龅齜龇齟龃齠龆",
+    "齡龄齣出齦龈齧啮齪龊齬龉齲龋齷龌龍龙龐庞龔龚龕龛龜龟"
+);
+
+/// 构建繁→简映射（首次调用时解析，之后复用）。
+fn t2s_map() -> &'static HashMap<char, char> {
+    static MAP: OnceLock<HashMap<char, char>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        T2S_PAIRS.chars()
+            .collect::<Vec<char>>()
+            .chunks(2)
+            .filter(|pair| pair.len() == 2 && pair[0] != pair[1])
+            .map(|pair| (pair[0], pair[1]))
+            .collect()
+    })
+}
+
+/// legado `java.t2s(s)`: 繁体转简体。
+fn java_t2s(input: &str) -> String {
+    let map = t2s_map();
+    input.chars().map(|c| *map.get(&c).unwrap_or(&c)).collect()
+}
+
+/// `java.s2t(s)`: 简体转繁体（上表反向；同一简体对应多个繁体时取表中最后一个）。
+fn java_s2t(input: &str) -> String {
+    static REVERSE: OnceLock<HashMap<char, char>> = OnceLock::new();
+    let reverse = REVERSE.get_or_init(|| t2s_map().iter().map(|(t, s)| (*s, *t)).collect());
+    input.chars().map(|c| *reverse.get(&c).unwrap_or(&c)).collect()
+}
 /// legado `java.htmlFormat(str)`: 解码 HTML 实体为纯文本
-fn java_html_format(input: &str) -> String {
-    input
+fn java_html_format(input: &str) -> String {    input
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -1527,13 +2121,22 @@ fn js_request(
     body: Option<String>,
     headers: &JsonValue,
     default_headers: &[(String, String)],
+    options: &JsonValue,
 ) -> JsonValue {
     let url = url.trim().to_string();
     if url.is_empty() {
         return json!({ "body": "", "code": 0, "url": "", "headers": {} });
     }
-    let method = Method::from_bytes(method.to_ascii_uppercase().as_bytes()).unwrap_or(Method::GET);
+    let method = match method.to_ascii_uppercase().as_str() {
+        "POST" => HttpMethod::POST, "HEAD" => HttpMethod::HEAD,
+        "PUT" => HttpMethod::PUT, "PATCH" => HttpMethod::PATCH,
+        "DELETE" => HttpMethod::DELETE, _ => HttpMethod::GET,
+    };
     let mut merged: Vec<(String, String)> = default_headers.to_vec();
+    for (key, value) in login_headers() {
+        merged.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
+        merged.push((key, value));
+    }
     if let Some(map) = headers.as_object() {
         for (key, value) in map {
             let value = match value {
@@ -1548,35 +2151,35 @@ fn js_request(
     if !merged.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
         merged.push(("User-Agent".to_string(), DEFAULT_JS_USER_AGENT.to_string()));
     }
-    let request_url = url.clone();
+    let source = active_source();
+    let concurrent_rate = source.concurrent_rate.clone();
+    let http = source.http.map(Ok).unwrap_or_else(|| source_http_context(&source.url));
+    let request_url = crate::crawler::url_analyzer::absolute_url(&source.url, &url);
+    let proxy = merged.iter().find(|(key, _)| key.eq_ignore_ascii_case("proxy")).map(|(_, value)| value.clone());
+    merged.retain(|(key, _)| !key.eq_ignore_ascii_case("proxy"));
+    let spec = RequestSpec {
+        url: request_url, method, headers: merged, body,
+        retry: options["retry"].as_u64().unwrap_or(2).min(5) as usize,
+        charset: options["charset"].as_str().map(str::to_string),
+        response_type: options.get("type").filter(|value| !value.is_null()).map(|value| value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string())),
+        ..Default::default()
+    };
     let outcome = run_blocking_http(move || -> anyhow::Result<JsonValue> {
-        let mut req = JS_HTTP_CLIENT.request(method, &request_url);
-        for (key, value) in merged {
-            req = req.header(key, value);
-        }
-        if let Some(body) = body {
-            req = req.body(body);
-        }
-        let response = req.send()?;
-        let code = response.status().as_u16();
-        let final_url = response.url().to_string();
-        let headers: serde_json::Map<String, JsonValue> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.as_str().to_ascii_lowercase(),
-                    JsonValue::String(v.to_str().unwrap_or_default().to_string()),
-                )
-            })
-            .collect();
-        let text = response.text().unwrap_or_default();
-        Ok(json!({ "body": text, "code": code, "url": final_url, "headers": headers }))
+        let http = http?;
+        let client = if let Some(proxy) = proxy.as_deref().filter(|v| Some(*v) != http.proxy.as_deref()) {
+            crate::crawler::http_client::build_source_client(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
+        } else { http.client };
+        let response = JS_HTTP_RUNTIME.block_on(http.session.request(&client, spec, concurrent_rate.as_deref()))?;
+        let headers = response.headers.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), json!(v))).collect::<serde_json::Map<_, _>>();
+        Ok(json!({"body":response.body, "code":response.status, "url":response.url, "headers":headers}))
     });
-    outcome.unwrap_or_else(|e| {
-        push_js_log(format!("[http] {url}: {e}"));
+    let value = outcome.unwrap_or_else(|e| {
+        push_js_log(format!("[http] 请求失败: {e}"));
         json!({ "body": "", "code": 0, "url": url, "headers": {} })
-    })
+    });
+    // legado `java.getStrResponse()` 无参时返回"最近一次请求的响应"。
+    LAST_RESPONSE.with(|cell| cell.replace(Some(value.to_string())));
+    value
 }
 
 fn js_http(
@@ -1588,12 +2191,12 @@ fn js_http(
 ) -> JsonValue {
     let headers = serde_json::from_str::<JsonValue>(headers).unwrap_or(JsonValue::Null);
     let body = (!body.is_empty() || method.eq_ignore_ascii_case("POST")).then(|| body.to_string());
-    js_request(method, url, body, &headers, default_headers)
+    js_request(method, url, body, &headers, default_headers, &JsonValue::Null)
 }
 
 /// legado `java.ajax(url)` / `java.connect(url, header)`: url 可带 `,{method, body, headers}` 选项。
 fn js_connect(spec: &str, headers: &str, default_headers: &[(String, String)]) -> JsonValue {
-    let (url, options) = split_ajax_spec(spec);
+    let (url, options) = crate::crawler::url_analyzer::split_url_options(spec);
     let options = options
         .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok())
         .unwrap_or(JsonValue::Null);
@@ -1618,45 +2221,7 @@ fn js_connect(spec: &str, headers: &str, default_headers: &[(String, String)]) -
     if let Some(map) = options.get("headers").and_then(|v| v.as_object()) {
         merged.extend(map.clone());
     }
-    js_request(&method, url, body, &JsonValue::Object(merged), default_headers)
-}
-
-fn split_ajax_spec(spec: &str) -> (&str, Option<&str>) {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut quote = '\0';
-    let mut escaped = false;
-
-    for (idx, ch) in spec.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-
-        match ch {
-            '\\' if in_string => {
-                escaped = true;
-            }
-            '"' | '\'' if in_string && ch == quote => {
-                in_string = false;
-                quote = '\0';
-            }
-            '"' | '\'' if !in_string => {
-                in_string = true;
-                quote = ch;
-            }
-            '{' | '[' if !in_string => depth += 1,
-            '}' | ']' if !in_string => depth -= 1,
-            ',' if !in_string && depth == 0 => {
-                let left = &spec[..idx];
-                let right = &spec[idx + ch.len_utf8()..];
-                return (left, Some(right.trim()));
-            }
-            _ => {}
-        }
-    }
-
-    (spec, None)
+    js_request(&method, url, body, &JsonValue::Object(merged), default_headers, &options)
 }
 
 // ────────────────────── 书源面板(showBrowser)宿主桥 ──────────────────────
@@ -1686,11 +2251,21 @@ pub fn run_panel_request(
     action: &str,
     payload: &JsonValue,
 ) -> anyhow::Result<String> {
-    let headers = source
-        .header
-        .as_deref()
-        .map(parse_source_headers)
-        .unwrap_or_default();
+    run_panel_fetch(source, base_url, action, payload).map(|response| {
+        response.get("body").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+    })
+}
+
+pub fn run_panel_fetch(
+    source: &BookSource, base_url: &str, action: &str, payload: &JsonValue,
+) -> anyhow::Result<JsonValue> {
+    with_source(source, || run_panel_request_inner(source, base_url, action, payload))
+}
+
+fn run_panel_request_inner(
+    source: &BookSource, base_url: &str, action: &str, payload: &JsonValue,
+) -> anyhow::Result<JsonValue> {
+    let headers = crate::crawler::url_analyzer::source_header_spec(source)?.headers;
     let text_of = |key: &str| payload.get(key).and_then(|v| v.as_str()).unwrap_or("");
     // headers 兜底: 面板桥已把它序列化成文本, 但若调用方直接传对象,
     // 上面 as_str() 只会取到空串, 会让自定义头静默失效。
@@ -1712,26 +2287,21 @@ pub fn run_panel_request(
             }
             js_connect(spec, "{}", &merged)
         }
-        "http" => {
+        "http" | "fetch" => {
             let method = text_of("method").to_uppercase();
-            let url = text_of("url");
+            let url = crate::crawler::url_analyzer::absolute_url(base_url, text_of("url"));
             let body = text_of("body");
             let extra = headers_text("headers");
             let mut merged = headers;
             if !extra.trim().is_empty() {
                 merged.extend(parse_source_headers(&extra));
             }
-            let _ = base_url;
             js_http(&method, &url, &body, "{}", &merged)
         }
         other => anyhow::bail!("未知的请求类型 {other}"),
     };
 
-    Ok(envelope
-        .get("body")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string())
+    Ok(envelope)
 }
 
 /// 面板 `java.createSymmetricCrypto` 的桥实现, 复用书源规则的同一套密码学。

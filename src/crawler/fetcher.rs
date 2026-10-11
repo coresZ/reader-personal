@@ -3,11 +3,16 @@ use encoding_rs::Encoding;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
+use base64::Engine;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HttpMethod {
     GET,
     POST,
+    HEAD,
+    PUT,
+    PATCH,
+    DELETE,
 }
 
 impl Default for HttpMethod {
@@ -67,8 +72,38 @@ pub struct StrResponse {
     pub body: String,
     pub url: String,
     pub code: u16,
+    /// legado 的 `headers` 是 Map 语义, 书源脚本 `JSON.stringify(result.headers)`
+    /// 会产出对象(`{"k":"v"}`), 而 Rust 侧内部表示是 `[[k,v],...]`。两种都收。
+    #[serde(deserialize_with = "lenient_headers")]
     pub headers: Vec<(String, String)>,
     pub is_successful: bool,
+}
+
+/// 接受 `[[k,v],...]`、`{"k":"v"}` 与 null 三种形态。
+fn lenient_headers<'de, D>(deserializer: D) -> Result<Vec<(String, String)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Array(rows)) => rows
+            .into_iter()
+            .filter_map(|row| {
+                let mut row = row.as_array()?.iter();
+                let key = row.next()?.as_str()?.to_string();
+                let value = row.next()?.as_str().unwrap_or_default().to_string();
+                Some((key, value))
+            })
+            .collect(),
+        Some(serde_json::Value::Object(map)) => map
+            .into_iter()
+            .map(|(key, value)| {
+                let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                (key, value)
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 pub async fn fetch(client: &HttpClient, req: RequestSpec) -> anyhow::Result<FetchResponse> {
@@ -83,6 +118,7 @@ pub async fn fetch_with_client(
     request_client: &reqwest::Client,
     req: RequestSpec,
 ) -> anyhow::Result<FetchResponse> {
+    if let Some(response) = data_uri_response(&req)? { return Ok(response); }
     let mut last_err: Option<anyhow::Error> = None;
     let max_retries = req.retry;
     for attempt in 0..=max_retries {
@@ -90,6 +126,10 @@ pub async fn fetch_with_client(
         let mut builder = match req.method {
             HttpMethod::GET => request_client.get(&req.url),
             HttpMethod::POST => request_client.post(&req.url),
+            HttpMethod::HEAD => request_client.head(&req.url),
+            HttpMethod::PUT => request_client.put(&req.url),
+            HttpMethod::PATCH => request_client.patch(&req.url),
+            HttpMethod::DELETE => request_client.delete(&req.url),
         };
 
         let mut has_content_type = false;
@@ -104,25 +144,17 @@ pub async fn fetch_with_client(
             if matches!(req.method, HttpMethod::POST) && !has_content_type {
                 builder = builder.header(
                     reqwest::header::CONTENT_TYPE,
-                    "application/x-www-form-urlencoded",
+                    if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+                        "application/json"
+                    } else { "application/x-www-form-urlencoded" },
                 );
             }
-            println!("DEBUG: fetch sending body: {}", body);
             builder = builder.body(body);
         }
 
-        println!(
-            "DEBUG: fetch executing {} request to: {}",
-            match req.method {
-                HttpMethod::GET => "GET",
-                HttpMethod::POST => "POST",
-            },
-            req.url
-        );
         match builder.send().await {
             Ok(res) => {
                 let status = res.status().as_u16();
-                println!("DEBUG: fetch response status: {}", status);
                 let is_successful = res.status().is_success();
                 let url = res.url().to_string();
                 let content_type = res
@@ -182,13 +214,15 @@ pub async fn fetch_with_client(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("fetch failed")))
 }
 
-fn decode_body(bytes: &[u8], charset: Option<&str>, content_type: Option<&str>) -> String {
-    let label = charset
+pub(crate) fn decode_body(bytes: &[u8], charset: Option<&str>, content_type: Option<&str>) -> String {
+    // URL charset controls request encoding. A declared response encoding takes
+    // precedence, including HTML pages returned by an UTF-8 search endpoint.
+    let label = charset_from_content_type(content_type)
+        .or_else(|| charset_from_html_meta(bytes))
+        .or_else(|| charset
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| charset_from_content_type(content_type))
-        .or_else(|| charset_from_html_meta(bytes));
+        .map(str::to_string));
 
     if let Some(label) = label {
         if let Some(encoding) = Encoding::for_label(label.trim().as_bytes()) {
@@ -198,6 +232,23 @@ fn decode_body(bytes: &[u8], charset: Option<&str>, content_type: Option<&str>) 
     }
 
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+pub(crate) fn data_uri_response(req: &RequestSpec) -> anyhow::Result<Option<FetchResponse>> {
+    let Some(data) = req.url.strip_prefix("data:") else { return Ok(None) };
+    let (meta, payload) = data.split_once(',').ok_or_else(|| anyhow::anyhow!("无效的内嵌数据地址"))?;
+    let decoded = urlencoding::decode_binary(payload.as_bytes());
+    let bytes = if meta.split(';').any(|part| part.eq_ignore_ascii_case("base64")) {
+        base64::engine::general_purpose::STANDARD.decode(decoded.as_ref())?
+    } else { decoded.into_owned() };
+    let content_type = meta.split(';').filter(|part| !part.eq_ignore_ascii_case("base64")).collect::<Vec<_>>().join(";");
+    let body = if req.response_type.as_deref().is_some_and(|value| !value.is_empty()) {
+        hex::encode(bytes)
+    } else { decode_body(&bytes, req.charset.as_deref(), Some(&content_type)) };
+    Ok(Some(FetchResponse {
+        url: req.url.clone(), status: 200, body, content_type: Some(content_type),
+        headers: Vec::new(), is_successful: true,
+    }))
 }
 
 fn charset_from_content_type(content_type: Option<&str>) -> Option<String> {

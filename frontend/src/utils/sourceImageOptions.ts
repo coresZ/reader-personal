@@ -1,3 +1,5 @@
+import { readSourceLiteral } from './sourceLiteral'
+
 /**
  * legado `img` 的 `,{json}` 参数协议。
  *
@@ -68,31 +70,25 @@ export function ensureSvgNamespace(url: string): string {
  */
 export function parseSourceImageOptions(rawSrc: string): SourceImageOption | null {
   if (!rawSrc) return null
-  const marker = rawSrc.search(SOURCE_IMG_OPTION_RE)
-  if (marker < 0) return null
-
-  const url = rawSrc.slice(0, marker).trim()
-  const optionText = rawSrc.slice(marker).replace(SOURCE_IMG_OPTION_RE, '').trim()
-  let option: Record<string, unknown>
-  try {
-    const parsed = JSON.parse(optionText)
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
-    option = parsed as Record<string, unknown>
-  } catch {
-    return null
+  const separators = [...rawSrc.matchAll(new RegExp(SOURCE_IMG_OPTION_RE.source, 'g'))].reverse()
+  for (const separator of separators) {
+    const parsed = readSourceLiteral(rawSrc, separator.index + separator[0].length)
+    if (!parsed || rawSrc.slice(parsed.end).trim()) continue
+    const option = parsed.value
+    if (!option || typeof option !== 'object' || Array.isArray(option)) continue
+    const asText = (key: string) => {
+      const value = option[key]
+      return typeof value === 'string' || typeof value === 'number' ? String(value) : ''
+    }
+    return {
+      url: rawSrc.slice(0, separator.index).trim(),
+      style: asText('style').toLowerCase(),
+      click: asText('click'),
+      width: asText('width'),
+      label: asText('displayText') || asText('num') || asText('text'),
+    }
   }
-
-  const asText = (key: string) => {
-    const value = option[key]
-    return typeof value === 'string' ? value : ''
-  }
-  return {
-    url,
-    style: asText('style').toLowerCase(),
-    click: asText('click'),
-    width: asText('width'),
-    label: asText('displayText') || asText('num') || asText('text'),
-  }
+  return null
 }
 
 /**

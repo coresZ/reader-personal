@@ -91,11 +91,11 @@
 
     <div v-else-if="activeTab === 'login'" class="login-pane">
       <div class="login-card">
-        <h4>书源登录调试</h4>
-        <p v-if="canLogin">当前 JSON 包含 `bookSourceUrl` 和 `loginUrl`，可以打开代理登录预览。</p>
-        <p v-else>当前书源未配置 `loginUrl`，或 JSON 暂时无法解析。</p>
+        <h4>书源登录</h4>
+        <p v-if="canLogin">打开书源提供的登录页面或表单，也可以手动导入 Cookie。</p>
+        <p v-else>请先填写有效的书源名称和地址。</p>
         <button class="mini-btn primary" type="button" :disabled="!canLogin || loginLoading" @click="$emit('login')">
-          {{ loginLoading ? '登录中...' : '打开登录页' }}
+          {{ loginLoading ? '准备中...' : '打开登录' }}
         </button>
       </div>
     </div>
@@ -139,7 +139,7 @@ const tabs: { key: TabKey; label: string }[] = [
   { key: 'visual', label: '可视化编辑' },
   { key: 'json', label: 'JSON' },
   { key: 'debug', label: '调试' },
-  { key: 'login', label: '登录调试' },
+  { key: 'login', label: '登录' },
 ]
 
 const overview = computed(() => getBookSourceOverview(props.source))

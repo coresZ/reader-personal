@@ -4,6 +4,16 @@ pub fn jsonpath_query(value: &Value, rule: &str) -> Vec<Value> {
     if let Some(rendered) = render_embedded_paths(value, rule) {
         return vec![Value::String(rendered)];
     }
+    // legado 允许省略 `$` 前缀（如 `data.books`），统一补成 `$.data.books`。
+    // 前导点（`.data`）剥掉，避免拼成 `$..`（递归下降）导致语义反转。
+    let owned;
+    let rule = if rule.starts_with('$') || rule.starts_with('[') {
+        rule
+    } else {
+        let stripped = rule.trim_start_matches('.');
+        owned = format!("$.{stripped}");
+        &owned
+    };
     if let Ok(res) = jsonpath_lib::select(value, rule) {
         let mut out = Vec::new();
         for item in res {

@@ -57,6 +57,7 @@ Reader 是「阅读3.0」（[Legado](https://github.com/Rimchars/legado)）的�
 - 书籍详情、目录获取、换源、章节缓存与离线阅读
 - 书源可视化编辑器、原始响应查看和分步骤规则调试
 - 书源登录预览及 Cookie 登录状态支持
+- 支持书源自定义登录表单、按钮操作与登录状态保存
 
 ### 阅读体验
 
@@ -214,6 +215,10 @@ cargo test -j 4
 书源使用 JSON 对象描述，常用字段包括 `bookSourceUrl`、`bookSourceName`、`searchUrl`、`exploreUrl`，以及 `ruleSearch`、`ruleBookInfo`、`ruleToc`、`ruleContent` 等规则组。
 
 规则支持 `@css:`、`@json:`、`@xpath:`、`@regex:` 与 `js:` 前缀。JavaScript 规则由本地 rquickjs 引擎执行，导入不可信书源前仍应检查其中的请求地址与脚本内容。
+
+在书源管理的「登录」页，可以使用书源提供的网页或自定义表单，也可以手动导入 Cookie。登录信息和 Cookie 按书源保存在本机，重启后仍可使用；可在登录窗口清除 Cookie。书源自带的设置网页支持确认和取消：调整后点击右上角「确认」保存，「取消」会保留原设置。
+
+旧版本导入时如果已将书源脚本中的花括号改成尖括号，需要重新导入原始书源文件来恢复规则。更新后的版本会保留现代书源中的脚本和请求参数，并重新生成目录缓存。
 
 ## 参与项目
 

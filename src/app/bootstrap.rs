@@ -34,6 +34,7 @@ pub async fn build_state(cfg: &AppConfig) -> anyhow::Result<AppState> {
     let repo = db::repo::BookSourceRepo::new(pool.clone());
 
     let http = HttpClient::new(cfg.request_timeout_secs, None)?;
+    crate::parser::js::set_js_http_client(http.clone());
     let parser = RuleEngine::new()?;
     let cache = FileCache::new(format!("{}/cache", cfg.storage_dir));
 

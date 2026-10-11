@@ -225,10 +225,19 @@ pub async fn unpin_book_source(
     Ok(ApiResponse::ok(serde_json::json!({ "success": true })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookSourceLoginParam {
+    pub book_source_url: Option<String>,
+    pub action: Option<String>,
+    pub values: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
 #[tauri::command]
 pub async fn login_book_source(
     state: tauri::State<'_, AppState>,
-    req: BookSourceUrlParam,
+    req: BookSourceLoginParam,
+    on_browser: tauri::ipc::Channel<crate::service::book_service::ShowBrowserRequest>,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
     let url = req
@@ -239,7 +248,10 @@ pub async fn login_book_source(
         .get(&user_ns, &url)
         .await?
         .ok_or_else(|| AppError::NotFound("bookSource not found".to_string()))?;
-    let mut result = state.book_service.login_book_source(&source).await?;
+    let handler: crate::service::source_browser::BrowserHandler = Arc::new(move |request| {
+        on_browser.send(request).map_err(|err| err.to_string())
+    });
+    let mut result = state.book_service.run_source_login_with_browser(&source, req.action, req.values, Some(handler)).await?;
     let login_session = state
         .book_service
         .create_source_login_session(&source.book_source_url)
@@ -251,6 +263,12 @@ pub async fn login_book_source(
         );
     }
     Ok(ApiResponse::ok(result))
+}
+
+#[tauri::command]
+pub fn close_source_panel(panel_id: String) {
+    crate::service::source_browser::cancel_browser(&panel_id);
+    crate::service::book_service::remove_source_panel(&panel_id);
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,9 +295,6 @@ pub async fn set_book_source_cookie(
         .ok_or_else(|| AppError::BadRequest("cookie required".to_string()))?
         .trim()
         .to_string();
-    if cookie.is_empty() {
-        return Err(AppError::BadRequest("cookie 不能为空".to_string()));
-    }
     // 先确认书源存在
     let source = state
         .book_source_service
@@ -290,17 +305,19 @@ pub async fn set_book_source_cookie(
     // 关键词同样走 check_keyword(默认"我的"), 不用"测试"——后者在很多站点
     // 搜不到任何书, 会让"Cookie 校验失败"误报。
     let validate_keyword = source.check_keyword();
-    state
-        .book_service
-        .validate_source_cookie(&user_ns, &source, &cookie, &validate_keyword)
-        .await?;
+    let validated = if !cookie.is_empty() {
+        state.book_service.validate_source_cookie(&user_ns, &source, &cookie, &validate_keyword).await?
+    } else {
+        state.book_service.clear_source_cookie(&user_ns, &source.book_source_url).await;
+        false
+    };
 
     state
         .book_service
         .set_source_cookie(&user_ns, &source.book_source_url, &cookie)
-        .await;
+        .await?;
     Ok(ApiResponse::ok(
-        serde_json::json!({ "success": true, "saved": true, "validated": true }),
+        serde_json::json!({ "success": true, "saved": true, "validated": validated }),
     ))
 }
 

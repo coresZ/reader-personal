@@ -1,21 +1,43 @@
 import { get, post, invokeEnvelope } from './invoke'
 import type { BookSource, BookSourceTestResponse } from '../types'
 import { MAX_SOURCE_TEST_BATCH_SIZE } from '../utils/sourceTesting'
+import { Channel } from '@tauri-apps/api/core'
+import type { ShowBrowserRequest } from './sourceClick'
 
 export function getBookSources() {
   return get<BookSource[]>('/getBookSources').then((r) => r.data)
 }
 
-export function loginBookSource(bookSourceUrl: string) {
-  return post<{
-    success: boolean
-    status: number
-    url: string
-    loginSession: string
-    checkResult?: string | null
-    bodyPreview?: string
-    bodyHtml?: string
-  }>('/loginBookSource', { bookSourceUrl }).then((r) => r.data)
+export interface SourceLoginField {
+  name: string
+  type: 'text' | 'password' | 'button' | 'toggle' | 'select'
+  action?: string | null
+  viewName?: string | null
+  placeholder?: string | null
+  chars?: unknown[] | null
+  style?: Record<string, unknown> | null
+  default?: unknown
+}
+
+export interface SourceLoginView {
+  mode: 'form' | 'web' | 'cookie'
+  fields: SourceLoginField[]
+  values: Record<string, string>
+  url?: string | null
+  openUrl?: string | null
+  loginSession: string
+  messages: string[]
+  actionCompleted: boolean
+  showBrowser?: ShowBrowserRequest | null
+  cancelled?: boolean
+}
+
+export function loginBookSource(bookSourceUrl: string, action?: string, values?: Record<string, string>, onBrowser?: (request: ShowBrowserRequest) => void) {
+  const channel = new Channel<ShowBrowserRequest>()
+  if (onBrowser) channel.onmessage = onBrowser
+  return invokeEnvelope<SourceLoginView>('login_book_source', {
+    req: { bookSourceUrl, action, values }, onBrowser: channel,
+  })
 }
 
 /** 手动导入书源登录 Cookie(如通过抓包获取的会话)。 */

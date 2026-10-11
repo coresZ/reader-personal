@@ -71,22 +71,32 @@ async fn route(
 
 // ─────────────────────────── 书源面板 (showBrowser) ───────────────────────────
 
-/// `${readerOrigin}/sourcePanel?panelId=...`: 面板 HTML(已注入宿主桥)。
+/// `${readerOrigin}/sourcePanel?__readerPanelId=...`: 面板 HTML(已注入宿主桥)。
 ///
 /// 面板由后端托管而不是用 iframe `srcdoc`, 因为 `srcdoc` 是 `about:srcdoc` 源,
 /// 无法同源访问 `/sourcePanelBridge`; 挂在 `reader.localhost` 下才能同步回调宿主。
 async fn source_panel_route(
-    _state: &AppState,
+    state: &AppState,
     query: &str,
-    _request: &tauri::http::Request<Vec<u8>>,
+    request: &tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
     let params = parse_query(query);
-    let Some(panel_id) = params.get("panelId") else {
+    // Keep transport fields separate from the upstream page's own query.
+    let namespaced = params.contains_key("__readerPanelId");
+    let Some(panel_id) = params.get(if namespaced { "__readerPanelId" } else { "panelId" }) else {
         return text_response(400, "missing panelId");
     };
-    let Some(html) = build_source_panel_page(panel_id) else {
+    let Some(entry) = crate::service::book_service::get_source_panel(panel_id) else {
         return text_response(404, "panel not found");
     };
+    let target = params.get(if namespaced { "__readerPanelUrl" } else { "url" });
+    if target.is_some() || (entry.html.is_empty() && !entry.url.starts_with("data:")) {
+        return match fetch_source_panel_page(state, panel_id, &entry, target.map(String::as_str), request).await {
+            Ok(response) => response,
+            Err(error) => text_response(502, &error.to_string()),
+        };
+    }
+    let html = render_source_panel_page(panel_id, &entry, &entry.url, &entry.html);
     http::Response::builder()
         .status(200)
         .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -98,8 +108,167 @@ async fn source_panel_route(
 /// 组装面板页: 面板 HTML + 注入的宿主桥脚本。面板不存在时返回 `None`。
 pub fn build_source_panel_page(panel_id: &str) -> Option<String> {
     let entry = crate::service::book_service::get_source_panel(panel_id)?;
-    let bridge = build_source_panel_bridge_script(panel_id);
-    Some(inject_before_head_end(&entry.html, &bridge))
+    Some(render_source_panel_page(panel_id, &entry, &entry.url, &entry.html))
+}
+
+fn script_string(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_default().replace('<', "\\u003c")
+}
+
+fn render_source_panel_page(panel_id: &str, entry: &crate::service::book_service::SourcePanelEntry, page_url: &str, html: &str) -> String {
+    let jar_cookie = entry.http.as_ref()
+        .and_then(|http| url::Url::parse(page_url).ok().map(|url| http.session.cookies.get(&url)))
+        .unwrap_or_default();
+    render_source_panel_page_with_cookie(panel_id, entry, page_url, html, &jar_cookie)
+}
+
+/// `jar_cookie`: 书源 cookie jar 中该页面域的 cookie 串 (`k=v; k2=v2`)。
+/// 面板页面 JS 常用 `document.cookie` 判断登录态（如光遇 `/user` 的
+/// `getCookie('qttoken')`）。自定义协议 origin 下 `Set-Cookie` 响应头
+/// 未必被 WebView 落盘，这里直接在页面脚本之前注入并劫持
+/// `document.cookie` 的 getter（jar 优先合并），保证入口检查可读到。
+fn render_source_panel_page_with_cookie(panel_id: &str, entry: &crate::service::book_service::SourcePanelEntry, page_url: &str, html: &str, jar_cookie: &str) -> String {
+    let page_url = if page_url.starts_with("data:") { "" } else { page_url };
+    let mut bridge = format!("<script>window.__readerPanelUrl={};window.__readerSourceKey={};</script>", script_string(page_url), script_string(&entry.book_source_url));
+    if !jar_cookie.trim().is_empty() {
+        bridge.push_str(&format!(
+            r#"<script>
+(function () {{
+  var jarCookie = {};
+  var pairs = jarCookie.split(/;\s*/).filter(function (p) {{ return p.indexOf('=') > 0; }});
+  var jar = {{}};
+  pairs.forEach(function (p) {{
+    var i = p.indexOf('=');
+    jar[p.slice(0, i).trim()] = p.slice(i + 1).trim();
+  }});
+  var desc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie')
+    || Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'cookie')
+    || Object.getOwnPropertyDescriptor(document, 'cookie');
+  if (!desc || !desc.get || !desc.set) return;
+  // 先尽力把 jar cookie 写进浏览器(部分环境可写, 子资源请求也能带上)
+  pairs.forEach(function (p) {{
+    try {{ desc.set.call(document, p.trim() + '; path=/'); }} catch (e) {{}}
+  }});
+  var nativeGet = desc.get, nativeSet = desc.set;
+  Object.defineProperty(document, 'cookie', {{
+    configurable: true,
+    get: function () {{
+      var merged = {{}};
+      try {{
+        String(nativeGet.call(document)).split(/;\s*/).forEach(function (p) {{
+          var i = p.indexOf('=');
+          if (i > 0) merged[p.slice(0, i).trim()] = p.slice(i + 1).trim();
+        }});
+      }} catch (e) {{}}
+      // 书源 jar 优先: 浏览器里的同名旧值被实时 jar 值覆盖
+      Object.keys(jar).forEach(function (k) {{ merged[k] = jar[k]; }});
+      return Object.keys(merged).map(function (k) {{ return k + '=' + merged[k]; }}).join('; ');
+    }},
+    set: function (value) {{ try {{ nativeSet.call(document, value); }} catch (e) {{}} }}
+  }});
+}})();
+</script>"#,
+            script_string(jar_cookie)
+        ));
+    }
+    bridge.push_str(&build_source_panel_bridge_script(panel_id));
+    if let Some(preload) = &entry.preload_js {
+        bridge.push_str(&format!("<script>(0,eval)({});</script>", script_string(preload)));
+    }
+    if page_url.starts_with("http://") || page_url.starts_with("https://") {
+        let base = page_url.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;");
+        bridge.push_str(&format!("<base href=\"{base}\">"));
+    }
+    // Install the bridge and preload before scripts in the original head execute.
+    let head = Regex::new(r"(?i)<head\b[^>]*>").expect("head pattern");
+    if let Some(found) = head.find(html) {
+        format!("{}{}{}", &html[..found.end()], bridge, &html[found.end()..])
+    } else {
+        format!("{bridge}{html}")
+    }
+}
+
+async fn fetch_source_panel_page(
+    state: &AppState, panel_id: &str, entry: &crate::service::book_service::SourcePanelEntry,
+    target: Option<&str>, request: &tauri::http::Request<Vec<u8>>,
+) -> Result<tauri::http::Response<Vec<u8>>, AppError> {
+    let target = resolve_proxy_target_url(target.unwrap_or(&entry.url), &entry.url)?;
+    if !proxy_target_matches_source(&target, &entry.url) {
+        return Ok(text_response(403, "panel target is outside the page domain"));
+    }
+    let source = state.book_source_service.get("default", &entry.book_source_url).await?
+        .ok_or_else(|| AppError::NotFound("bookSource not found".into()))?;
+    fetch_source_panel_response(&source, panel_id, entry, &target, request).await
+}
+
+async fn fetch_source_panel_response(
+    source: &BookSource, panel_id: &str, entry: &crate::service::book_service::SourcePanelEntry,
+    target: &str, request: &tauri::http::Request<Vec<u8>>,
+) -> Result<tauri::http::Response<Vec<u8>>, AppError> {
+    let context = entry.http.clone().map(Ok).unwrap_or_else(|| crate::parser::js::source_http_context(&entry.book_source_url))
+        .map_err(AppError::Internal)?;
+    let header_source = source.clone();
+    let header_context = context.clone();
+    let headers = tokio::task::spawn_blocking(move || {
+        crate::parser::js::with_http_context(header_context, || {
+            crate::parser::js::with_source(&header_source, || {
+                crate::crawler::url_analyzer::source_header_spec(&header_source)
+            })
+        })
+    }).await.map_err(|err| AppError::Internal(err.into()))??;
+    let client = match headers.proxy.as_deref() {
+        Some(proxy) => crate::crawler::http_client::build_source_client(context.timeout_secs, Some(proxy), context.session.cookies.clone()).map_err(AppError::Internal)?,
+        None => context.client.clone(),
+    };
+    let mut forwarded = merge_proxy_headers(headers.headers, request.headers())?;
+    if !forwarded.contains_key(http::header::REFERER) {
+        forwarded.insert(http::header::REFERER, http::HeaderValue::from_str(&entry.url)
+            .map_err(|err| AppError::BadRequest(format!("网页来源地址无效: {err}")))?);
+    }
+    let mut builder = client.request(request.method().clone(), target).headers(forwarded);
+    if !request.body().is_empty() { builder = builder.body(request.body().clone()); }
+    let response = builder.send().await.map_err(AppError::Http)?;
+    let status = response.status();
+    let final_url = response.url().to_string();
+    let content_type = response.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
+    let bytes = response.bytes().await.map_err(AppError::Http)?;
+    let is_html = is_html_response(Some(&content_type), &bytes);
+    let body = if is_html {
+        let html = crate::crawler::fetcher::decode_body(&bytes, None, Some(&content_type));
+        let html = rewrite_source_panel_html(&html, &final_url, &entry.url, panel_id);
+        let jar_cookie = url::Url::parse(&final_url)
+            .map(|url| context.session.cookies.get(&url)).unwrap_or_default();
+        render_source_panel_page_with_cookie(panel_id, entry, &final_url, &html, &jar_cookie).into_bytes()
+    } else { bytes.to_vec() };
+    let mut built = http::Response::builder().status(status.as_u16())
+        .header(http::header::CONTENT_TYPE, if is_html { "text/html; charset=utf-8" } else { &content_type })
+        .header(http::header::CACHE_CONTROL, "no-store");
+    // 面板页在 reader origin 里运行, 页面 JS 读 document.cookie 判断登录态
+    // (如光遇 /user 的 getCookie('qttoken'))。真实 cookie 在书源 jar 中,
+    // 以 Set-Cookie 透出给面板 origin, 让入口检查通过; 后续请求仍由代理
+    // 携带 jar cookie, 浏览器侧的这份仅供 JS 读取。每个 cookie 对一个头。
+    if is_html {
+        if let Ok(url) = url::Url::parse(&final_url) {
+            for pair in context.session.cookies.get(&url).split("; ").filter(|p| !p.is_empty()) {
+                built = built.header(http::header::SET_COOKIE, format!("{pair}; Path=/"));
+            }
+        }
+    }
+    Ok(built.body(body).unwrap_or_default())
+}
+
+fn rewrite_source_panel_html(html: &str, page_url: &str, allowed_url: &str, panel_id: &str) -> String {
+    let tags = Regex::new(r"(?is)<(?:script|link|img|iframe|source|video|audio|form|a)\b[^>]*>").unwrap();
+    let attrs = Regex::new(r#"(?i)\b(src|href|action)\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap();
+    tags.replace_all(html, |tag: &Captures| {
+        attrs.replace_all(&tag[0], |attr: &Captures| {
+            let raw = attr.get(2).or_else(|| attr.get(3)).map(|v| v.as_str()).unwrap_or_default();
+            if raw.starts_with('#') || raw.is_empty() { return attr[0].to_string(); }
+            let target = crate::crawler::url_analyzer::absolute_url(page_url, &raw.replace("&amp;", "&"));
+            if !proxy_target_matches_source(&target, allowed_url) { return attr[0].to_string(); }
+            format!("{}=\"{}/sourcePanel?__readerPanelId={}&amp;__readerPanelUrl={}\"", &attr[1], reader_scheme_origin(), urlencoding::encode(panel_id), urlencoding::encode(&target))
+        }).into_owned()
+    }).into_owned()
 }
 
 /// 面板内桥的同步端点。请求体: `{ "action": "...", "payload": {...} }`
@@ -141,6 +310,18 @@ async fn source_panel_bridge_route(
     let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
     let payload = body.get("payload").cloned().unwrap_or_default();
 
+    if action == "complete" {
+        let page = crate::service::source_browser::BrowserPage {
+            url: payload.get("url").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).unwrap_or(&entry.url).to_string(),
+            body: payload.get("body").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        };
+        let result = match crate::service::source_browser::complete_browser(panel_id, page) {
+            Ok(()) => serde_json::json!({"ok":true}),
+            Err(error) => serde_json::json!({"ok":false,"error":error}),
+        };
+        return json_response_panel(200, result, allow_origin);
+    }
+
     let outcome = crate::service::book_service::handle_source_panel_bridge(
         &state.book_source_service,
         &entry,
@@ -178,24 +359,6 @@ fn parse_query(query: &str) -> HashMap<String, String> {
     url::form_urlencoded::parse(query.as_bytes())
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect()
-}
-
-fn inject_before_head_end(html: &str, snippet: &str) -> String {
-    if let Some(index) = html.find("</head>") {
-        let mut out = String::with_capacity(html.len() + snippet.len());
-        out.push_str(&html[..index]);
-        out.push_str(snippet);
-        out.push_str(&html[index..]);
-        out
-    } else if let Some(index) = html.find("</body>") {
-        let mut out = String::with_capacity(html.len() + snippet.len());
-        out.push_str(&html[..index]);
-        out.push_str(snippet);
-        out.push_str(&html[index..]);
-        out
-    } else {
-        format!("{snippet}{html}")
-    }
 }
 
 fn text_response(status: u16, message: &str) -> tauri::http::Response<Vec<u8>> {
@@ -471,7 +634,7 @@ async fn book_source_proxy_route(
     }
     let upstream_referer = extract_upstream_referer(request.headers());
     match forward_book_source_request(
-        state,
+        &state.book_service,
         &source,
         &login_session,
         request.method(),
@@ -574,7 +737,7 @@ fn extract_upstream_referer(headers: &http::HeaderMap) -> Option<String> {
 }
 
 async fn forward_book_source_request(
-    state: &AppState,
+    book_service: &crate::service::book_service::BookService,
     source: &BookSource,
     login_session: &str,
     method: &http::Method,
@@ -583,8 +746,7 @@ async fn forward_book_source_request(
     upstream_referer: Option<&str>,
     body: &[u8],
 ) -> Result<tauri::http::Response<Vec<u8>>, AppError> {
-    let client = state
-        .book_service
+    let client = book_service
         .source_http_client("default", &source.book_source_url, None)
         .await?;
     let req_method = match *method {
@@ -593,49 +755,36 @@ async fn forward_book_source_request(
         _ => return Err(AppError::BadRequest("unsupported proxy method".to_string())),
     };
 
-    let mut builder = client.request(req_method, target_url);
-
-    if let Some(header_str) = &source.header {
-        if let Ok(source_headers) =
-            serde_json::from_str::<HashMap<String, String>>(header_str)
-        {
-            for (k, v) in source_headers {
-                builder = builder.header(k, v);
+    let header_source = source.clone();
+    let header_service = book_service.clone();
+    let header_spec = tokio::task::spawn_blocking(move || {
+        header_service.source_scope("default", &header_source, || {
+            crate::crawler::url_analyzer::source_header_spec(&header_source)
+        })?
+    }).await.map_err(|err| AppError::Internal(err.into()))??;
+    let mut forwarded = merge_proxy_headers(header_spec.headers, headers)?;
+    if !forwarded.contains_key(http::header::REFERER) {
+        forwarded.insert(http::header::REFERER, http::HeaderValue::from_str(upstream_referer.unwrap_or(target_url))
+            .map_err(|err| AppError::BadRequest(format!("网页来源地址无效: {err}")))?);
+    }
+    let referer_value = forwarded.get(http::header::REFERER).and_then(|value| value.to_str().ok()).unwrap_or(target_url).to_string();
+    if !forwarded.contains_key(http::header::ORIGIN) {
+        if let Ok(url) = Url::parse(&referer_value) {
+            if let Ok(origin) = http::HeaderValue::from_str(&url.origin().ascii_serialization()) {
+                forwarded.insert(http::header::ORIGIN, origin);
             }
         }
     }
-
-    let mut has_content_type = false;
-    let mut has_x_requested_with = false;
-    for (name, value) in headers.iter() {
-        if should_forward_request_header(name.as_str()) {
-            if name.as_str().eq_ignore_ascii_case("content-type") {
-                has_content_type = true;
-            }
-            if name.as_str().eq_ignore_ascii_case("x-requested-with") {
-                has_x_requested_with = true;
-            }
-            builder = builder.header(name, value.clone());
-        }
-    }
-
-    let referer_value = upstream_referer.unwrap_or(target_url);
-    builder = builder.header(http::header::REFERER, referer_value);
-    if let Ok(url) = Url::parse(referer_value) {
-        let origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
-        builder = builder.header(http::header::ORIGIN, origin);
-    }
-
-    if *method == http::Method::POST && !has_content_type {
-        builder = builder.header(
+    if *method == http::Method::POST && !forwarded.contains_key(http::header::CONTENT_TYPE) {
+        forwarded.insert(
             http::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded; charset=UTF-8",
+            http::HeaderValue::from_static("application/x-www-form-urlencoded; charset=UTF-8"),
         );
     }
-    if is_ajax_api_target(target_url) && !has_x_requested_with {
-        builder = builder.header("X-Requested-With", "XMLHttpRequest");
+    if is_ajax_api_target(target_url) && !forwarded.contains_key("x-requested-with") {
+        forwarded.insert("x-requested-with", http::HeaderValue::from_static("XMLHttpRequest"));
     }
-
+    let mut builder = client.request(req_method, target_url).headers(forwarded);
     if *method == http::Method::POST {
         builder = builder.body(body.to_vec());
     }
@@ -663,15 +812,6 @@ async fn forward_book_source_request(
         status,
         final_url
     );
-    if is_ajax_api_target(target_url) {
-        let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(500)]).replace('\n', "\\n");
-        tracing::info!(
-            "bookSourceProxy upstream api body: target={} status={} preview={}",
-            target_url,
-            status,
-            preview
-        );
-    }
     if status.is_client_error() || status.is_server_error() {
         let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(400)]).replace('\n', "\\n");
         tracing::warn!(
@@ -682,8 +822,9 @@ async fn forward_book_source_request(
         );
     }
 
+    let html_response = is_html_response(content_type.as_deref(), &bytes);
     let mut response_builder = http::Response::builder().status(status.as_u16());
-    if let Some(ct) = content_type.as_deref() {
+    if let Some(ct) = if html_response { Some("text/html; charset=utf-8") } else { content_type.as_deref() } {
         if let Ok(value) = http::HeaderValue::from_str(ct) {
             response_builder = response_builder.header(http::header::CONTENT_TYPE, value);
         }
@@ -696,10 +837,10 @@ async fn forward_book_source_request(
         // login sessions live only in the backend source-scoped client.
         .header("Clear-Site-Data", "\"cookies\"");
 
-    let body = if is_html_response(content_type.as_deref(), &bytes) {
+    let body = if html_response {
         // 登录 iframe 运行在 reader.localhost 下；只注入请求代理脚本。
         // Cookie 始终留在后端按书源隔离的客户端中，不写入浏览器 origin。
-        let text = String::from_utf8_lossy(&bytes).to_string();
+        let text = crate::crawler::fetcher::decode_body(&bytes, None, content_type.as_deref());
         // 代理页的文档地址位于 reader.localhost，浏览器不会再按上游站点
         // 解析相对的 script/link/img/form 地址；先把同站静态资源改写回
         // bookSourceProxy，避免登录页出现无样式、无脚本或提交地址失效。
@@ -816,6 +957,32 @@ fn build_login_proxy_url(
     ))
 }
 
+// Source settings override the embedded browser's defaults. HeaderMap::insert
+// replaces case-insensitive matches so Referer/User-Agent are sent exactly once.
+fn merge_proxy_headers(
+    source_headers: Vec<(String, String)>,
+    browser_headers: &http::HeaderMap,
+) -> Result<http::HeaderMap, AppError> {
+    let mut merged = http::HeaderMap::new();
+    for (name, value) in browser_headers {
+        if should_forward_request_header(name.as_str()) {
+            merged.insert(name.clone(), value.clone());
+        }
+    }
+    for (name, value) in source_headers {
+        let name = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|err| AppError::BadRequest(format!("书源请求头名称无效: {err}")))?;
+        let value = http::HeaderValue::from_str(&value)
+            .map_err(|err| AppError::BadRequest(format!("书源请求头值无效: {err}")))?;
+        merged.insert(name, value);
+    }
+    // The browser's boundary/encoding describes the actual submitted bytes.
+    if let Some(value) = browser_headers.get(http::header::CONTENT_TYPE) {
+        merged.insert(http::header::CONTENT_TYPE, value.clone());
+    }
+    Ok(merged)
+}
+
 fn should_forward_request_header(name: &str) -> bool {
     !matches!(
         name.to_ascii_lowercase().as_str(),
@@ -866,7 +1033,10 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
         r#"<script>
 (function () {{
   var panelId = {panel_id_json};
-  var bridgeBase = "/sourcePanelBridge?panelId=" + encodeURIComponent(panelId);
+  var bridgeBase = new URL("/sourcePanelBridge?panelId=" + encodeURIComponent(panelId), window.location.href).href;
+  var nativeFetch = window.fetch.bind(window);
+  var pageUrl = window.__readerPanelUrl || "";
+  var documentId = window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : String(Date.now()) + "-" + Math.random();
 
   // 同步桥: 与 legado 的 Java 同步接口语义一致(插件大量使用同步 ajax)。
   //
@@ -897,12 +1067,201 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
   // 面板 origin 为 reader.localhost, 父应用为 tauri.localhost, 用 postMessage 跨源通信。
   function postToHost(message) {{
     try {{
-      message.panelId = message.panelId || panelId;
+      message.panelId = panelId;
+      message.documentId = documentId;
       window.parent.postMessage(message, "*");
     }} catch (e) {{}}
   }}
 
+
+  var initialPageUrl = pageUrl;
+  var panelOrigin = new URL(bridgeBase).origin;
+  var navigating = false;
+  var nativeSubmit = HTMLFormElement.prototype.submit;
+  function panelTarget(url) {{
+    return url.searchParams.get(url.searchParams.has("__readerPanelId") ? "__readerPanelUrl" : "url");
+  }}
+  function isPanelUrl(url) {{
+    var id = url.searchParams.get(url.searchParams.has("__readerPanelId") ? "__readerPanelId" : "panelId");
+    return url.origin === panelOrigin && url.pathname === "/sourcePanel" && id === panelId;
+  }}
+  function realUrl(raw) {{
+    var url = new URL(raw, pageUrl || window.location.href);
+    if (isPanelUrl(url)) {{
+      var original = panelTarget(url) || initialPageUrl;
+      if (original) {{
+        var decoded = new URL(original);
+        if (url.hash) decoded.hash = url.hash;
+        return decoded;
+      }}
+    }}
+    return url;
+  }}
+  function proxyUrl(url, storedHtml) {{
+    var proxy = new URL("/sourcePanel", bridgeBase);
+    proxy.search = url.search;
+    proxy.searchParams.set("__readerPanelId", panelId);
+    if (storedHtml) proxy.searchParams.delete("__readerPanelUrl");
+    else proxy.searchParams.set("__readerPanelUrl", url.href);
+    proxy.hash = url.hash;
+    return proxy.href;
+  }}
+  // Pages read location.search during their first inline script (e.g. comment
+  // book/chapter ids). Publish it before preload/page scripts, without fetching
+  // again or turning a stored HTML panel into an upstream navigation on reload.
+  if (/^https?:/.test(pageUrl)) {{
+    var loadedUrl = new URL(window.location.href);
+    window.history.replaceState(window.history.state, "", proxyUrl(new URL(pageUrl), !panelTarget(loadedUrl)));
+  }}
+  function updatePageUrl(url) {{
+    pageUrl = url.href;
+    window.__readerPanelUrl = pageUrl;
+    var base = document.querySelector("base");
+    if (base && /^https?:$/.test(url.protocol)) base.href = pageUrl;
+    postToHost({{ type: "location", url: pageUrl }});
+  }}
+  function startNavigation(event) {{
+    navigating = true;
+    postToHost({{ type: "navigating" }});
+    if (event && event.signal) event.signal.addEventListener("abort", function () {{
+      navigating = false;
+      postToHost({{ type: "navigationCancelled" }});
+    }}, {{ once: true }});
+  }}
+  function submitToProxy(event, url) {{
+    var source = event.sourceElement;
+    var original = source && (source.form || (source.tagName === "FORM" ? source : null));
+    var form = document.createElement("form");
+    form.method = "post";
+    form.action = proxyUrl(url);
+    form.enctype = source && source.getAttribute("formenctype") || original && original.enctype || "application/x-www-form-urlencoded";
+    if (original) form.acceptCharset = original.acceptCharset;
+    form.hidden = true;
+    for (var pair of event.formData.entries()) {{
+      var field = document.createElement("input");
+      field.name = pair[0];
+      if (typeof pair[1] === "string") {{
+        field.type = "hidden";
+        field.value = pair[1];
+      }} else {{
+        field.type = "file";
+        var transfer = new DataTransfer();
+        transfer.items.add(pair[1]);
+        field.files = transfer.files;
+      }}
+      form.appendChild(field);
+    }}
+    (document.body || document.documentElement).appendChild(form);
+    nativeSubmit.call(form);
+    form.remove();
+  }}
+  if (window.navigation && typeof window.navigation.addEventListener === "function") {{
+    window.navigation.addEventListener("navigate", function (event) {{
+      if (event.downloadRequest || event.hashChange) return;
+      var destination = new URL(event.destination.url);
+      var source = event.sourceElement;
+      var form = source && (source.form || (source.tagName === "FORM" ? source : null));
+      var target = realUrl(destination.href);
+      var rebuildGet = false;
+      if (form && !event.formData) {{
+        var action = new URL(source.getAttribute("formaction") || form.action || window.location.href, pageUrl || window.location.href);
+        if (isPanelUrl(action)) {{
+          // GET submissions replace the action query, including the proxy's id.
+          target = realUrl(action.href);
+          target.search = destination.search;
+          target.hash = destination.hash;
+          rebuildGet = true;
+        }}
+      }}
+      if (event.destination.sameDocument && !rebuildGet) return;
+      if (isPanelUrl(destination) && !rebuildGet) {{
+        startNavigation(event);
+        return;
+      }}
+      if (!/^https?:$/.test(target.protocol)) return;
+      if (!event.cancelable) {{
+        startNavigation(event);
+        return;
+      }}
+      event.preventDefault();
+      try {{
+        if (!event.formData && pageUrl) {{
+          var current = new URL(pageUrl);
+          if (current.origin === target.origin && current.pathname === target.pathname && current.search === target.search && current.hash !== target.hash) {{
+            updatePageUrl(target);
+            window.location.hash = target.hash;
+            return;
+          }}
+        }}
+        if (event.formData) submitToProxy(event, target);
+        else if (event.navigationType === "replace") window.location.replace(proxyUrl(target));
+        else window.location.assign(proxyUrl(target));
+      }} catch (error) {{
+        navigating = false;
+        postToHost({{ type: "navigationError", message: "网页跳转失败，请重新加载后重试：" + String(error) }});
+      }}
+    }});
+  }}
+  // Older webviews may not expose cancellable navigation. The host still
+  // invalidates readiness when the frame leaves and verifies the next document.
+  window.addEventListener("beforeunload", function () {{ if (!navigating) startNavigation(); }});
+  ["pushState", "replaceState"].forEach(function (method) {{
+    var native = window.history[method];
+    window.history[method] = function (state, title, url) {{
+      if (arguments.length < 3 || url == null || !/^https?:/.test(pageUrl)) return native.apply(window.history, arguments);
+      var target = realUrl(String(url));
+      if (target.origin !== new URL(pageUrl).origin) throw new DOMException("History URL must stay on the page origin", "SecurityError");
+      var result = native.call(window.history, state, title, proxyUrl(target));
+      updatePageUrl(target);
+      return result;
+    }};
+  }});
+  window.addEventListener("popstate", function () {{
+    var target = realUrl(window.location.href);
+    if (/^https?:$/.test(target.protocol)) updatePageUrl(target);
+  }});
+  window.addEventListener("hashchange", function () {{
+    if (!pageUrl) return;
+    var target = new URL(pageUrl);
+    target.hash = window.location.hash;
+    updatePageUrl(target);
+  }});
+
   // 面板内 console 转发到宿主日志, 便于排查
+  async function bridgeAsync(action, payload, signal) {{
+    var response = await nativeFetch(bridgeBase, {{
+      method: "POST", headers: {{ "Content-Type": "text/plain;charset=UTF-8" }},
+      body: JSON.stringify({{ action: action, payload: payload || {{}} }}), signal: signal
+    }});
+    if (!response.ok) throw new Error("bridge HTTP " + response.status);
+    var result = await response.json();
+    if (!result.ok) throw new Error(result.error || "书源操作失败");
+    return result.value;
+  }}
+
+  // Inline settings pages use the source's native requests for CORS and cookies.
+  window.fetch = async function (input, init) {{
+    var rawUrl = input instanceof Request ? input.url : String(input);
+    var url = new URL(rawUrl, pageUrl || window.location.href);
+    if (!/^https?:$/.test(url.protocol) || url.origin === window.location.origin) return nativeFetch(input, init);
+    var request = new Request(url.href, input instanceof Request ? input : init);
+    if (input instanceof Request && init) request = new Request(request, init);
+    if (input instanceof Request || init && (init.body instanceof FormData || init.body instanceof Blob || init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body))) {{
+      // Preserve multipart boundaries and binary bodies through the raw proxy;
+      // relative form submissions must resolve against the upstream page.
+      var sameOrigin = pageUrl && url.origin === new URL(pageUrl).origin;
+      return nativeFetch(sameOrigin ? new Request(proxyUrl(url), request) : request);
+    }}
+    var headers = {{}};
+    request.headers.forEach(function (value, name) {{ headers[name] = value; }});
+    var body = /^(GET|HEAD)$/i.test(request.method) ? "" : await request.text();
+    var response = await bridgeAsync("fetch", {{ url: url.href, method: request.method, headers: headers, body: body }}, request.signal);
+    if (!response.code) throw new Error(response.error || "网络请求失败");
+    var responseHeaders = new Headers(response.headers || {{}});
+    ["set-cookie", "content-encoding", "content-length"].forEach(function (name) {{ responseHeaders.delete(name); }});
+    return new Response([204, 205, 304].includes(response.code) || request.method === "HEAD" ? null : response.body, {{ status: response.code, headers: responseHeaders }});
+  }};
+
   var rawLog = console.log.bind(console);
   console.log = function () {{
     var parts = Array.prototype.slice.call(arguments).map(function (v) {{
@@ -942,8 +1301,13 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
       return r.ok ? r.value : "";
     }},
     log: function (m) {{ bridgeSync("log", {{ message: String(m) }}); return m; }},
-    toast: function (m) {{ bridgeSync("toast", {{ message: String(m) }}); }},
-    longToast: function (m) {{ bridgeSync("toast", {{ message: String(m) }}); }},
+    toast: function (m) {{ postToHost({{ type: "toast", message: String(m) }}); }},
+    longToast: function (m) {{ postToHost({{ type: "toast", message: String(m) }}); }},
+    upConfig: function (config) {{
+      try {{ postToHost({{ type: "config", options: typeof config === "string" ? JSON.parse(config) : config }}); }} catch (e) {{}}
+    }},
+    upLoginData: function (values) {{ postToHost({{ type: "loginData", values: values }}); }},
+    reLoginView: function () {{ postToHost({{ type: "refreshLogin" }}); }},
     getCache: function (k) {{
       var r = bridgeSync("cacheGet", {{ key: String(k) }});
       return r.ok ? (r.value === undefined ? null : r.value) : null;
@@ -1000,13 +1364,33 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
     base64Encode: function (v) {{ var r = bridgeSync("digest", {{ kind: "base64", input: String(v) }}); return r.ok ? String(r.value) : ""; }},
     base64Decode: function (v) {{ var r = bridgeSync("digest", {{ kind: "unbase64", input: String(v) }}); return r.ok ? String(r.value) : ""; }},
     // 面板内再次弹层: 后端登记为新面板, 由桥通知宿主切换
-    showBrowser: function (url, html) {{
-      var r = bridgeSync("showBrowser", {{ url: String(url), html: html == null ? "" : String(html) }});
+    showBrowser: function (url, html, preloadJs, options) {{
+      var r = bridgeSync("showBrowser", {{ url: String(url), html: html == null ? null : String(html), preloadJs: preloadJs == null ? null : String(preloadJs), options: options }});
       if (r.ok && r.value) {{
-        postToHost({{ type: "showBrowser", panelId: String(r.value), url: String(url) }});
+        postToHost({{ type: "showBrowser", request: r.value }});
       }}
       return r.ok;
     }}
+  }};
+
+  function sourceGet(key) {{ var r = bridgeSync("sourceGet", {{ key: key }}); return r.ok ? r.value : null; }}
+  function sourceSet(key, value) {{ return bridgeSync("sourceSet", {{ key: key, value: value == null ? null : String(value) }}).ok; }}
+  function sourceMap(key) {{ try {{ return JSON.parse(sourceGet(key) || "{{}}"); }} catch (e) {{ return {{}}; }} }}
+  window.source = {{
+    getKey: function () {{ return window.__readerSourceKey || ""; }},
+    getVariable: function () {{ return sourceGet("variable") || ""; }},
+    setVariable: function (v) {{ return sourceSet("variable", v); }},
+    putVariable: function (v) {{ return sourceSet("variable", v); }},
+    getLoginInfo: function () {{ return sourceGet("loginInfo"); }},
+    getLoginInfoMap: function () {{ return sourceMap("loginInfo"); }},
+    putLoginInfo: function (v) {{ return sourceSet("loginInfo", v); }},
+    removeLoginInfo: function () {{ return sourceSet("loginInfo", null); }},
+    getLoginHeader: function () {{ return sourceGet("loginHeader"); }},
+    getLoginHeaderMap: function () {{ return sourceMap("loginHeader"); }},
+    putLoginHeader: function (v) {{ return sourceSet("loginHeader", typeof v === "string" ? v : JSON.stringify(v)); }},
+    removeLoginHeader: function () {{ return sourceSet("loginHeader", null); }},
+    get: function (k) {{ return window.java.getCache(k) || ""; }},
+    put: function (k, v) {{ return window.java.putCache(k, v); }}
   }};
 
   window.cache = {{
@@ -1027,21 +1411,58 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
   }};
 
   // window.run(script): 在宿主书源 jsLib 作用域里执行脚本, 返回 Promise
-  window.run = function (script) {{
-    return new Promise(function (resolve, reject) {{
-      var r = bridgeSync("run", {{ script: String(script) }});
-      if (r.ok) resolve(r.value);
-      else reject(new Error(r.error || "run failed"));
-    }});
+  window.run = async function (script) {{
+    var value = await bridgeAsync("run", {{ script: String(script) }});
+    if (value.showBrowser) postToHost({{ type: "showBrowser", request: value.showBrowser }});
+    var effects = value.loginEffects || {{}};
+    if (effects.reset) postToHost({{ type: "loginData", values: null }});
+    if (effects.values && Object.keys(effects.values).length) postToHost({{ type: "loginData", values: effects.values }});
+    if (effects.refresh) postToHost({{ type: "refreshLogin" }});
+    (value.logs || []).forEach(function (line) {{ if (line.startsWith("[toast]")) postToHost({{ type: "toast", message: line.slice(7).trim() }}); }});
+    return value.result;
   }};
+
+  window.java.run = window.run;
+  window.ajaxAwait = function (url) {{ return bridgeAsync("ajax", {{ spec: String(url) }}); }};
+
+  function snapshotDocument() {{
+    var copy = document.documentElement.cloneNode(true);
+    var live = document.querySelectorAll("input,textarea,select");
+    var cloned = copy.querySelectorAll("input,textarea,select");
+    live.forEach(function (field, index) {{
+      var target = cloned[index];
+      if (field.tagName === "TEXTAREA") target.textContent = field.value;
+      else if (field.tagName === "SELECT") Array.from(target.options).forEach(function (option, i) {{ option.toggleAttribute("selected", field.options[i].selected); }});
+      else {{ target.setAttribute("value", field.value); target.toggleAttribute("checked", field.checked); }}
+    }});
+    return "<!DOCTYPE html>" + copy.outerHTML;
+  }}
+window.addEventListener("message", function (event) {{
+    if (event.source !== window.parent || !event.data || event.data.panelId !== panelId) return;
+    if (event.data.type === "reader:ready") {{
+      if (!navigating) ready(event.data.requestId);
+      return;
+    }}
+    if (event.data.type !== "reader:confirm" || event.data.documentId !== documentId) return;
+    var requestId = event.data.requestId;
+    if (navigating) {{
+      postToHost({{ type: "error", requestId: requestId, message: "网页正在跳转，请加载完成后再确认" }});
+      return;
+    }}
+    var r;
+    try {{ r = bridgeSync("complete", {{ url: pageUrl, body: snapshotDocument() }}); }}
+    catch (error) {{ r = {{ ok: false, error: String(error) }}; }}
+    postToHost(r.ok ? {{ type: "complete", requestId: requestId }} : {{ type: "error", requestId: requestId, message: r.error }});
+  }});
+  function ready(requestId) {{ postToHost({{ type: "ready", requestId: requestId, title: document.title, url: pageUrl }}); }}
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () {{ ready(); }}, {{ once: true }});
+  else ready();
 
   // 插件用 window.close() 关闭面板。
   // iframe 内 window.close() 通常无效(浏览器只允许关脚本自开的窗口),
   // 因此先通知宿主关掉弹层, 再尝试原生 close。
-  var hostClose = window.close.bind(window);
   window.close = function () {{
     postToHost({{ type: "close" }});
-    try {{ hostClose(); }} catch (e) {{}}
   }};
 }})();
 </script>"#
@@ -1172,6 +1593,117 @@ fn registrable_domain_from_host(host: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "reads an explicitly supplied source export and its public registration page"]
+    async fn live_source_registration_page() {
+        let path = std::env::var("READER_REGISTRATION_SOURCE_FILE").expect("source JSON path");
+        let value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let source = crate::model::book_source::book_source_from_value(value).unwrap();
+        let target = std::env::var("READER_REGISTRATION_URL").expect("public registration URL");
+        let http = crate::crawler::http_client::HttpClient::new(20, None).unwrap();
+        let context = http.source_context("registration-smoke", &source.book_source_url, None).unwrap();
+        let entry = crate::service::book_service::SourcePanelEntry {
+            url: target.clone(), book_source_url: source.book_source_url.clone(), http: Some(context), ..Default::default()
+        };
+        let response = fetch_source_panel_response(&source, "fixture-settings", &entry, &target, &http::Request::new(Vec::new())).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let html = String::from_utf8(response.into_body()).unwrap();
+        assert!(html.contains("reg-email"));
+        assert!(html.contains("window.java ="));
+        std::fs::create_dir_all("target/source-panel-fixtures").unwrap();
+        std::fs::write("target/source-panel-fixtures/registration.html", html).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panel_pages_and_form_posts_evaluate_dynamic_source_headers() {
+        use axum::{body::Bytes, http::HeaderMap, routing::get, Router};
+        use crate::crawler::http_client::HttpClient;
+        use crate::service::book_service::SourcePanelEntry;
+
+        let app = Router::new().route("/register", get(|headers: HeaderMap| async move {
+            assert_eq!(headers.get("user-agent").unwrap(), "Legado/3.0");
+            assert!(headers.get("authorization").is_none());
+            ([("content-type", "text/html")], "<html><head><title>注册</title></head><body><input id=\"reg-email\"><script src=\"/static/auth.js\"></script></body></html>")
+        }).post(|headers: HeaderMap, body: Bytes| async move {
+            assert_eq!(headers.get("authorization").unwrap(), "Bearer fixture-token");
+            assert_eq!(headers.get("content-type").unwrap(), "multipart/form-data; boundary=fixture");
+            assert_eq!(body.as_ref(), b"--fixture\r\nContent-Disposition: form-data; name=\"email\"\r\n\r\nreader@example.test\r\n--fixture--\r\n");
+            ([("content-type", "application/json")], r#"{"code":200}"#)
+        })).route("/static/auth.js", get(|| async { ([("content-type", "text/javascript")], "window.registrationReady = true;") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let source = BookSource {
+            book_source_url: format!("moyue://rapid/{}", uuid::Uuid::new_v4()),
+            header: Some("@js:var v=JSON.parse(source.getVariable()||'{}');JSON.stringify(v.token?{'Authorization':'Bearer '+v.token,'User-Agent':'Legado/3.0'}:{'User-Agent':'Legado/3.0'})".into()),
+            ..Default::default()
+        };
+        let http = HttpClient::new(3, None).unwrap();
+        let context = http.source_context("panel-registration", &source.book_source_url, None).unwrap();
+        let entry = SourcePanelEntry { url: format!("{base}/register"), book_source_url: source.book_source_url.clone(), http: Some(context.clone()), ..Default::default() };
+        let response = fetch_source_panel_response(&source, "registration", &entry, &entry.url, &http::Request::new(Vec::new())).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let html = String::from_utf8(response.into_body()).unwrap();
+        assert!(html.contains("reg-email"));
+        assert!(html.contains("window.java ="));
+        assert!(html.contains("__readerPanelUrl="));
+        let script = fetch_source_panel_response(&source, "registration", &entry, &format!("{base}/static/auth.js"), &http::Request::new(Vec::new())).await.unwrap();
+        assert_eq!(script.body(), b"window.registrationReady = true;");
+        context.session.put("variable", Some(r#"{"token":"fixture-token"}"#)).unwrap();
+        let request = http::Request::builder().method("POST")
+            .header("content-type", "multipart/form-data; boundary=fixture")
+            .body(b"--fixture\r\nContent-Disposition: form-data; name=\"email\"\r\n\r\nreader@example.test\r\n--fixture--\r\n".to_vec()).unwrap();
+        let response = fetch_source_panel_response(&source, "registration", &entry, &entry.url, &request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), br#"{"code":200}"#);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panel_html_exposes_source_jar_cookies_to_page_scripts() {
+        // 光遇等站点的前端用 document.cookie 判断登录态(getCookie('qttoken')),
+        // 面板 HTML 响应需要把书源 jar 的 cookie 以 Set-Cookie 透出给面板 origin。
+        use axum::{http::HeaderMap, routing::get, Router};
+        use crate::crawler::http_client::HttpClient;
+        use crate::service::book_service::SourcePanelEntry;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = seen.clone();
+        let app = Router::new().route("/user", get(move |headers: HeaderMap| async move {
+            *sink.lock().unwrap() = headers.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            ([("content-type", "text/html")], "<html><head><title>用户后台</title></head><body>用户中心</body></html>")
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = BookSource { book_source_url: format!("https://aggregate-{}.test", uuid::Uuid::new_v4()), ..Default::default() };
+        let http = HttpClient::new(3, None).unwrap();
+        let context = http.source_context("panel-cookie", &source.book_source_url, None).unwrap();
+        let url = url::Url::parse(&format!("{base}/user")).unwrap();
+        context.session.cookies.set(&url, "qttoken=localtoken123456789; deviceId=device-fixture").unwrap();
+        let entry = SourcePanelEntry { url: url.to_string(), book_source_url: source.book_source_url.clone(), http: Some(context.clone()), ..Default::default() };
+
+        let response = fetch_source_panel_response(&source, "user", &entry, &entry.url, &http::Request::new(Vec::new())).await.unwrap();
+        assert_eq!(response.status(), 200);
+        // 转发请求带上 jar cookie
+        assert!(seen.lock().unwrap().contains("qttoken=localtoken123456789"), "上游应收到 jar 中的 qttoken");
+        // 面板 origin 的 JS 可读到透出的 cookie（每个 cookie 对一个 Set-Cookie 头）
+        let set_cookies: Vec<&str> = response.headers().get_all("set-cookie").iter()
+            .filter_map(|v| v.to_str().ok()).collect();
+        assert!(set_cookies.iter().any(|c| c.starts_with("qttoken=localtoken123456789;")), "应透出 qttoken: {set_cookies:?}");
+        assert!(set_cookies.iter().any(|c| c.starts_with("deviceId=device-fixture;")), "应透出 deviceId: {set_cookies:?}");
+        // 不依赖 WebView cookie 行为: HTML 内注入 document.cookie 劫持脚本,
+        // jar cookie 以字面量嵌入（页面 getCookie('qttoken') 直接可读）
+        let html = String::from_utf8(response.into_body()).unwrap();
+        assert!(html.contains("jarCookie"), "应注入 jar cookie 变量");
+        assert!(html.contains("qttoken=localtoken123456789"), "jar cookie 应嵌入注入脚本: {}", html.chars().take(200).collect::<String>());
+        assert!(html.contains("deviceId=device-fixture"), "jar cookie 应完整嵌入(含 deviceId)");
+        assert!(html.contains("Object.defineProperty(document, 'cookie'"), "应劫持 document.cookie");
+        assert!(html.matches("<script>").count() >= 2, "注入脚本应在页面 head 中先于页面脚本执行");
+        server.abort();
+    }
+
     #[test]
     fn reader_scheme_origin_matches_platform() {
         let origin = reader_scheme_origin();
@@ -1239,6 +1771,139 @@ mod tests {
         assert_eq!(extract_registrable_domain("http://localhost:8080"), "localhost");
         // 无法解析 → 空串
         assert_eq!(extract_registrable_domain("not a url"), "");
+    }
+
+    #[test]
+    fn login_target_preserves_nested_jump_url_query() {
+        let target = resolve_proxy_target_url(
+            "https://www.deqixss.com/login.php?jumpurl=https://www.deqixss.com/",
+            "https://www.deqixss.com/",
+        )
+        .unwrap();
+        assert_eq!(target, "https://www.deqixss.com/login.php?jumpurl=https://www.deqixss.com/");
+        assert!(proxy_target_matches_source(&target, "https://www.deqixss.com/"));
+    }
+
+    fn proxy_test_service(root: &std::path::Path) -> crate::service::book_service::BookService {
+        crate::service::book_service::BookService::new(
+            crate::crawler::http_client::HttpClient::new(20, None).unwrap(),
+            crate::parser::rule_engine::RuleEngine::new().unwrap(),
+            crate::storage::cache::file_cache::FileCache::new(root.join("cache")),
+            root.to_str().unwrap(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn login_proxy_sends_single_headers_and_preserves_form_and_cookie() {
+        use axum::{body::Bytes, http::{HeaderMap, StatusCode}, routing::get, Router};
+        async fn page(headers: HeaderMap, body: Bytes) -> (StatusCode, HeaderMap, String) {
+            let mut output = HeaderMap::new();
+            for name in ["referer", "user-agent", "accept-language", "origin"] {
+                if headers.get_all(name).iter().count() != 1 {
+                    return (StatusCode::BAD_REQUEST, output, format!("duplicate {name}"));
+                }
+            }
+            if body.is_empty() {
+                output.insert("set-cookie", "login-session=fixture; Path=/".parse().unwrap());
+            }
+            output.insert("content-type", "application/json".parse().unwrap());
+            (StatusCode::OK, output, serde_json::json!({
+                "referer":headers["referer"].to_str().unwrap(),
+                "ua":headers["user-agent"].to_str().unwrap(),
+                "language":headers["accept-language"].to_str().unwrap(),
+                "origin":headers["origin"].to_str().unwrap(),
+                "cookie":headers.get("cookie").and_then(|v|v.to_str().ok()),
+                "contentType":headers.get("content-type").and_then(|v|v.to_str().ok()),
+                "body":String::from_utf8(body.to_vec()).unwrap(),
+            }).to_string())
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/login.php", get(page).post(page))).await.unwrap();
+        });
+        let root = std::env::temp_dir().join(format!("reader-login-headers-{}", uuid::Uuid::new_v4()));
+        let service = proxy_test_service(&root);
+        let mut source = BookSource {
+            book_source_url: base.clone(),
+            header: Some(serde_json::json!({"Referer":format!("{base}/"), "User-Agent":"source-agent", "Accept-Language":"zh-CN"}).to_string()),
+            ..Default::default()
+        };
+        let mut browser = HeaderMap::new();
+        browser.insert("user-agent", "browser-agent".parse().unwrap());
+        browser.insert("accept-language", "en-US".parse().unwrap());
+        browser.insert("referer", "http://tauri.localhost/".parse().unwrap());
+        browser.insert("origin", "http://reader.localhost".parse().unwrap());
+        browser.insert("cookie", "unrelated=browser".parse().unwrap());
+        let target = format!("{base}/login.php?jumpurl={}", urlencoding::encode(&format!("{base}/")));
+        let first = forward_book_source_request(&service, &source, "fixture", &http::Method::GET, &browser, &target, None, &[]).await.unwrap();
+        assert_eq!(first.status(), 200);
+        let first: serde_json::Value = serde_json::from_slice(first.body()).unwrap();
+        assert_eq!(first["referer"], format!("{base}/"));
+        assert_eq!(first["ua"], "source-agent");
+        assert_eq!(first["language"], "zh-CN");
+        assert_eq!(first["origin"], base);
+        assert!(first["cookie"].is_null());
+        let mut headers: serde_json::Value = serde_json::from_str(source.header.as_ref().unwrap()).unwrap();
+        headers["Content-Type"] = serde_json::json!("application/json");
+        source.header = Some(headers.to_string());
+        browser.insert("content-type", "application/x-www-form-urlencoded; charset=UTF-8".parse().unwrap());
+        let body = b"username=fixture&password=local-test&act=login&usecookie=1";
+        let second = forward_book_source_request(&service, &source, "fixture", &http::Method::POST, &browser, &target, Some(&target), body).await.unwrap();
+        assert_eq!(second.status(), 200);
+        let second: serde_json::Value = serde_json::from_slice(second.body()).unwrap();
+        assert_eq!(second["referer"], format!("{base}/"));
+        assert_eq!(second["contentType"], "application/x-www-form-urlencoded; charset=UTF-8");
+        assert_eq!(second["body"], serde_json::Value::String(String::from_utf8_lossy(body).into_owned()));
+        assert_eq!(second["cookie"], "login-session=fixture");
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "reads the supplied source and fetches its public login page using the production proxy"]
+    async fn live_login_proxy_page() {
+        let path = std::env::var("READER_LOGIN_SOURCE_FILE").expect("source JSON path");
+        let value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let source = crate::model::book_source::book_source_from_value(value).unwrap();
+        let root = std::env::temp_dir().join(format!("reader-live-login-{}", uuid::Uuid::new_v4()));
+        let service = proxy_test_service(&root);
+        let view = service.login_book_source(&source).await.unwrap();
+        let target = view["url"].as_str().unwrap();
+        let browser = http::HeaderMap::from_iter([
+            (http::header::USER_AGENT, http::HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0")),
+            (http::header::ACCEPT_LANGUAGE, http::HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8")),
+            (http::header::REFERER, http::HeaderValue::from_static("http://tauri.localhost/")),
+            (http::HeaderName::from_static("sec-fetch-site"), http::HeaderValue::from_static("cross-site")),
+            (http::HeaderName::from_static("sec-fetch-mode"), http::HeaderValue::from_static("navigate")),
+            (http::HeaderName::from_static("sec-fetch-dest"), http::HeaderValue::from_static("iframe")),
+        ]);
+        let response = forward_book_source_request(&service, &source, "fixture-session", &http::Method::GET, &browser, target, None, &[]).await.unwrap();
+        let status = response.status();
+        let html = String::from_utf8(response.into_body()).unwrap();
+        assert_eq!(status, 200, "{html}");
+        assert!(html.contains("name=\"username\""), "login form must be present");
+        assert!(html.contains("name=\"password\""));
+        let output = std::path::PathBuf::from("target/login-proxy-fixtures");
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("login.html"), &html).unwrap();
+        let mut fixtures = vec![serde_json::json!({"url":target,"status":status.as_u16(),"file":"login.html","contentType":"text/html; charset=utf-8"})];
+        let resources: Vec<String> = scraper::Html::parse_document(&html)
+            .select(&scraper::Selector::parse("script[src],link[rel=stylesheet][href]").unwrap())
+            .filter_map(|element| element.value().attr("src").or_else(|| element.value().attr("href")))
+            .filter(|url| url.starts_with("/bookSourceProxy?"))
+            .filter_map(|url| Url::parse(&format!("http://reader.localhost{url}")).ok())
+            .filter_map(|url| url.query_pairs().find(|(name,_)|name=="url").map(|(_,value)|value.into_owned()))
+            .collect();
+        for (index, url) in resources.iter().enumerate() {
+            let response = forward_book_source_request(&service, &source, "fixture-session", &http::Method::GET, &browser, url, Some(target), &[]).await.unwrap();
+            assert_eq!(response.status(), 200, "resource {url}");
+            let file = format!("resource-{index}");
+            let content_type = response.headers().get(http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+            std::fs::write(output.join(&file), response.body()).unwrap();
+            fixtures.push(serde_json::json!({"url":url,"status":200,"file":file,"contentType":content_type}));
+        }
+        std::fs::write(output.join("report.json"), serde_json::to_vec_pretty(&serde_json::json!({"sourceName":source.book_source_name,"sourceUrl":source.book_source_url,"view":view,"responses":fixtures})).unwrap()).unwrap();
+        eprintln!("production login proxy: HTTP 200, form present, {} same-site resources fetched", resources.len());
     }
 
     #[test]
@@ -1415,6 +2080,7 @@ mod tests {
                 chapter_url: "https://source.example/book/1/1".to_string(),
                 book_json: "{}".to_string(),
                 chapter_json: "{}".to_string(),
+                ..Default::default()
             },
         );
 
@@ -1443,6 +2109,7 @@ mod tests {
             chapter_url: String::new(),
             book_json: "{}".to_string(),
             chapter_json: "{}".to_string(),
+            ..Default::default()
         };
 
         // 登记超过上限, 最旧的应被淘汰, 最新的应仍在

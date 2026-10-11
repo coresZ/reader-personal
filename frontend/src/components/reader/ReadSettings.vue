@@ -282,7 +282,7 @@
         </div>
       </div>
 
-      <!-- 页面宽度 -->
+      <!-- 页面宽度：左右分页时正文的行宽（窗口更宽时正文居中、两侧留白） -->
       <div class="setting-row">
         <label>页面宽度</label>
         <div class="stepper">

@@ -78,20 +78,6 @@ fn legado_to_css(selector: &str) -> String {
         return selector.to_string();
     }
 
-    // Default: treat as class if it doesn't look like a tag
-    if selector
-        .chars()
-        .next()
-        .map(|c| c.is_alphabetic())
-        .unwrap_or(false)
-    {
-        let parts: Vec<&str> = selector.split_whitespace().collect();
-        if parts.len() > 1 {
-            return format!(".{}", parts.join("."));
-        }
-        return selector.to_string();
-    }
-
     selector.to_string()
 }
 
@@ -240,61 +226,27 @@ fn collect_matches_from_element<'a>(
 }
 
 fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
-    let sel = match Selector::parse(css_selector) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
+    let Some(sel) = parse_css_selector(css_selector) else { return vec![] };
     doc.select(&sel).collect()
 }
 
 fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<ElementRef<'a>> {
-    let sel = match Selector::parse(css_selector) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
+    let Some(sel) = parse_css_selector(css_selector) else { return vec![] };
     el.select(&sel).collect()
+}
+
+fn parse_css_selector(selector: &str) -> Option<Selector> {
+    if let Ok(parsed) = Selector::parse(selector) { return Some(parsed); }
+    // Jsoup accepts values such as [property=og:novel:book_name] without
+    // quotes. Quote these values before handing the selector to scraper.
+    static ATTR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = ATTR.get_or_init(|| regex::Regex::new(r#"(\[[^\]\s=~|^$*]+[~|^$*]?=)([^"'\]\s]+)(\])"#).unwrap());
+    let normalized = re.replace_all(selector, "${1}\"${2}\"${3}");
+    Selector::parse(&normalized).ok()
 }
 
 fn child_elements<'a>(el: ElementRef<'a>) -> Vec<ElementRef<'a>> {
     el.children().filter_map(ElementRef::wrap).collect()
-}
-
-/// Descendant elements of `el` whose tag name equals `tag` (case-insensitive).
-/// `id.list@tag.li` means "all `li` under `#list`", which may be nested inside
-/// a `ul` — so we match descendants, not just direct children.
-///
-/// An index spec on the tag (e.g. `@tag.tr!0`, `@tag.li[2:]`) is honored:
-/// `!0` excludes the first row, `[0]`/`[1:3]` select a range — same semantics
-/// as a base selector's index.
-fn child_elements_by_tag<'a>(el: ElementRef<'a>, tag: &str) -> Vec<ElementRef<'a>> {
-    let (base_tag, index_mode, index_items) =
-        if let Some((base, index_mode, index_items)) = parse_bracket_index_spec(tag) {
-            (base, index_mode, index_items)
-        } else if let Some((base, index_mode, index_items)) = parse_legacy_index_spec(tag) {
-            (base, index_mode, index_items)
-        } else {
-            (tag, IndexMode::Select, Vec::new())
-        };
-
-    let base_tag = base_tag.trim();
-    let mut matches: Vec<ElementRef<'a>> = if let Ok(sel) = Selector::parse(base_tag) {
-        el.select(&sel).collect()
-    } else {
-        el.children()
-            .filter_map(ElementRef::wrap)
-            .filter(|child| child.value().name().eq_ignore_ascii_case(base_tag))
-            .collect()
-    };
-
-    if !index_items.is_empty() {
-        matches = apply_indices(matches, &ParsedSelector {
-            base: parse_selector_base(base_tag),
-            explicit_index: true,
-            index_mode,
-            index_items,
-        });
-    }
-    matches
 }
 
 fn select_by_text_doc<'a>(doc: &'a Html, needle: &str) -> Vec<ElementRef<'a>> {
@@ -446,33 +398,18 @@ fn expand_range(len: usize, start: Option<i32>, end: Option<i32>, step: i32) -> 
 /// Select elements with Legado rule syntax
 pub fn select_list<'a>(doc: &'a Html, selector: &str) -> Vec<ElementRef<'a>> {
     let selector = selector.trim();
-
-    // Split by @ first to get the base selector (handle @@ separately in text extraction)
-    let sel_text = selector.split("@@").next().unwrap_or(selector).trim();
-    let split = split_top_level(sel_text, &["@"]);
-    let parts: Vec<&str> = split.parts.iter().map(|s| s.trim()).collect();
-    let sel_text = parts.first().copied().unwrap_or(sel_text).trim();
-
-    // Handle list combination operators at the top level
-    if sel_text.contains("&&") || sel_text.contains("||") || sel_text.contains("%%") {
-        return select_with_combination(doc, sel_text);
+    if split_top_level(selector, &["&&", "||", "%%"]).delimiter.is_some() {
+        return select_with_combination(doc, selector);
     }
-
-    let base_matches = collect_matches(doc, &parse_selector_with_index(sel_text));
-
-    // `@tag.xxx` suffix: expand each matched element's `xxx` child elements.
-    // e.g. `id.list@tag.li` → select `#list`, then all its `li` children.
-    if let Some(tag) = parts.get(1).and_then(|p| p.strip_prefix("tag.")) {
-        if !tag.is_empty() {
-            let mut out = Vec::new();
-            for el in base_matches {
-                out.extend(child_elements_by_tag(el, tag));
-            }
-            return out;
-        }
+    let parts = split_top_level(selector, &["@"]).parts;
+    let Some(first) = parts.first() else { return vec![] };
+    let mut matches = collect_matches(doc, &parse_selector_with_index(first));
+    for part in parts.iter().skip(1) {
+        let parsed = parse_selector_with_index(part);
+        matches = matches.into_iter()
+            .flat_map(|el| collect_matches_from_element(el, &parsed)).collect();
     }
-
-    base_matches
+    matches
 }
 
 /// Handle list combination operators
@@ -484,11 +421,11 @@ fn select_with_combination<'a>(doc: &'a Html, rule: &str) -> Vec<ElementRef<'a>>
         return vec![];
     }
 
-    let mut result = select_list_simple(doc, &rules[0]);
+    let mut result = select_list(doc, &rules[0]);
     let operator = split.delimiter.as_deref().unwrap_or("");
 
     for next_rule in rules.iter().skip(1) {
-        let next_results = select_list_simple(doc, next_rule);
+        let next_results = select_list(doc, next_rule);
 
         match operator {
             "&&" => {
@@ -517,11 +454,6 @@ fn select_with_combination<'a>(doc: &'a Html, rule: &str) -> Vec<ElementRef<'a>>
     }
 
     result
-}
-
-/// Simple select without combination operators
-fn select_list_simple<'a>(doc: &'a Html, selector: &str) -> Vec<ElementRef<'a>> {
-    collect_matches(doc, &parse_selector_with_index(selector))
 }
 
 /// Extract text from element with various Legado extractors
@@ -796,25 +728,13 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
         return vec![];
     }
 
-    let first_part = parts[0].trim();
-
-    let matches = collect_matches(doc, &parse_selector_with_index(first_part));
-    if matches.is_empty() {
-        return vec![];
-    }
-
-    let mut results = Vec::new();
-    for el in matches {
-        if parts.len() > 1 {
-            let rest = parts[1..].join("@");
-            if let Some(v) = select_text_from_element(&el, &rest) {
-                results.push(v);
-            }
-        } else {
-            results.push(extract_text(&el, "text").unwrap_or_default());
-        }
-    }
-    results
+    let (selector, extractor) = if parts.len() > 1 {
+        (parts[..parts.len()-1].join("@"), parts.last().unwrap().as_str())
+    } else {
+        (parts[0].clone(), "text")
+    };
+    select_list(doc, &selector).into_iter()
+        .filter_map(|el| extract_text(&el, extractor)).collect()
 }
 
 /// XPath support using sxd-xpath

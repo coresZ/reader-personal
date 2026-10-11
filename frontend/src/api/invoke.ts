@@ -11,7 +11,7 @@ import type { ApiResponse } from '../types'
 
 const COMMAND_BY_PATH: Record<string, string> = {
   '/reader3/getBookSources': 'get_book_sources',
-  '/reader3/loginBookSource': 'login_book_source',
+  // Source login uses an IPC channel for interactive pages; see api/source.ts.
   '/reader3/setBookSourceCookie': 'set_book_source_cookie',
   '/reader3/testBookSources': 'test_book_sources',
   '/reader3/cancelBookSourceTest': 'cancel_book_source_test',

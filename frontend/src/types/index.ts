@@ -6,6 +6,11 @@ export interface ApiResponse<T = unknown> {
 }
 
 // ─── 书籍 ───
+export interface BookReadConfig {
+  useReplaceRule?: boolean | null
+  [key: string]: unknown
+}
+
 export interface Book {
   name: string
   author: string
@@ -15,6 +20,7 @@ export interface Book {
   coverUrl?: string
   tocUrl?: string
   charset?: string
+  readConfig?: BookReadConfig | null
   customCoverUrl?: string
   /** 首次自定义之前的原始值, 供「还原」回退。
    *  后端是 Rust `Option<String>`, 未记录时经 JSON 往返为 `null`(key 存在)。 */
@@ -87,6 +93,8 @@ export interface BookSource {
   exploreUrl?: string
   header?: string
   loginUrl?: string
+  loginUi?: string
+  jsLib?: string
   loginCheckJs?: string
   loadWithBaseUrl?: boolean
   singleUrl?: boolean

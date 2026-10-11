@@ -141,6 +141,7 @@
       :class="{ 'horizontal-page-mode': isHorizontalPageMode }"
       ref="scrollContainerRef"
       @scroll="handleScroll"
+      @load.capture="handleReaderImageLoad"
       @mousedown="handleManualReadingInput"
       @wheel="handleManualReadingInput"
       @touchstart="handleTouchStart"
@@ -169,6 +170,7 @@
           '--reader-page-width': config.pageWidth + 'px',
           '--reader-side-padding': '24px',
           '--reader-page-step': horizontalPageStepStyle,
+          '--reader-text-width': horizontalTextWidth + 'px',
         }"
       >
         <!-- 章节加载阶段：段评解析可能耗时数秒。做成浮层，三种阅读模式都能看到。 -->
@@ -328,28 +330,7 @@
       :book="bookInfoBook"
     />
 
-    <!-- 书源面板: java.showBrowser(url, html) 弹出的底部弹层(legado BottomWebViewDialog) -->
-    <Transition name="fade">
-      <div v-if="sourceBrowser?.visible" class="source-browser-mask" @click.self="closeSourceBrowserPanel">
-        <div class="source-browser-panel" :style="{ background: chromeTheme.popup, color: chromeTheme.fontColor }">
-          <div class="source-browser-head">
-            <span class="source-browser-title">{{ sourceBrowser.url || '书源面板' }}</span>
-            <button class="source-browser-close" @click="closeSourceBrowserPanel">关闭</button>
-          </div>
-          <!--
-            面板托管在 reader.localhost, 与应用(tauri.localhost)跨源 —— 面板脚本
-            因此碰不到本应用的 DOM 与 Tauri IPC。
-            保留 allow-same-origin 是必需的: 插件用 localStorage 缓存书籍信息,
-            opaque origin 下会抛 SecurityError。桥请求靠 CORS 而非同源放行。
-          -->
-          <iframe
-            class="source-browser-frame"
-            :src="sourceBrowser.src"
-            sandbox="allow-scripts allow-forms allow-popups allow-modals allow-same-origin"
-          ></iframe>
-        </div>
-      </div>
-    </Transition>
+    <SourceBrowserPanel :request="sourceBrowser" :background="chromeTheme.popup" :color="chromeTheme.fontColor" @close="sourceBrowser = null" @toast="(message: string) => appStore.showToast(message)" />
   </div>
 </template>
 
@@ -372,6 +353,7 @@ import {
 import { shouldPreferServerReadingPosition, type ReadingPositionSnapshot } from '../utils/readingPosition'
 import { isLocalBook } from '../utils/localBook'
 import { processSourceImageOptions } from '../utils/sourceImageOptions'
+import { repairSourceImageHtml } from '../utils/sourceImageHtml'
 import { handleReaderFontSizeWheel } from '../utils/readerFontSize'
 import { createReaderProgressAutoSaveScheduler, createReaderProgressExitSaver } from '../utils/readerProgressAutoSave'
 import {
@@ -380,6 +362,7 @@ import {
   cancelPageScrollAnimation,
   getReaderPageStep,
 } from '../utils/readerPaging'
+import { clampReaderPageIndex, readerPageIndexFromProgress } from '../utils/readerPageIndex'
 import { splitBrParagraphs } from '../utils/readerParagraph'
 import { resolveReaderBackground } from '../utils/readerColor'
 import {
@@ -397,6 +380,7 @@ import {
 import type { Book } from '../types'
 
 import ReaderMobileControls from '../components/reader/ReaderMobileControls.vue'
+import SourceBrowserPanel from '../components/SourceBrowserPanel.vue'
 import { useReaderSearch } from '../composables/useReaderSearch'
 import { useReaderSelection } from '../composables/useReaderSelection'
 import { useHorizontalPaging } from '../composables/useHorizontalPaging'
@@ -541,7 +525,7 @@ function scheduleHoverHide() {
 
 /** 搜索/朗读/书详情/书源面板等浮层打开时不自动展开。 */
 function readerOverlayOpen() {
-  return showSearch.value || showTTSPanel.value || showBookInfo.value || !!sourceBrowser.value?.visible
+  return showSearch.value || showTTSPanel.value || showBookInfo.value || !!sourceBrowser.value
 }
 
 function handleReaderPointerMove(event: PointerEvent) {
@@ -628,54 +612,19 @@ watch(() => store.activePanel, (open) => {
 
 let speechTimerTicker: number | null = null
 let readerViewUnmounted = false
+/** 挂载流程是否已跑完。resize 的重新分页要等它结束: 挂载自己会重建一次分页,
+ *  提前触发会和它撞在一起(见 checkMedia 的注释)。 */
+let mounted = false
 let suppressNextTapUntil = 0
 const readerContextMenu = ref({ visible: false, top: 0, left: 0, text: '' })
-// `java.showBrowser` 面板(legado 的 BottomWebViewDialog): 底部弹层 + iframe。
-//
-// 面板 HTML 由后端托管在 `reader.localhost`(与应用 `tauri.localhost` 天然跨源),
-// 这样面板内的同步桥(`window.java`/`cache`/`run`)能走同源 HTTP 回调宿主,
-// 而跨源隔离又保证面板脚本碰不到本应用的 DOM / Tauri IPC。
-const sourceBrowser = ref<{ visible: boolean; url: string; src: string } | null>(null)
+const sourceBrowser = ref<ShowBrowserRequest | null>(null)
 
 function openSourceBrowserPanel(request: ShowBrowserRequest) {
   if (!request.panelId) {
     console.warn('[source-click] showBrowser 缺少 panelId')
     return
   }
-  sourceBrowser.value = {
-    visible: true,
-    url: request.url || '',
-    src: `${readerOrigin}/sourcePanel?panelId=${encodeURIComponent(request.panelId)}`,
-  }
-}
-
-function closeSourceBrowserPanel() {
-  sourceBrowser.value = null
-}
-
-/**
- * 面板通过 `postMessage` 请求宿主关闭自己或换成另一个面板
- * (`window.close()` 在 iframe 内无效, 嵌套 `java.showBrowser` 也走这里)。
- */
-function handleSourcePanelMessage(event: MessageEvent) {
-  const current = sourceBrowser.value
-  if (!current?.visible) return
-  // 只接受来自面板 iframe 的消息
-  if (event.origin !== readerOrigin) return
-  const data = event.data as { type?: string; panelId?: string; url?: string } | null
-  if (!data || typeof data !== 'object') return
-
-  if (data.type === 'close') {
-    // 只处理当前面板自己的关闭请求
-    if (typeof data.panelId === 'string' && !current.src.includes(encodeURIComponent(data.panelId))) {
-      return
-    }
-    closeSourceBrowserPanel()
-    return
-  }
-  if (data.type === 'showBrowser' && data.panelId) {
-    openSourceBrowserPanel({ url: data.url || '', panelId: data.panelId })
-  }
+  sourceBrowser.value = request
 }
 let restorePositionTimer: number | null = null
 let persistPositionTimer: number | null = null
@@ -831,14 +780,59 @@ function scheduleRefreshOfflineCacheState() {
   }, 120)
 }
 
+/** resize 后的重新分页要防抖: 拖拽窗口会连续触发 resize, 每次重建都是重量级
+ *  (逐段二分测量)。不防抖会有多个重建并发, 先完成的那个可能读到后一次写入的
+ *  pages, 却拿自己那份已过期的 progress 去映射索引, 结果是位置不准 + 抖动。 */
+let horizontalRebuildTimer: number | null = null
+const loadedReaderImageSizes = new Map<string, string>()
+
 function checkMedia() {
   isMobile.value = window.innerWidth <= 768
-  window.setTimeout(() => {
-    updateHorizontalMetrics()
-    if (isHorizontalPageMode.value) {
-      rebuildHorizontalPages()
-    }
-  }, 0)
+  // 挂载流程自己会重建(见 onMounted 的 rebuildHorizontalPages), 这里若也排一次
+  // 重建就会双重重建 —— 而且后一次的 progress 是拿前一次刚写好的索引算的, 等于
+  // 白白多做一轮重量级测量, 还可能把位置恢复的结果覆盖掉。
+  if (!mounted) return
+  scheduleHorizontalRebuild()
+}
+
+function scheduleHorizontalRebuild() {
+  if (horizontalRebuildTimer) clearTimeout(horizontalRebuildTimer)
+  horizontalRebuildTimer = window.setTimeout(() => {
+    horizontalRebuildTimer = null
+    if (!isHorizontalPageMode.value) return
+    // 这里**不**提前调 updateHorizontalMetrics(): 它会立刻改写 --reader-page-step,
+    // 而 horizontalPages 还是按旧尺寸分的页, 重建完成前的那一两帧会错位闪烁。
+    // rebuildHorizontalPages 内部本来就会重算 metrics。
+    //
+    // 窗口尺寸变化会改变行宽与每页容量, 页边界必须重算 —— 沿用旧分页会出现半页
+    // 错位。与排版参数变化一致: 按**阅读进度比例**映射位置, 而不是跳回章首。
+    const previousMax = Math.max(0, horizontalPages.value.length - 1)
+    const progress = previousMax > 0 ? horizontalPageIndex.value / previousMax : 0
+    void rebuildHorizontalPages().then(() => {
+      if (!isHorizontalPageMode.value) return
+      if (pendingLegadoPageRestore.value) return
+      horizontalPageIndex.value = readerPageIndexFromProgress(
+        progress,
+        horizontalPages.value.length,
+      )
+      syncHorizontalPageState()
+    })
+  }, 150)
+}
+
+function queueLoadedImagePagination(image: unknown) {
+  if (!mounted || !isHorizontalPageMode.value || !(image instanceof HTMLImageElement) || !image.naturalWidth) return
+  const src = image.currentSrc || image.src
+  const size = `${image.naturalWidth}x${image.naturalHeight}`
+  if (loadedReaderImageSizes.get(src) === size) return
+  // New page DOM fires load again even when its image is cached. Rebuild only
+  // once per intrinsic size in this chapter, after the browser knows its width.
+  loadedReaderImageSizes.set(src, size)
+  scheduleHorizontalRebuild()
+}
+
+function handleReaderImageLoad(event: Event) {
+  queueLoadedImagePagination(event.target)
 }
 
 function handleViewportChange() {
@@ -894,7 +888,7 @@ function formatChapterHtml(rawText: string) {
   const wrapper = document.createElement('div')
 
   if (/<[a-z][\s\S]*>/i.test(text)) {
-    wrapper.innerHTML = text
+    wrapper.innerHTML = repairSourceImageHtml(text)
     normalizeSourceTypography(wrapper)
     const paragraphs = Array.from(wrapper.querySelectorAll('p')) as HTMLParagraphElement[]
     if (paragraphs.length) {
@@ -1046,8 +1040,10 @@ const {
   horizontalPageIndex,
   horizontalPageStep,
   horizontalPageStepStyle,
+  horizontalTextWidth,
   horizontalPages,
   isHorizontalAtEnd,
+  horizontalLastPageStart,
   rebuildHorizontalPages,
   updateHorizontalMetrics,
   updateHorizontalEndState,
@@ -1068,6 +1064,8 @@ const {
 )
 
 const horizontalPageTransform = computed(() => {
+  // 索引是**栏索引**(始终对齐到屏起始: 0 / 栏数 / 2×栏数 …), 位移 = 索引 × 单栏宽。
+  // 一屏恰好一页: 位移 = 页索引 × 屏宽(屏宽 = 容器宽)。
   const offset = horizontalPageIndex.value * Math.max(1, horizontalPageStep.value)
   return `translate3d(${-offset}px, 0, 0)`
 })
@@ -1103,12 +1101,18 @@ const {
   scrollContainerRef,
 )
 
+/** 是否该预加载下一章: 到达倒数第二页就算到(与纵向滚动模式的「提前一屏」一致)。 */
+function shouldPreloadNextChapter() {
+  if (!config.value.enablePreload) return false
+  return horizontalPageIndex.value >= horizontalLastPageStart.value - 1
+}
+
 function syncHorizontalPageState() {
   const maxPage = Math.max(0, horizontalPages.value.length - 1)
   const progress = maxPage <= 0 ? 1 : horizontalPageIndex.value / maxPage
   store.setChapterScrollProgress(progress)
   updateHorizontalEndState()
-  if (config.value.enablePreload && maxPage > 0 && horizontalPageIndex.value >= maxPage - 1) {
+  if (shouldPreloadNextChapter()) {
     store.preloadAroundChapter(store.currentIndex)
   }
   scheduleSaveReadingPosition()
@@ -1119,12 +1123,13 @@ function pageForward() {
   const container = scrollContainerRef.value
   if (!container) return
   if (isHorizontalPageMode.value) {
-    const maxPage = Math.max(0, horizontalPages.value.length - 1)
-    if (horizontalPageIndex.value >= maxPage) {
+    // 一屏恰好一页, 所以步进量是 1 页。
+    const lastPage = horizontalLastPageStart.value
+    if (horizontalPageIndex.value >= lastPage) {
       nextChapter()
       return
     }
-    horizontalPageIndex.value = Math.min(maxPage, horizontalPageIndex.value + 1)
+    horizontalPageIndex.value = Math.min(lastPage, horizontalPageIndex.value + 1)
     container.scrollTo({ left: 0, behavior: 'auto' })
     syncHorizontalPageState()
     return
@@ -1355,9 +1360,9 @@ function scrollToBottom() {
   const container = scrollContainerRef.value
   if (!container) return
   if (isHorizontalPageMode.value) {
-    // 尾页 = 最后一页(不是容器的 scrollHeight, 那只在纵向滚动模式里成立)。
-    const maxPage = Math.max(0, horizontalPages.value.length - 1)
-    horizontalPageIndex.value = maxPage
+    // 尾页 = 末屏的起始栏(不是最后一栏): 多栏模式下索引必须落在屏边界上,
+    // 否则会显示一个从半屏处开始的错位画面。
+    horizontalPageIndex.value = horizontalLastPageStart.value
     syncHorizontalPageState()
     return
   }
@@ -1632,7 +1637,8 @@ async function restoreLegadoReadingPosition() {
     const pages = Array.from(container.querySelectorAll('.horizontal-page')) as HTMLElement[]
     const pageIndex = page ? pages.indexOf(page) : -1
     if (pageIndex < 0 || !pages.length) return false
-    horizontalPageIndex.value = Math.max(0, Math.min(pages.length - 1, pageIndex))
+    // 一屏恰好一页: 目标页索引直接就是它在页面列表里的下标。
+    horizontalPageIndex.value = clampReaderPageIndex(pageIndex, pages.length)
     updateHorizontalEndState()
     pendingLegadoPageRestore.value = null
     legadoPositionRestoreAttempts = 0
@@ -2254,13 +2260,15 @@ function handleScroll() {
     store.setChapterScrollProgress(progress)
     if (isHorizontalPageMode.value) {
       updateHorizontalMetrics()
-      const maxPage = Math.max(0, horizontalPages.value.length - 1)
-      horizontalPageIndex.value = Math.max(0, Math.min(maxPage, horizontalPageIndex.value))
+      horizontalPageIndex.value = clampReaderPageIndex(
+        horizontalPageIndex.value,
+        horizontalPages.value.length,
+      )
       if (container.scrollLeft !== 0) {
         container.scrollTo({ left: 0, behavior: 'auto' })
       }
       updateHorizontalEndState()
-      if (config.value.enablePreload && maxPage > 0 && horizontalPageIndex.value >= maxPage - 1) {
+      if (shouldPreloadNextChapter()) {
         store.preloadAroundChapter(store.currentIndex)
       }
     } else if (config.value.enablePreload && container.scrollHeight - (container.scrollTop + container.clientHeight) < container.clientHeight * 1.5) {
@@ -2898,7 +2906,6 @@ onMounted(async () => {
   window.addEventListener('click', closeReaderContextMenu)
   // 书源图片气泡的 click 脚本(捕获阶段, 抢在翻页逻辑之前)
   document.addEventListener('click', handleSourceImageClick, true)
-  window.addEventListener('message', handleSourcePanelMessage)
   document.addEventListener('mouseup', handleMouseUpSelection)
   document.addEventListener('touchend', handleTouchEndSelection)
     document.addEventListener('selectionchange', handleSelectionChange)
@@ -2929,6 +2936,9 @@ onMounted(async () => {
   scheduleRefreshOfflineCacheState()
   updateHorizontalMetrics()
   await rebuildHorizontalPages()
+  // 挂载期结束: 此后 resize 才允许触发重新分页。
+  mounted = true
+  scrollContainerRef.value?.querySelectorAll('img').forEach(queueLoadedImagePagination)
   // 章节列表 watcher(2114)可能已完成初始化并应用了位置恢复; 这里只在列表
   // 尚未初始化时补一次, 否则重复初始化会把已恢复的视口拽回章节开头。
   if (isContinuousMode.value && !continuousChapters.value.length) {
@@ -2949,7 +2959,6 @@ onUnmounted(() => {
   window.removeEventListener('mouseup', handleReaderMouseUpForHotkey, true)
   window.removeEventListener('click', closeReaderContextMenu)
   document.removeEventListener('click', handleSourceImageClick, true)
-  window.removeEventListener('message', handleSourcePanelMessage)
   document.removeEventListener('mouseup', handleMouseUpSelection)
   document.removeEventListener('touchend', handleTouchEndSelection)
     document.removeEventListener('selectionchange', handleSelectionChange)
@@ -2963,6 +2972,7 @@ onUnmounted(() => {
   if (persistPositionTimer) clearTimeout(persistPositionTimer)
   if (legadoPositionRestoreTimer) clearTimeout(legadoPositionRestoreTimer)
   if (refreshOfflineCacheStateTimer) clearTimeout(refreshOfflineCacheStateTimer)
+  if (horizontalRebuildTimer) clearTimeout(horizontalRebuildTimer)
   hoverSupportStop?.()
   hoverSupportStop = null
   hoverMediaQuery?.removeEventListener('change', syncHoverPointerSupport)
@@ -3006,6 +3016,7 @@ watch(() => config.value.readMethod, async () => {
 })
 
 watch(() => store.currentIndex, () => {
+  loadedReaderImageSizes.clear()
   if (!isHorizontalPageMode.value) return
   resetHorizontalPagePosition()
   rebuildHorizontalPages()
@@ -3025,8 +3036,10 @@ watch(
       if (!isHorizontalPageMode.value) return
       // 远端进度正在精确恢复时不要抢位置, 交给那套机制。
       if (pendingLegadoPageRestore.value) return
-      const maxPage = Math.max(0, horizontalPages.value.length - 1)
-      horizontalPageIndex.value = Math.max(0, Math.min(maxPage, Math.round(progress * maxPage)))
+      horizontalPageIndex.value = readerPageIndexFromProgress(
+        progress,
+        horizontalPages.value.length,
+      )
       syncHorizontalPageState()
     })
   },
@@ -3036,6 +3049,7 @@ watch(
 watch(
   [() => store.content, showSearch, searchQuery],
   () => {
+    loadedReaderImageSizes.clear()
     if (!isHorizontalPageMode.value) return
     if (!pendingLegadoPageRestore.value) horizontalPageIndex.value = 0
     rebuildHorizontalPages()
@@ -3405,6 +3419,11 @@ watch(
   will-change: transform;
 }
 
+/* 一页 = 一屏：宽度恒等于容器宽(--reader-page-step 由 JS 写为容器宽)。
+   正文的**行宽**由里面的 .horizontal-page-content 单独控制, 并在页内居中,
+   所以宽窗口下是「正文居中 + 两侧留白」, 而不是一屏并排显示两页。
+   这里的左右 padding 必须与 useHorizontalPaging 的 HORIZONTAL_PAGE_SIDE_PADDING
+   保持一致 —— 那边用它算行宽的可用宽度, 不一致会让测量与实际排版不符。 */
 .horizontal-page {
   width: var(--reader-page-step);
   min-width: var(--reader-page-step);
@@ -3478,12 +3497,19 @@ watch(
   -webkit-touch-callout: default;
 }
 
+/* 页内正文列：宽度 = 行宽(「页面宽度」设置, 由 JS 写进 --reader-text-width)。
+   `margin: 0 auto` 让它在页宽大于行宽时居中, 因此宽窗口下呈现为
+   「正文居中 + 两侧留白」, 而不是一屏并排显示两页。 */
 .horizontal-page-content {
+  width: var(--reader-text-width, 100%);
+  max-width: 100%;
+  margin: 0 auto;
   height: 100%;
   overflow: hidden;
   overflow-wrap: break-word;
   text-align: left;
   word-break: normal;
+  box-sizing: border-box;
 }
 
 :deep(.horizontal-page-content .horizontal-flow-title) {
@@ -3717,62 +3743,6 @@ watch(
   margin: 0 0.15em;
 }
 
-/* java.showBrowser 面板: 底部弹层(legado BottomWebViewDialog) */
-.source-browser-mask {
-  position: fixed;
-  inset: 0;
-  z-index: 90;
-  display: flex;
-  align-items: flex-end;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.42);
-}
-
-.source-browser-panel {
-  display: flex;
-  flex-direction: column;
-  width: min(720px, 100%);
-  height: min(78vh, 100%);
-  border-radius: 14px 14px 0 0;
-  overflow: hidden;
-  box-shadow: 0 -12px 34px rgba(0, 0, 0, 0.3);
-}
-
-.source-browser-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent);
-}
-
-.source-browser-title {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 13px;
-  opacity: 0.8;
-}
-
-.source-browser-close {
-  flex-shrink: 0;
-  min-height: 30px;
-  padding: 0 12px;
-  border: 0;
-  border-radius: 7px;
-  background: color-mix(in srgb, currentColor 10%, transparent);
-  color: inherit;
-  font-size: 13px;
-}
-
-.source-browser-frame {
-  flex: 1;
-  width: 100%;
-  border: 0;
-  background: #fff;
-}
 :deep(.search-highlight.current-match) {
   background: orange;
 }

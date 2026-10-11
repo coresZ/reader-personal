@@ -1,0 +1,192 @@
+use cookie_store::CookieStore;
+use reqwest::{cookie::CookieStore as ReqwestCookieStore, header::HeaderValue};
+use std::{collections::HashMap, fs, path::{Path, PathBuf}, sync::{Arc, Mutex}};
+use url::Url;
+
+/// One source owns one cookie store, including requests made by its scripts.
+/// Cookies retain their normal domain/path/expiry rules within that source.
+pub struct SourceCookieJar {
+    store: Mutex<CookieStore>,
+    path: Option<PathBuf>,
+}
+
+impl SourceCookieJar {
+    pub fn new(path: Option<PathBuf>) -> Self {
+        let store = path.as_ref().and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| cookie_store::serde::json::load(bytes.as_slice()).ok())
+            .unwrap_or_default();
+        Self { store: Mutex::new(store), path }
+    }
+
+    fn persist(&self, store: &CookieStore) -> anyhow::Result<()> {
+        if let Some(path) = &self.path {
+            let mut bytes = Vec::new();
+            cookie_store::serde::json::save_incl_expired_and_nonpersistent(store, &mut bytes)
+                .map_err(|e| anyhow::anyhow!("保存登录状态失败: {e}"))?;
+            write_private_state(path, &bytes)?;
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, url: &Url) -> String {
+        self.store.lock().unwrap_or_else(|e| e.into_inner()).get_request_values(url)
+            .map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join("; ")
+    }
+
+    pub fn set(&self, url: &Url, header: &str) -> anyhow::Result<()> {
+        self.update(url, header, false)
+    }
+
+    pub fn replace(&self, url: &Url, header: &str) -> anyhow::Result<()> {
+        self.update(url, header, true)
+    }
+
+    fn update(&self, url: &Url, header: &str, replace: bool) -> anyhow::Result<()> {
+        HeaderValue::from_str(header).map_err(|_| anyhow::anyhow!("Cookie 格式无效"))?;
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = store.clone();
+        if replace { remove_url_cookies(&mut next, url); }
+        for pair in header.split(';').map(str::trim).filter(|pair| !pair.is_empty()) {
+            anyhow::ensure!(pair.split_once('=').is_some_and(|(name, _)| !name.trim().is_empty()), "Cookie 格式无效");
+            next.parse(&format!("{pair}; Path=/"), url)
+                .map_err(|_| anyhow::anyhow!("Cookie 格式无效"))?;
+        }
+        self.persist(&next)?;
+        *store = next;
+        Ok(())
+    }
+
+    pub fn clear_url(&self, url: &Url) -> anyhow::Result<()> {
+        self.replace(url, "")
+    }
+
+    pub fn clear(&self) -> anyhow::Result<()> {
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let empty = CookieStore::default();
+        self.persist(&empty)?;
+        *store = empty;
+        Ok(())
+    }
+}
+
+fn remove_url_cookies(store: &mut CookieStore, url: &Url) {
+    let keys = store.iter_any().filter(|cookie| cookie.domain.matches(url))
+        .filter_map(|cookie| Some((cookie.domain.as_cow()?.into_owned(), cookie.path.as_ref().to_string(), cookie.name().to_string())))
+        .collect::<Vec<_>>();
+    for (domain, path, name) in keys { store.remove(&domain, &path, &name); }
+}
+
+impl ReqwestCookieStore for SourceCookieJar {
+    fn set_cookies(&self, headers: &mut dyn Iterator<Item = &HeaderValue>, url: &Url) {
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        for header in headers {
+            if let Ok(value) = header.to_str() { let _ = store.parse(value, url); }
+        }
+        if let Err(err) = self.persist(&store) { tracing::warn!("保存书源会话失败: {err}"); }
+    }
+
+    fn cookies(&self, url: &Url) -> Option<HeaderValue> {
+        let value = self.get(url);
+        if value.is_empty() { None } else { HeaderValue::from_str(&value).ok() }
+    }
+}
+
+pub struct SourceSession {
+    pub identity: String,
+    pub source_url: String,
+    pub cookies: Arc<SourceCookieJar>,
+    state: Mutex<HashMap<String, String>>,
+    state_path: Option<PathBuf>,
+    request_times: tokio::sync::Mutex<std::collections::VecDeque<tokio::time::Instant>>,
+}
+
+impl SourceSession {
+    pub fn new(user_ns: &str, source_url: &str, root: Option<&Path>) -> Self {
+        let key = format!("{user_ns}::{source_url}");
+        let dir = root.map(|root| root.join(crate::util::hash::md5_hex(&key)));
+        let state_path = dir.as_ref().map(|dir| dir.join("state.json"));
+        let state = state_path.as_ref().and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        Self {
+            identity: format!("{}::{key}", root.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()),
+            source_url: source_url.to_string(),
+            cookies: Arc::new(SourceCookieJar::new(dir.map(|dir| dir.join("cookies.json")))),
+            state: Mutex::new(state), state_path,
+            request_times: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+    }
+
+    pub fn put(&self, key: &str, value: Option<&str>) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = state.clone();
+        match value {
+            Some(value) => { next.insert(key.to_string(), value.to_string()); }
+            None => { next.remove(key); }
+        }
+        if let Some(path) = &self.state_path { write_private_state(path, &serde_json::to_vec(&next)?)?; }
+        *state = next;
+        Ok(())
+    }
+
+    pub async fn request(&self, client: &reqwest::Client, req: super::fetcher::RequestSpec, rate: Option<&str>) -> anyhow::Result<super::fetcher::FetchResponse> {
+        let rate = rate.unwrap_or("").trim();
+        if rate.is_empty() || rate == "0" || req.url.starts_with("data:") {
+            return super::fetcher::fetch_with_client(client, req).await;
+        }
+        let (limit, duration, serial) = if let Some((limit, window)) = rate.split_once('/') {
+            match (limit.trim().parse::<usize>(), window.trim().parse::<u64>()) {
+                (Ok(limit), Ok(window)) if limit > 0 => (limit, window, false),
+                _ => return super::fetcher::fetch_with_client(client, req).await,
+            }
+        } else {
+            match rate.parse::<u64>() {
+                Ok(duration) => (1, duration, true),
+                Err(_) => return super::fetcher::fetch_with_client(client, req).await,
+            }
+        };
+        let mut starts = self.request_times.lock().await;
+        let window = std::time::Duration::from_millis(duration);
+        loop {
+            let now = tokio::time::Instant::now();
+            while starts.front().is_some_and(|start| now.duration_since(*start) >= window) { starts.pop_front(); }
+            if starts.len() < limit { break; }
+            tokio::time::sleep_until(*starts.front().unwrap() + window).await;
+        }
+        starts.push_back(tokio::time::Instant::now());
+        if !serial { drop(starts); return super::fetcher::fetch_with_client(client, req).await; }
+        // The guard releases even when a cancellable native request is dropped.
+        let response = super::fetcher::fetch_with_client(client, req).await;
+        drop(starts);
+        response
+    }
+}
+
+#[derive(Clone)]
+pub struct SourceHttpContext {
+    pub session: Arc<SourceSession>,
+    pub client: reqwest::Client,
+    pub proxy: Option<String>,
+    pub timeout_secs: u64,
+}
+
+pub(crate) fn write_private_state(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    use std::io::Write;
+    let mut file = options.open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(tmp, path)?;
+    Ok(())
+}

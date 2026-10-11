@@ -6,8 +6,15 @@ export interface ShowBrowserRequest {
   url: string
   html?: string | null
   preloadJs?: string | null
+  options?: Record<string, unknown> | null
+  title?: string | null
+  awaitResult?: boolean
   /** 后端托管的面板 id：iframe 加载 `${readerOrigin}/sourcePanel?panelId=...`。 */
   panelId?: string | null
+}
+
+export function closeSourcePanel(panelId: string) {
+  return invoke<void>('close_source_panel', { panelId })
 }
 
 /** 正文图片 `click` 脚本的执行结果。 */

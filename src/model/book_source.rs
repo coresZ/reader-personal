@@ -20,6 +20,7 @@ pub struct BookSource {
     pub concurrent_rate: Option<String>,
     pub header: Option<String>,
     pub login_url: Option<String>,
+    #[serde(deserialize_with = "deserialize_login_ui")]
     pub login_ui: Option<String>,
     pub login_check_js: Option<String>,
     pub cover_decode_js: Option<String>,
@@ -145,6 +146,15 @@ where
     }
 }
 
+fn deserialize_login_ui<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(value @ Value::Array(_)) => Ok(Some(value.to_string())),
+        Some(_) => Err(serde::de::Error::custom("loginUi must be a string or an array")),
+    }
+}
+
 pub fn book_source_from_value(value: Value) -> serde_json::Result<BookSource> {
     serde_json::from_value(migrate_legacy_book_source_value(value))
 }
@@ -156,8 +166,19 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
 
     move_if_absent(obj, "ruleBookUrlPattern", "bookUrlPattern");
     move_if_absent(obj, "serialNumber", "customOrder");
-    move_if_absent(obj, "ruleFindUrl", "exploreUrl");
-    move_if_absent(obj, "ruleSearchUrl", "searchUrl");
+    // Only URLs originating in the old schema need syntax migration. Modern
+    // fields can contain arbitrary JS/JSON; rewriting braces corrupts them.
+    for (old, new) in [("ruleFindUrl", "exploreUrl"), ("ruleSearchUrl", "searchUrl")] {
+        if !obj.contains_key(new) {
+            if let Some(raw) = obj.remove(old) {
+                let converted = match raw {
+                    Value::String(raw) => Value::String(convert_legacy_url_rule(&raw)),
+                    other => other,
+                };
+                obj.insert(new.to_string(), converted);
+            }
+        }
+    }
     move_if_absent(obj, "enable", "enabled");
 
     if let Some(Value::String(kind)) = obj.get("bookSourceType").cloned() {
@@ -177,15 +198,6 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
                     Value::String(json!({ "User-Agent": ua }).to_string()),
                 );
             }
-        }
-    }
-
-    for key in ["searchUrl", "exploreUrl", "loginUrl"] {
-        if let Some(Value::String(raw)) = obj.get(key).cloned() {
-            obj.insert(
-                key.to_string(),
-                Value::String(convert_legacy_url_rule(&raw)),
-            );
         }
     }
 
@@ -300,6 +312,9 @@ fn migrate_rule_object(obj: &mut Map<String, Value>, target: &str, fields: &[(&s
 }
 
 fn convert_legacy_url_rule(raw: &str) -> String {
+    if raw.contains("@js:") || raw.contains("<js>") || raw.contains(",{\"") {
+        return raw.to_string();
+    }
     let mut url = raw.to_string();
     let mut option = Map::new();
 
@@ -369,7 +384,7 @@ fn extract_legacy_header(input: &str) -> Option<(usize, usize, String)> {
 }
 
 fn convert_legacy_page_braces(input: &str) -> String {
-    let re = regex::Regex::new(r"\{([^{}]*,[^{}]*)\}").unwrap();
+    let re = regex::Regex::new(r"\{(\s*\d+(?:\s*,\s*\d+)+\s*)\}").unwrap();
     re.replace_all(input, "<$1>").into_owned()
 }
 

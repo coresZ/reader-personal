@@ -1,7 +1,7 @@
 use crate::crawler::{
     fetcher::{fetch_with_client, FetchResponse, RequestSpec, StrResponse},
     http_client::{HttpClient, ProxyMode, ProxyStatus},
-    url_analyzer::analyze_url,
+    url_analyzer::{analyze_url, split_url_options},
 };
 use crate::error::error::AppError;
 use crate::model::{
@@ -34,6 +34,10 @@ pub struct ShowBrowserRequest {
     pub url: String,
     pub html: Option<String>,
     pub preload_js: Option<String>,
+    pub options: Option<serde_json::Value>,
+    pub title: Option<String>,
+    #[serde(default)]
+    pub await_result: bool,
     /// 后端托管的面板 id(前端按 `${readerOrigin}/sourcePanel?panelId=...` 加载)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub panel_id: Option<String>,
@@ -61,10 +65,12 @@ fn clear_show_browser_request() {
 
 /// 已打开的 `java.showBrowser` 面板: 面板 HTML 由后端托管, 前端只需按 id 加载
 /// `${readerOrigin}/sourcePanel?panelId=...`, 面板内的桥脚本即可同源回调宿主。
-#[derive(Clone, Debug)]
+#[derive(Clone, Default)]
 pub struct SourcePanelEntry {
     pub url: String,
     pub html: String,
+    pub preload_js: Option<String>,
+    pub http: Option<crate::crawler::source_session::SourceHttpContext>,
     /// 归属书源, 面板内 `window.run` 需要在其 jsLib 作用域执行。
     pub book_source_url: String,
     pub book_url: String,
@@ -82,22 +88,20 @@ const MAX_SOURCE_PANELS: usize = 8;
 
 /// 登记一个面板并返回其 id。
 pub fn register_source_panel(entry: SourcePanelEntry) -> String {
-    let id = format!(
-        "p{}_{}",
-        md5_hex(&format!("{}:{}", entry.book_source_url, entry.url)),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    );
+    let id = uuid::Uuid::new_v4().simple().to_string();
     let mut panels = SOURCE_PANELS.lock().unwrap_or_else(|e| e.into_inner());
     // 按插入顺序淘汰最旧的(用 Vec 而非 HashMap: 后者无序, 淘汰会变成随机的,
     // 可能剔掉正在显示的面板导致其后续交互 404)
     if panels.len() >= MAX_SOURCE_PANELS {
-        panels.remove(0);
+        let (old_id, _) = panels.remove(0);
+        crate::service::source_browser::cancel_browser(&old_id);
     }
     panels.push((id.clone(), entry));
     id
+}
+
+pub fn remove_source_panel(panel_id: &str) {
+    SOURCE_PANELS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(id, _)| id != panel_id);
 }
 
 pub fn get_source_panel(panel_id: &str) -> Option<SourcePanelEntry> {
@@ -137,7 +141,25 @@ pub async fn handle_source_panel_bridge(
             crate::parser::js::push_js_log(format!("[panel.toast] {message}"));
             Ok(serde_json::Value::String(message))
         }
-        "close" => Ok(serde_json::Value::Null),
+        "close" => {
+            Ok(serde_json::Value::Null)
+        }
+        "sourceGet" | "sourceSet" => {
+            let key = text_of("key");
+            if !matches!(key.as_str(), "variable" | "loginInfo" | "loginHeader") {
+                return Err("未知的书源状态".to_string());
+            }
+            let http = entry.http.clone().map(Ok).unwrap_or_else(|| {
+                crate::parser::js::source_http_context(&entry.book_source_url)
+            }).map_err(|e| e.to_string())?;
+            if action == "sourceSet" {
+                let value = payload.get("value").and_then(|v| v.as_str());
+                http.session.put(&key, value).map_err(|e| e.to_string())?;
+                Ok(json!(true))
+            } else {
+                Ok(json!(http.session.get(&key)))
+            }
+        }
         "cacheGet" => {
             let key = text_of("key");
             Ok(crate::parser::js::get_panel_cache(&entry.book_source_url, &key)
@@ -165,21 +187,34 @@ pub async fn handle_source_panel_bridge(
                 chapter: serde_json::from_str(&entry.chapter_json).unwrap_or_else(|_| json!({})),
             };
             let output = tokio::task::spawn_blocking(move || {
-                crate::parser::js::with_book_context(Some(book_ctx), || {
+                let execute = || crate::parser::js::with_book_context(Some(book_ctx), || {
                     crate::parser::js::with_source(&source, || {
                         crate::parser::js::with_source_key(Some(&entry.book_url), || {
-                            crate::parser::js::eval_js(&script, "", &entry.chapter_url)
+                            take_js_logs();
+                            clear_show_browser_request();
+                            crate::parser::js::take_login_effects();
+                            let result = crate::parser::js::eval_js(&script, "", &entry.url);
+                            let browser = take_show_browser_request();
+                            let logs = take_js_logs();
+                            let effects = crate::parser::js::take_login_effects();
+                            let result = result?;
+                            let browser = browser.map(|request| {
+                                crate::service::source_browser::register_browser_request(request, entry.clone())
+                            }).transpose()?;
+                            Ok::<_, anyhow::Error>(json!({"result":result,"showBrowser":browser,"logs":logs,"loginEffects":effects}))
                         })
                     })
-                })
+                });
+                match entry.http.clone() {
+                    Some(http) => crate::parser::js::with_http_context(http, execute),
+                    None => execute(),
+                }
             })
             .await
             .map_err(|e| e.to_string())?;
-            output
-                .map(serde_json::Value::String)
-                .map_err(|e| format!("脚本执行失败: {e}"))
+            output.map_err(|e| format!("脚本执行失败: {e}"))
         }
-        "ajax" | "connect" | "http" => {
+        "ajax" | "connect" | "http" | "fetch" => {
             let source = book_source_service
                 .get("default", &entry.book_source_url)
                 .await
@@ -189,27 +224,36 @@ pub async fn handle_source_panel_bridge(
             let payload = payload.clone();
             let entry = entry.clone();
             let result = tokio::task::spawn_blocking(move || {
-                crate::parser::js::run_panel_request(&source, &entry.chapter_url, &action, &payload)
+                let execute = || {
+                    if action == "fetch" {
+                        crate::parser::js::run_panel_fetch(&source, &entry.url, &action, &payload)
+                    } else {
+                        crate::parser::js::run_panel_request(&source, &entry.url, &action, &payload).map(serde_json::Value::String)
+                    }
+                };
+                match entry.http.clone() {
+                    Some(http) => crate::parser::js::with_http_context(http, execute),
+                    None => execute(),
+                }
             })
             .await
             .map_err(|e| e.to_string())?;
-            result
-                .map(serde_json::Value::String)
-                .map_err(|e| e.to_string())
+            result.map_err(|e| e.to_string())
         }
         // 面板内再次调 `java.showBrowser`: 登记为新面板并回传 panelId,
         // 由桥通过 postMessage 通知宿主换成新面板(嵌套弹层)。
         "showBrowser" => {
-            let panel_id = register_source_panel(SourcePanelEntry {
+            let options = payload.get("options").and_then(|value| {
+                if let Some(text) = value.as_str() { serde_json::from_str::<serde_json::Value>(text).ok() }
+                else { Some(value.clone()) }
+            }).filter(|value| value.is_object());
+            let request = crate::service::source_browser::register_browser_request(ShowBrowserRequest {
                 url: text_of("url"),
-                html: text_of("html"),
-                book_source_url: entry.book_source_url.clone(),
-                book_url: entry.book_url.clone(),
-                chapter_url: entry.chapter_url.clone(),
-                book_json: entry.book_json.clone(),
-                chapter_json: entry.chapter_json.clone(),
-            });
-            Ok(serde_json::Value::String(panel_id))
+                html: payload.get("html").and_then(|v| v.as_str()).map(str::to_string),
+                preload_js: payload.get("preloadJs").and_then(|v| v.as_str()).map(str::to_string),
+                options, title: None, await_result: false, panel_id: None,
+            }, entry.clone()).map_err(|e| e.to_string())?;
+            Ok(json!(request))
         }
         // 面板签名用的对称加密(与书源规则的 `java.createSymmetricCrypto` 同一实现)。
         // 部分书源接口靠它签请求, 缺了这个插件只能降级到 CryptoJS 注入, 容易失败。
@@ -272,8 +316,6 @@ pub struct BookService {
     parser: RuleEngine,
     cache: FileCache,
     storage_dir: PathBuf,
-    source_cookies: Arc<RwLock<HashMap<String, String>>>,
-    source_clients: Arc<RwLock<HashMap<String, reqwest::Client>>>,
     login_sessions: Arc<RwLock<HashMap<String, SourceLoginSession>>>,
     rate_states: Arc<RwLock<HashMap<String, RateState>>>,
     bookshelf_write_lock: Arc<Mutex<()>>,
@@ -414,13 +456,12 @@ fn truncate_trace_body(body: &str) -> String {
 impl BookService {
     pub fn new(http: HttpClient, parser: RuleEngine, cache: FileCache, storage_dir: &str) -> Self {
         let storage_dir = PathBuf::from(storage_dir);
+        http.set_source_storage_dir(storage_dir.join("source-state"));
         Self {
             http,
             parser,
             cache,
             storage_dir,
-            source_cookies: Arc::new(RwLock::new(HashMap::new())),
-            source_clients: Arc::new(RwLock::new(HashMap::new())),
             login_sessions: Arc::new(RwLock::new(HashMap::new())),
             rate_states: Arc::new(RwLock::new(HashMap::new())),
             bookshelf_write_lock: Arc::new(Mutex::new(())),
@@ -434,28 +475,98 @@ impl BookService {
     /// Return a client isolated to one book source. Its cookie jar is never
     /// shared with another source or with the app's generic HTTP client.
     pub async fn source_http_client(
-        &self,
-        user_ns: &str,
-        source_url: &str,
-        proxy: Option<&str>,
+        &self, user_ns: &str, source_url: &str, proxy: Option<&str>,
     ) -> Result<reqwest::Client, AppError> {
-        let key = Self::source_cookie_key(user_ns, source_url);
-        let proxy_key = proxy.map(str::trim).unwrap_or_default();
-        let client_key = format!("{key}::proxy={proxy_key}");
-        if let Some(client) = self.source_clients.read().await.get(&client_key).cloned() {
-            return Ok(client);
-        }
+        Ok(self.http.source_context(user_ns, source_url, proxy).map_err(AppError::Internal)?.client)
+    }
 
-        let mut clients = self.source_clients.write().await;
-        if let Some(client) = clients.get(&client_key).cloned() {
-            return Ok(client);
+    pub fn source_scope<T>(&self, user_ns: &str, source: &BookSource, f: impl FnOnce() -> T) -> Result<T, AppError> {
+        let context = self.http.source_context(user_ns, &source.book_source_url, None).map_err(AppError::Internal)?;
+        Ok(crate::parser::js::with_http_context(context, || with_source(source, f)))
+    }
+
+    async fn run_source_task<T: Send + 'static>(
+        &self, user_ns: &str, source: &BookSource,
+        f: impl FnOnce(&BookSource) -> T + Send + 'static,
+    ) -> Result<T, AppError> {
+        let context = self.http.source_context(user_ns, &source.book_source_url, None).map_err(AppError::Internal)?;
+        let source = source.clone();
+        tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(context, || with_source(&source, || f(&source))))
+            .await.map_err(|err| AppError::Internal(anyhow::anyhow!("书源任务失败: {err}")))
+    }
+
+    async fn analyze_request(&self, user_ns: &str, source: &BookSource, rule: &str, key: &str, page: i32, base: &str) -> Result<RequestSpec, AppError> {
+        let (rule, key, base) = (rule.to_string(), key.to_string(), base.to_string());
+        self.run_source_task(user_ns, source, move |source| crate::parser::js::with_search_context(&key, page, || analyze_url(&rule, &key, page, &base, source))).await?
+    }
+
+    async fn parse_toc_page(&self, user_ns: &str, source: &BookSource, res: &FetchResponse, book_url: &str) -> Result<(Vec<BookChapter>, Vec<String>), AppError> {
+        let mut book_ctx = self.js_book_context(user_ns, book_url, "").await.unwrap_or_default();
+        book_ctx.book["tocUrl"] = json!(book_url);
+        let source_key = book_ctx.book["bookUrl"].as_str().unwrap_or(book_url).to_string();
+        let (body, url) = (res.body.clone(), res.url.clone());
+        self.run_source_task(user_ns, source, move |source| {
+            with_book_context(Some(book_ctx), || {
+                RuleEngine::new().unwrap().chapter_list(source, &body, &url, Some(&source_key))
+            })
+        }).await
+    }
+
+    async fn parse_info_page(&self, user_ns: &str, source: &BookSource, res: &FetchResponse, book_url: &str) -> Result<Book, AppError> {
+        // 详情响应为空时给出可诊断的提示: 规则里的 `result` 会是空串,
+        // 表现为书源脚本自己抛出的公式化异常(如"详情bookUrl为空:"),
+        // 掩盖了真正原因(线路失效/站点返回空页/被限流)。
+        if res.body.trim().is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "详情页响应为空（HTTP {}，{}）。请检查书源线路是否可用或稍后重试",
+                res.status,
+                if res.url.is_empty() { book_url.to_string() } else { res.url.clone() }
+            )));
         }
-        let client = self
-            .http
-            .new_client_with_proxy(proxy)
-            .map_err(AppError::Internal)?;
-        clients.insert(client_key, client.clone());
-        Ok(client)
+        let book_ctx = self.js_book_context(user_ns, book_url, "").await.unwrap_or_default();
+        let read_config = book_ctx.book.get("readConfig").cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+        let (body, url, book_url) = (res.body.clone(), res.url.clone(), book_url.to_string());
+        self.run_source_task(user_ns, source, move |source| {
+            take_js_logs();
+            let mut book = with_book_context(Some(book_ctx), || {
+                RuleEngine::new().unwrap().book_info(source, &body, &url, &book_url)
+            });
+            book.read_config = read_config;
+            apply_book_read_config_override(&mut book);
+            let logs = take_js_logs();
+            if book.name.is_empty() {
+                if let Some(error) = first_js_error(&logs) { return Err(AppError::BadRequest(format!("书籍详情解析失败: {error}"))); }
+            }
+            Ok(book)
+        }).await?
+    }
+
+    async fn check_source_response(&self, user_ns: &str, source: &BookSource, res: FetchResponse) -> Result<FetchResponse, AppError> {
+        if source.login_check_js.as_deref().unwrap_or("").trim().is_empty() { return Ok(res); }
+        let retry_url = res.url.clone();
+        let (checked, login_requested) = self.run_source_task(user_ns, source, move |source| apply_login_check_js(source, res)).await??;
+        // `source.login()`: 校验脚本已请求重新登录(典型: 响应 401/40101)。
+        // 用已保存的登录信息重跑 loginUrl, 再用同一个 URL 重取一次。
+        if !login_requested { return Ok(checked); }
+        if let Err(err) = self.run_source_login(source, Some("login".into()), None).await {
+            tracing::warn!("source.login() 重新登录失败: {err:?}");
+            return Ok(checked);
+        }
+        let spec = match crate::crawler::url_analyzer::analyze_url(&retry_url, "", 1, &retry_url, source) {
+            Ok(spec) => spec,
+            Err(err) => {
+                tracing::warn!("source.login() 重取请求构造失败: {err:?}");
+                return Ok(checked);
+            }
+        };
+        match self.fetch_with_rate(user_ns, source, spec).await {
+            Ok(retried) => Ok(retried),
+            Err(err) => {
+                tracing::warn!("source.login() 重取响应失败: {err:?}");
+                Ok(checked)
+            }
+        }
     }
 
     pub async fn create_source_login_session(&self, source_url: &str) -> String {
@@ -488,7 +599,6 @@ impl BookService {
         proxy: Option<&str>,
     ) -> anyhow::Result<ProxyStatus> {
         let status = self.http.configure_proxy(mode, proxy)?;
-        self.source_clients.write().await.clear();
         // A proxy switch invalidates any in-flight login preview tokens. This
         // prevents a session created under one network path from being reused
         // after the request routing has changed.
@@ -496,172 +606,63 @@ impl BookService {
         Ok(status)
     }
 
-    fn source_cookie_key(user_ns: &str, source_url: &str) -> String {
-        format!("{}::{}", user_ns, normalize_source_url(source_url))
-    }
-
-    async fn apply_source_cookie(
-        &self,
-        user_ns: &str,
-        source: &BookSource,
-        headers: &mut Vec<(String, String)>,
-    ) {
-        let key = Self::source_cookie_key(user_ns, &source.book_source_url);
-        if let Some(cookie) = self.source_cookies.read().await.get(&key).cloned() {
-            if !headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("cookie"))
-            {
-                headers.push(("Cookie".to_string(), cookie));
-            }
-        }
-    }
-
-    pub async fn set_source_cookie(&self, user_ns: &str, source_url: &str, cookie: &str) {
-        let cookie = cookie.trim();
-        if cookie.is_empty() {
-            return;
-        }
-        let key = Self::source_cookie_key(user_ns, source_url);
-        let prefix = format!("{key}::proxy=");
-        self.source_cookies
-            .write()
-            .await
-            .insert(key.clone(), cookie.to_string());
-        self.source_clients
-            .write()
-            .await
-            .retain(|client_key, _| client_key != &key && !client_key.starts_with(&prefix));
+    pub async fn set_source_cookie(&self, user_ns: &str, source_url: &str, cookie: &str) -> Result<(), AppError> {
+        let context = self.http.source_context(user_ns, source_url, None).map_err(AppError::Internal)?;
+        let url = url::Url::parse(source_url).map_err(|_| AppError::BadRequest("书源地址无效".to_string()))?;
+        context.session.cookies.replace(&url, cookie).map_err(AppError::Internal)?;
+        Ok(())
     }
 
     pub async fn clear_source_cookie(&self, user_ns: &str, source_url: &str) {
-        let key = Self::source_cookie_key(user_ns, source_url);
-        self.source_cookies.write().await.remove(&key);
-        let prefix = format!("{key}::proxy=");
-        self.source_clients
-            .write()
-            .await
-            .retain(|client_key, _| client_key != &key && !client_key.starts_with(&prefix));
+        if let Ok(context) = self.http.source_context(user_ns, source_url, None) {
+            let _ = context.session.cookies.clear();
+            let _ = context.session.put("loginHeader", None);
+        }
         let source_url = normalize_source_url(source_url);
-        self.login_sessions
-            .write()
-            .await
-            .retain(|_, session| session.source_url != source_url);
+        self.login_sessions.write().await.retain(|_, session| session.source_url != source_url);
     }
 
-    /// 批量清理多个书源的登录 Cookie / 客户端 / 登录会话。
-    ///
-    /// 与逐条 `clear_source_cookie` 等价, 但三把锁各只取一次: 删几百个失效源时,
-    /// 逐条调用是 3N 次写锁竞争(每把锁还要 `retain` 整表), 明显拖慢删除。
-    /// 这里先把要清的前缀算好, 再各锁一次批量 `retain`。
     pub async fn clear_source_cookies(&self, user_ns: &str, source_urls: &[String]) {
-        if source_urls.is_empty() {
-            return;
-        }
-        // key 与 `::proxy=` 前缀成对收集: 客户端缓存键形如 `{key}::proxy={proxy}`。
-        let entries = source_urls
-            .iter()
-            .map(|url| {
-                let key = Self::source_cookie_key(user_ns, url);
-                let prefix = format!("{key}::proxy=");
-                (key, prefix)
-            })
-            .collect::<Vec<_>>();
-
-        {
-            let mut cookies = self.source_cookies.write().await;
-            for (key, _) in &entries {
-                cookies.remove(key);
-            }
-        }
-        {
-            let mut clients = self.source_clients.write().await;
-            clients.retain(|client_key, _| {
-                !entries
-                    .iter()
-                    .any(|(key, prefix)| client_key == key || client_key.starts_with(prefix))
-            });
-        }
-        {
-            // 登录会话记录的是规范化后的 url, 比较前同样要规范化。
-            let normalized = source_urls
-                .iter()
-                .map(|url| normalize_source_url(url))
-                .collect::<std::collections::HashSet<_>>();
-            let mut sessions = self.login_sessions.write().await;
-            sessions.retain(|_, session| !normalized.contains(&session.source_url));
-        }
+        for url in source_urls { self.clear_source_cookie(user_ns, url).await; }
     }
 
-    /// Validate a candidate login cookie before storing it: run one search
-    /// request with the cookie attached and make sure the site still returns
-    /// a normal page (Qidian returns a degraded/anti-crawler page — e.g. the
-    /// `var buid` verification shell — when a stale or wrong cookie is sent,
-    /// which would otherwise poison every later search of this source).
+    /// Validate in an isolated session. A search without matches cannot tell
+    /// whether the candidate cookie is valid; only an explicit login check can.
     pub async fn validate_source_cookie(
-        &self,
-        // 校验是一次性动作, 校验请求自己带 cookie, 不需要按用户取存量值
-        _user_ns: &str,
-        source: &BookSource,
-        cookie: &str,
-        keyword: &str,
-    ) -> Result<(), AppError> {
-        let search_url = source
-            .search_url
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("书源未配置 searchUrl，无法校验 Cookie".to_string()))?;
-        let mut spec = analyze_url(&search_url, keyword, 1, &source.book_source_url, source)
-            .map_err(|e| AppError::BadRequest(e.to_string()))?;
-        // 单次校验请求只携带待验证的 cookie, 不带旧 cookie, 避免旧值干扰判断
+        &self, user_ns: &str, source: &BookSource, cookie: &str, keyword: &str,
+    ) -> Result<bool, AppError> {
+        let candidate_http = HttpClient::new(30, self.http.active_proxy()).map_err(AppError::Internal)?;
+        let context = candidate_http.source_context(&format!("cookie-check-{}", uuid::Uuid::new_v4()), &source.book_source_url, None).map_err(AppError::Internal)?;
+        let url = url::Url::parse(&source.book_source_url).map_err(|_| AppError::BadRequest("书源地址无效".into()))?;
+        context.session.cookies.set(&url, cookie).map_err(AppError::Internal)?;
+        let current = self.http.source_context(user_ns, &source.book_source_url, None).map_err(AppError::Internal)?;
+        for key in ["variable", "loginInfo"] {
+            if let Some(value) = current.session.get(key) { context.session.put(key, Some(&value)).map_err(AppError::Internal)?; }
+        }
+        let Some(rule) = source.search_url.as_ref().filter(|v| !v.trim().is_empty()).cloned() else { return Ok(false) };
+        let source_copy = source.clone();
+        let keyword = keyword.to_string();
+        let analyze_context = context.clone();
+        let mut spec = tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(analyze_context, || {
+            analyze_url(&rule, &keyword, 1, &source_copy.book_source_url, &source_copy)
+        })).await.map_err(|err| AppError::Internal(err.into()))??;
         spec.headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
-        spec.headers.push(("Cookie".to_string(), cookie.trim().to_string()));
-
-        // Cookie validation must not reuse the source's persistent reqwest
-        // client: its cookie jar may contain an older session and make an
-        // invalid candidate appear valid. Use a fresh client for this request.
+        spec.headers.push(("Cookie".into(), cookie.trim().to_string()));
+        let client = if let Some(proxy) = spec.proxy.as_deref() {
+            crate::crawler::http_client::build_source_client(context.timeout_secs, Some(proxy), context.session.cookies.clone()).map_err(AppError::Internal)?
+        } else { context.client.clone() };
         let holds_slot = self.wait_for_rate(source).await;
-        let client = match self.http.new_client_with_proxy(spec.proxy.as_deref()) {
-            Ok(client) => client,
-            Err(err) => {
-                // 同 fetch_with_rate_cancellable: 提前返回必须归还 slot,
-                // 否则该源会永久停在 in_flight。
-                if holds_slot {
-                    self.finish_rate(source).await;
-                }
-                return Err(AppError::Internal(err));
-            }
-        };
         let result = fetch_with_client(&client, spec).await;
-        if holds_slot {
-            self.finish_rate(source).await;
-        }
+        if holds_slot { self.finish_rate(source).await; }
         let res = result.map_err(AppError::Internal)?;
-        let body = res.body;
-
-        // 反爬/降级页面在站内跳转前后都不可靠, 直接按内容特征判断
-        let body_lower = body.to_lowercase();
-        if res.status == 202
-            || body_lower.contains("var buid")
-            || body_lower.contains("验证")
-            || body_lower.contains("安全校验")
-            || body_lower.contains("<title>403")
-            || body_lower.contains("access denied")
-        {
-            return Err(AppError::BadRequest(format!(
-                "Cookie 无效或已过期(站点返回 {}，疑似被反爬拦截)。请更换抓包 Cookie 后重试",
-                res.status
-            )));
+        if !res.is_successful || res.status == 202 || res.body.contains("var buid") {
+            return Err(AppError::BadRequest(format!("站点未接受验证请求（HTTP {}），请检查网页登录状态", res.status)));
         }
-
-        // 正常搜索页: 用规则解析一次, 拿不到书就说明页面结构已变, 同样拒绝
-        let books = self.parser.search_books(source, &body, &res.url);
-        if books.is_empty() {
-            return Err(AppError::BadRequest(
-                "Cookie 校验失败: 搜索页未返回任何结果, 请确认 Cookie 有效".to_string(),
-            ));
-        }
-
-        Ok(())
+        if source.login_check_js.as_deref().unwrap_or("").trim().is_empty() { return Ok(false); }
+        let source_copy = source.clone();
+        tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(context, || apply_login_check_js(&source_copy, res)))
+            .await.map_err(|err| AppError::Internal(err.into()))??;
+        Ok(true)
     }
 
     async fn fetch_source_url(
@@ -672,11 +673,9 @@ impl BookService {
         base_url: &str,
         key: &str,
     ) -> Result<FetchResponse, AppError> {
-        let mut spec = analyze_url(url_rule, key, 1, base_url, source)?;
-        self.apply_source_cookie(user_ns, source, &mut spec.headers)
-            .await;
+        let spec = self.analyze_request(user_ns, source, url_rule, key, 1, base_url).await?;
         let res = self.fetch_with_rate(user_ns, source, spec).await?;
-        Ok(apply_login_check_js(source, res))
+        self.check_source_response(user_ns, source, res).await
     }
 
     async fn fetch_with_rate(
@@ -738,11 +737,10 @@ impl BookService {
             }
             return Err(anyhow::anyhow!(CANCELLED_ERR));
         }
-        let request_client = match self
-            .source_http_client(user_ns, &source.book_source_url, spec.proxy.as_deref())
-            .await
+        let request_context = match self.http
+            .source_context(user_ns, &source.book_source_url, spec.proxy.as_deref())
         {
-            Ok(client) => client,
+            Ok(context) => context,
             Err(err) => {
                 // 必须归还 in_flight: 用 `?` 直接返回会让这个源永久停在
                 // in_flight, 之后所有请求都在 wait_for_serial_rate 里死等。
@@ -757,7 +755,7 @@ impl BookService {
             Some(flag) => {
                 // 100ms 轮询而不是"监听一次": 取消标志是 AtomicBool, 没有可等待的
                 // 唤醒机制, 用间隔轮询即可 —— 取消响应延迟上限就是这 100ms。
-                let fetch = fetch_with_client(&request_client, spec);
+                let fetch = request_context.session.request(&request_context.client, spec, source.concurrent_rate.as_deref());
                 tokio::pin!(fetch);
                 loop {
                     tokio::select! {
@@ -774,7 +772,7 @@ impl BookService {
                     }
                 }
             }
-            None => fetch_with_client(&request_client, spec).await,
+            None => request_context.session.request(&request_context.client, spec, source.concurrent_rate.as_deref()).await,
         };
         if holds_slot {
             self.finish_rate(source).await;
@@ -903,16 +901,14 @@ impl BookService {
             page,
             search_url
         );
-        let mut spec = analyze_url(&search_url, key, page, &source.book_source_url, source)
+        let spec = self.analyze_request(user_ns, source, &search_url, key, page, &source.book_source_url).await
             .map_err(|e| {
                 tracing::error!("analyze_url failed: {:?}", e);
                 e
             })?;
 
-        self.apply_source_cookie(user_ns, source, &mut spec.headers)
-            .await;
 
-        tracing::debug!("search_book fetched spec: {:?}", spec);
+        tracing::debug!("search request prepared");
         let res = self
             .fetch_with_rate_cancellable(user_ns, source, spec, cancel)
             .await
@@ -920,11 +916,16 @@ impl BookService {
                 tracing::error!("fetch failed: {:?}", e);
                 e
             })?;
-        let res = apply_login_check_js(source, res);
+        let res = self.check_source_response(user_ns, source, res).await?;
         tracing::debug!("fetch success, body length: {}", res.body.len());
         let books = self
-            .parse_search_books_blocking(source, &res.body, &res.url)
-            .await;
+            .parse_search_books_blocking(user_ns, source, &res.body, &res.url, key, page)
+            .await?;
+        if books.is_empty() && !res.is_successful {
+            return Err(AppError::BadRequest(format!(
+                "书源搜索请求失败（HTTP {}），请检查站点访问状态或网络设置", res.status
+            )));
+        }
         tracing::info!("found {} books", books.len());
         Ok(books)
     }
@@ -937,39 +938,30 @@ impl BookService {
     /// 把一个完全正常的源标坏。原实现里 `parser.search_books` 是同步调用, panic 会
     /// 直接终止该检测任务(不产生 outcome、不写库), 这里用 `resume_unwind` 保持同一
     /// 行为 —— `spawn_blocking` 只是把 panic 包成了 `JoinError`, 并非真的"没有结果"。
-    async fn parse_search_books_blocking(
-        &self,
-        source: &BookSource,
-        body: &str,
-        url: &str,
-    ) -> Vec<SearchBook> {
-        let parser = self.parser.clone();
-        let source = source.clone();
-        let body = body.to_string();
-        let url = url.to_string();
-        match tokio::task::spawn_blocking(move || parser.search_books(&source, &body, &url)).await {
-            Ok(books) => books,
-            // 任务被 abort(取消)不是解析崩溃, 安静返回空结果 —— 调用方紧接着会用
-            // 取消标志判定为"未检测", 不会据此标失效。
-            Err(err) if err.is_cancelled() => Vec::new(),
-            Err(err) => std::panic::resume_unwind(err.into_panic()),
-        }
+    async fn parse_search_books_blocking(&self, user_ns: &str, source: &BookSource, body: &str, url: &str, key: &str, page: i32) -> Result<Vec<SearchBook>, AppError> {
+        self.parse_book_list_blocking(user_ns, source, body, url, false, key.to_string(), page).await
     }
 
-    /// 发现页解析的阻塞版本(同 `parse_search_books_blocking` 的理由)。
-    async fn parse_explore_books_blocking(
-        &self,
-        source: &BookSource,
-        body: &str,
-        url: &str,
-    ) -> Vec<SearchBook> {
+    async fn parse_explore_books_blocking(&self, user_ns: &str, source: &BookSource, body: &str, url: &str, page: i32) -> Result<Vec<SearchBook>, AppError> {
+        self.parse_book_list_blocking(user_ns, source, body, url, true, String::new(), page).await
+    }
+
+    async fn parse_book_list_blocking(&self, user_ns: &str, source: &BookSource, body: &str, url: &str, explore: bool, key: String, page: i32) -> Result<Vec<SearchBook>, AppError> {
+        let context = self.http.source_context(user_ns, &source.book_source_url, None).map_err(AppError::Internal)?;
         let parser = self.parser.clone();
-        let source = source.clone();
-        let body = body.to_string();
-        let url = url.to_string();
-        match tokio::task::spawn_blocking(move || parser.explore_books(&source, &body, &url)).await {
-            Ok(books) => books,
-            Err(err) if err.is_cancelled() => Vec::new(),
+        let (source, body, url) = (source.clone(), body.to_string(), url.to_string());
+        match tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(context, || {
+            take_js_logs();
+            let books = crate::parser::js::with_search_context(&key, page, || if explore { parser.explore_books(&source, &body, &url) } else { parser.search_books(&source, &body, &url) });
+            (books, take_js_logs())
+        })).await {
+            Ok((books, logs)) => {
+                if books.is_empty() {
+                    if let Some(error) = first_js_error(&logs) { return Err(AppError::BadRequest(format!("书源解析失败: {error}"))); }
+                }
+                Ok(books)
+            }
+            Err(err) if err.is_cancelled() => Ok(Vec::new()),
             Err(err) => std::panic::resume_unwind(err.into_panic()),
         }
     }
@@ -1000,23 +992,16 @@ impl BookService {
         if rule_find_url.trim().is_empty() {
             return Err(AppError::BadRequest("ruleFindUrl required".to_string()));
         }
-        let mut spec = analyze_url(rule_find_url, "", page, &source.book_source_url, source)?;
+        let spec = self.analyze_request(user_ns, source, rule_find_url, "", page, &source.book_source_url).await?;
 
-        self.apply_source_cookie(user_ns, source, &mut spec.headers)
-            .await;
 
-        let res = apply_login_check_js(
-            source,
-            self.fetch_with_rate_cancellable(user_ns, source, spec, cancel)
-                .await?,
-        );
-        Ok(self
-            .parse_explore_books_blocking(source, &res.body, &res.url)
-            .await)
+        let res = self.fetch_with_rate_cancellable(user_ns, source, spec, cancel).await?;
+        let res = self.check_source_response(user_ns, source, res).await?;
+        self.parse_explore_books_blocking(user_ns, source, &res.body, &res.url, page).await
     }
 
     pub fn explore_kinds(&self, source: &BookSource) -> Result<Vec<ExploreKind>, AppError> {
-        parse_explore_kinds(source)
+        self.source_scope("default", source, || parse_explore_kinds(source))?
     }
 
     pub async fn test_book_source_availability(
@@ -1146,7 +1131,7 @@ impl BookService {
                 let res = self
                     .fetch_source_url(user_ns, source, &search_url, &source.book_source_url, &kw)
                     .await?;
-                let books = self.parser.search_books(source, &res.body, &res.url);
+                let books = self.parse_search_books_blocking(user_ns, source, &res.body, &res.url, &kw, 1).await?;
                 Ok(debug_trace_from(
                     &res,
                     serde_json::to_value(books).unwrap_or_default(),
@@ -1168,7 +1153,7 @@ impl BookService {
                 let res = self
                     .fetch_source_url(user_ns, source, &url, &source.book_source_url, "")
                     .await?;
-                let info = self.parser.book_info(source, &res.body, &res.url, &url);
+                let info = self.parse_info_page(user_ns, source, &res, &url).await?;
                 Ok(debug_trace_from(
                     &res,
                     serde_json::to_value(info).unwrap_or_default(),
@@ -1183,7 +1168,7 @@ impl BookService {
                     .fetch_source_url(user_ns, source, toc_url, &source.book_source_url, "")
                     .await?;
                 let (chapters, _next_urls) =
-                    self.parser.chapter_list(source, &res.body, &res.url, Some(toc_url));
+                    self.parse_toc_page(user_ns, source, &res, toc_url).await?;
                 let mut index = 0i32;
                 let chapters: Vec<BookChapter> = chapters
                     .into_iter()
@@ -1207,8 +1192,8 @@ impl BookService {
                     .fetch_source_url(user_ns, source, url, &source.book_source_url, "")
                     .await?;
                 let (content, js_logs) =
-                    self.parse_content_blocking(source, &res, url, None).await?;
-                let next = self.parser.next_content_url(source, &res.body, &res.url);
+                    self.parse_content_blocking(user_ns, source, &res, url, None).await?;
+                let next = self.source_scope(user_ns, source, || self.parser.next_content_url(source, &res.body, &res.url))?;
                 Ok(debug_trace_from(
                     &res,
                     serde_json::json!({
@@ -1222,39 +1207,20 @@ impl BookService {
         }
     }
 
-    pub async fn login_book_source(
-        &self,
-        source: &BookSource,
-    ) -> Result<serde_json::Value, AppError> {
-        let login_url = source
-            .login_url
-            .clone()
-            .filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| AppError::BadRequest("missing loginUrl".to_string()))?;
+    pub async fn login_book_source(&self, source: &BookSource) -> Result<serde_json::Value, AppError> {
+        self.run_source_login(source, None, None).await
+    }
 
-        let spec = analyze_url(&login_url, "", 1, &source.book_source_url, source)?;
+    pub async fn run_source_login(&self, source: &BookSource, action: Option<String>, values: Option<serde_json::Map<String, serde_json::Value>>) -> Result<serde_json::Value, AppError> {
+        self.run_source_login_with_browser(source, action, values, None).await
+    }
 
-        let res = self.fetch_with_rate("default", source, spec).await?;
-        let check_result = if let Some(login_check_js) = source
-            .login_check_js
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-        {
-            Some(with_source(source,|| {
-                eval_js(login_check_js, &res.body, &res.url).unwrap_or_default()
-            }))
-        } else {
-            None
-        };
-
-        Ok(serde_json::json!({
-            "success": true,
-            "status": res.status,
-            "url": res.url,
-            "checkResult": check_result,
-            "bodyPreview": res.body.chars().take(500).collect::<String>(),
-            "bodyHtml": res.body
-        }))
+    pub async fn run_source_login_with_browser(&self, source: &BookSource, action: Option<String>, values: Option<serde_json::Map<String, serde_json::Value>>, handler: Option<crate::service::source_browser::BrowserHandler>) -> Result<serde_json::Value, AppError> {
+        self.run_source_task("default", source, move |source| {
+            crate::service::source_browser::with_browser_handler(source, handler, || {
+                crate::service::source_login::run(source, action.as_deref(), values)
+            })?
+        }).await?.map_err(AppError::Internal)
     }
 
     pub async fn get_book_info(
@@ -1266,7 +1232,7 @@ impl BookService {
         let res = self
             .fetch_source_url(user_ns, source, book_url, &source.book_source_url, "")
             .await?;
-        Ok(self.parser.book_info(source, &res.body, &res.url, book_url))
+        self.parse_info_page(user_ns, source, &res, book_url).await
     }
 
     pub async fn get_chapter_list(
@@ -1315,7 +1281,7 @@ impl BookService {
             .fetch_source_url(user_ns, source, toc_url, &source.book_source_url, "")
             .await?;
         let (chapters, next_urls) =
-            self.parser.chapter_list(source, &res.body, &res.url, Some(toc_url));
+            self.parse_toc_page(user_ns, source, &res, toc_url).await?;
         tracing::info!(
             "get_chapter_list_first_page: toc_url={} final_url={} body_len={} chapters={} next_urls={}",
             toc_url,
@@ -1410,12 +1376,7 @@ impl BookService {
                         "",
                     )
                     .await?;
-                let (chapters, _) = self.parser.chapter_list(
-                    &pagination.source,
-                    &res.body,
-                    &res.url,
-                    Some(&pagination.toc_url),
-                );
+                let (chapters, _) = self.parse_toc_page(&pagination.user_ns, &pagination.source, &res, &pagination.toc_url).await?;
 
                 // Check if this page is a duplicate (all chapters already seen)
                 // This handles cases where the first page URL differs from toc_url (e.g., different domain)
@@ -1460,12 +1421,7 @@ impl BookService {
                         "",
                     )
                     .await?;
-                let (chapters, next_urls) = self.parser.chapter_list(
-                    &pagination.source,
-                    &res.body,
-                    &res.url,
-                    Some(&pagination.toc_url),
-                );
+                let (chapters, next_urls) = self.parse_toc_page(&pagination.user_ns, &pagination.source, &res, &pagination.toc_url).await?;
 
                 // Check if this page is a duplicate
                 let all_seen = chapters
@@ -1521,7 +1477,7 @@ impl BookService {
             .fetch_source_url(user_ns, source, toc_url, &source.book_source_url, "")
             .await?;
         let (chapters, next_urls) =
-            self.parser.chapter_list(source, &res.body, &res.url, Some(toc_url));
+            self.parse_toc_page(user_ns, source, &res, toc_url).await?;
 
         visited_page_urls.insert(toc_url.to_string());
 
@@ -1558,9 +1514,7 @@ impl BookService {
                 let res = self
                     .fetch_source_url(user_ns, source, &url, &source.book_source_url, "")
                     .await?;
-                let (chapters, _) = self
-                    .parser
-                    .chapter_list(source, &res.body, &res.url, Some(toc_url));
+                let (chapters, _) = self.parse_toc_page(user_ns, source, &res, toc_url).await?;
 
                 for ch in chapters {
                     if seen_chapter_urls.contains(&ch.url) {
@@ -1588,9 +1542,7 @@ impl BookService {
                 let res = self
                     .fetch_source_url(user_ns, source, &current_url, &source.book_source_url, "")
                     .await?;
-                let (chapters, next_urls) = self
-                    .parser
-                    .chapter_list(source, &res.body, &res.url, Some(toc_url));
+                let (chapters, next_urls) = self.parse_toc_page(user_ns, source, &res, toc_url).await?;
 
                 for ch in chapters {
                     if seen_chapter_urls.contains(&ch.url) {
@@ -1627,38 +1579,32 @@ impl BookService {
         book_url: &str,
         chapter_url: &str,
     ) -> Option<JsBookContext> {
-        let book = self.get_shelf_book(user_ns, book_url).await.ok().flatten();
+        let book = self.read_bookshelf(user_ns).await.ok().and_then(|books| {
+            books.into_iter().find(|book| {
+                book.book_url == book_url || book.toc_url.as_deref() == Some(book_url)
+            })
+        });
         let toc_url = book
             .as_ref()
             .and_then(|b| b.toc_url.clone())
             .filter(|u| !u.is_empty())
             .unwrap_or_else(|| book_url.to_string());
-        let chapter = self
-            .load_chapter_list_cache(user_ns, &toc_url)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|list| list.into_iter().find(|ch| ch.url == chapter_url));
+        let chapter = if chapter_url.is_empty() {
+            None
+        } else {
+            self.load_chapter_list_cache(user_ns, &toc_url)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|list| list.into_iter().find(|ch| ch.url == chapter_url))
+        };
         let book_json = match book {
-            Some(b) => json!({
-                "name": b.name,
-                "author": b.author,
-                "bookUrl": b.book_url,
-                "tocUrl": b.toc_url,
-                "origin": b.origin,
-                "originName": b.origin_name,
-                "coverUrl": b.cover_url,
-                "intro": b.intro,
-                "kind": b.kind,
-                "wordCount": b.word_count,
-                "durChapterIndex": b.dur_chapter_index,
-                "durChapterTitle": b.dur_chapter_title,
-                "totalChapterNum": b.total_chapter_num,
-            }),
+            Some(book) => serde_json::to_value(book).unwrap_or_else(|_| json!({ "bookUrl": book_url })),
             None => json!({ "bookUrl": book_url }),
         };
         let chapter_json = match chapter {
             Some(ch) => serde_json::to_value(ch).unwrap_or_else(|_| json!({})),
+            None if chapter_url.is_empty() => json!({}),
             None => json!({ "url": chapter_url }),
         };
         Some(JsBookContext {
@@ -1679,6 +1625,7 @@ impl BookService {
         script: &str,
         result: &str,
     ) -> Result<(String, Vec<String>, Option<ShowBrowserRequest>), AppError> {
+        let context = self.http.source_context(user_ns, &source.book_source_url, None).map_err(AppError::Internal)?;
         let book_ctx = self.js_book_context(user_ns, book_url, chapter_url).await;
         // 面板登记需要原始 JSON(面板脚本 `writeConfig(chapter, ...)` 依赖这两个绑定)
         let (book_json, chapter_json) = book_ctx
@@ -1695,27 +1642,26 @@ impl BookService {
             take_js_logs();
             clear_show_browser_request();
             let base_url = chapter_url.clone();
-            let output = with_book_context(book_ctx, || {
+            let output = crate::parser::js::with_http_context(context, || with_book_context(book_ctx, || {
                 with_source(&source, || {
                     with_source_key(Some(&source_key), || {
                         crate::parser::js::eval_js(&script, &result_text, &base_url)
                     })
                 })
-            });
+            }));
             let logs = take_js_logs();
             // 面板 HTML 由后端托管: 前端按 panelId 加载, 面板内的桥才能同源回调宿主
-            let browser = take_show_browser_request().map(|mut req| {
-                req.panel_id = Some(register_source_panel(SourcePanelEntry {
-                    url: req.url.clone(),
-                    html: req.html.clone().unwrap_or_default(),
+            let browser = take_show_browser_request().map(|req| {
+                crate::service::source_browser::register_browser_request(req, SourcePanelEntry {
                     book_source_url: source.book_source_url.clone(),
                     book_url: source_key.clone(),
                     chapter_url: base_url.clone(),
                     book_json: book_json.clone(),
                     chapter_json: chapter_json.clone(),
-                }));
-                req
-            });
+                    http: crate::parser::js::source_http_context(&source.book_source_url).ok(),
+                    ..Default::default()
+                })
+            }).transpose().map_err(AppError::Internal)?;
             output
                 .map(|value| (value, logs, browser))
                 .map_err(|e| AppError::Internal(anyhow::anyhow!("执行 click 脚本失败: {e}")))
@@ -1728,11 +1674,13 @@ impl BookService {
     /// 返回 (正文, 本次解析产生的 JS 日志)。
     async fn parse_content_blocking(
         &self,
+        user_ns: &str,
         source: &BookSource,
         res: &FetchResponse,
         source_key: &str,
         book_ctx: Option<JsBookContext>,
     ) -> Result<(String, Vec<String>), AppError> {
+        let context = self.http.source_context(user_ns, &source.book_source_url, None).map_err(AppError::Internal)?;
         let parser = self.parser.clone();
         let source = source.clone();
         let body = res.body.clone();
@@ -1740,13 +1688,25 @@ impl BookService {
         let source_key = source_key.to_string();
         tokio::task::spawn_blocking(move || {
             take_js_logs();
-            let content = with_book_context(book_ctx, || {
+            let content = crate::parser::js::with_http_context(context, || with_book_context(book_ctx, || {
                 parser.content(&source, &body, &url, Some(&source_key))
-            });
-            (content, take_js_logs())
+            }));
+            let logs = take_js_logs();
+            if content.is_empty() {
+                // 优先展示书源脚本自己的提示(如"本书源为VIP专属内容，开通VIP后可阅读"),
+                // 它比"正文解析为空"更能告诉用户发生了什么。
+                if let Some(message) = first_js_message(&logs) {
+                    return Err(AppError::BadRequest(message));
+                }
+                if let Some(error) = first_js_error(&logs) {
+                    return Err(AppError::BadRequest(format!("正文解析失败: {error}")));
+                }
+                return Err(AppError::BadRequest("书源正文解析为空，请检查正文规则".to_string()));
+            }
+            Ok((content, logs))
         })
         .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("正文解析任务失败: {e}")))
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("正文解析任务失败: {e}")))?
     }
 
     pub async fn get_content(
@@ -1762,7 +1722,8 @@ impl BookService {
 
     /// 与 `get_content` 相同, 但把加载阶段回调出去, 供前端显示"卡在哪一步"。
     ///
-    /// `skip_js_lib` 为 true 时**不加载书源脚本**(jsLib): 正文规则里的插件调用
+    /// `skip_js_lib` 为 true 时跳过选择器规则的可选脚本；纯 JS 正文仍保留必需的库。
+    /// 正文规则里的插件调用
     /// (如 `addComment(result)`) 会因函数不存在而失败, 从而回退到选择器提取结果
     /// —— 也就是纯正文。离线缓存只需要正文, 没必要为每章付出脚本解析与段评请求
     /// 的代价。
@@ -1806,8 +1767,11 @@ impl BookService {
         let mut visited_urls = std::collections::HashSet::new();
         let mut current_url = chapter_url.to_string();
         let book_ctx = self.js_book_context(user_ns, book_url, chapter_url).await;
-        // 只缓存正文时用一份不带 jsLib 的书源副本(见 `skip_js_lib` 的说明)
-        let stripped_source: Option<BookSource> = skip_js_lib
+        // Pure JS rules require their library to obtain/decode the content.
+        // Selector-based rules can still skip optional presentation helpers.
+        let content_rule = source.rule_content.as_ref().and_then(|rule| rule.content.as_deref()).unwrap_or("").trim_start();
+        let requires_library = ["@js:", "js:", "<js>"].iter().any(|prefix| content_rule.starts_with(prefix));
+        let stripped_source: Option<BookSource> = (skip_js_lib && !requires_library)
             .then(|| BookSource { js_lib: None, ..source.clone() });
         let parse_source = stripped_source.as_ref().unwrap_or(source);
 
@@ -1838,9 +1802,23 @@ impl BookService {
             tracing::debug!("get_content fetch done, body len={}", res.body.len());
             // 正文规则里往往会触发书源脚本与段评请求, 这是最耗时的一步
             notify(ContentLoadStage::Parsing);
-            let (content, _logs) = self
-                .parse_content_blocking(parse_source, &res, book_url, book_ctx.clone())
-                .await?;
+            let (content, _logs) = match self
+                .parse_content_blocking(user_ns, parse_source, &res, book_url, book_ctx.clone())
+                .await
+            {
+                Ok(parsed) => parsed,
+                // 解析失败(如书源提示 VIP 专属、正文规则为空)时:
+                // 有缓存就用缓存保证可读, 否则把书源的真实提示抛给用户。
+                Err(err) => {
+                    match cached.clone() {
+                        Some(hit) if !hit.trim().is_empty() => {
+                            tracing::debug!("get_content parse failed, falling back to cache: {err:?}");
+                            return Ok(hit);
+                        }
+                        _ => return Err(err),
+                    }
+                }
+            };
             tracing::debug!("get_content parsed content len={}", content.len());
 
             if !content.is_empty() {
@@ -1851,7 +1829,7 @@ impl BookService {
             }
 
             // Check for next page
-            if let Some(next_url) = self.parser.next_content_url(source, &res.body, &res.url) {
+            if let Some(next_url) = self.source_scope(user_ns, source, || self.parser.next_content_url(source, &res.body, &res.url))? {
                 tracing::debug!("get_content found next_url: {}", next_url);
                 if should_follow_content_page(chapter_url, &current_url, &next_url) {
                     current_url = next_url;
@@ -1999,6 +1977,7 @@ impl BookService {
             book.intro = None;
         }
 
+        apply_book_read_config_override(&mut book);
         let _write_guard = self.bookshelf_write_lock.lock().await;
         let mut list = self.read_bookshelf(user_ns).await?;
         let mut exist_idx: Option<usize> = None;
@@ -2011,6 +1990,7 @@ impl BookService {
 
         if let Some(i) = exist_idx {
             let exist = list[i].clone();
+            merge_book_read_config(&exist, &mut book);
             merge_book_source_candidates(&exist, &mut book);
             if book.dur_chapter_index.is_none() {
                 book.dur_chapter_index = exist.dur_chapter_index;
@@ -2066,6 +2046,7 @@ impl BookService {
             if book.book_url.trim().is_empty() {
                 return Err(AppError::BadRequest("bookUrl required".to_string()));
             }
+            apply_book_read_config_override(&mut book);
             normalized.push(book);
         }
         self.write_bookshelf(user_ns, &normalized).await?;
@@ -2412,7 +2393,9 @@ impl BookService {
             .join("data")
             .join(user_ns)
             .join("book_sources")
-            .join(format!("{}.json", name))
+            // Earlier caches merged aggregate stations by origin and could omit
+            // completed results. Rebuild once under the complete-list format.
+            .join(format!("{}.v2.json", name))
     }
 
     fn bookshelf_path(&self, user_ns: &str) -> PathBuf {
@@ -2447,6 +2430,7 @@ impl BookService {
         };
         for book in &mut list {
             sanitize_book_urls(book);
+            apply_book_read_config_override(book);
         }
         Ok(list)
     }
@@ -2468,11 +2452,23 @@ impl BookService {
     // Chapter list cache methods
     fn chapter_list_cache_path(&self, user_ns: &str, toc_url: &str) -> PathBuf {
         let name = md5_hex(toc_url);
+        // The aggregate catalog embeds chapter payloads and review scripts in
+        // data URLs. Older java.put/get and getCookie implementations could
+        // cache incomplete URLs, so rebuild only this protocol's catalogs once.
+        // Content files stay available as offline fallbacks.
+        let (url, options) = split_url_options(toc_url);
+        let aggregate_catalog = url.starts_with("data:")
+            && options
+                .and_then(|options| serde_json::from_str::<serde_json::Value>(options).ok())
+                .is_some_and(|options| {
+                    options.get("type").and_then(|value| value.as_str()) == Some("gycatalog")
+                });
+        let revision = if aggregate_catalog { "v3" } else { "v2" };
         self.storage_dir
             .join("data")
             .join(user_ns)
             .join("chapters")
-            .join(format!("{}.json", name))
+            .join(format!("{name}.{revision}.json"))
     }
 
     pub async fn load_chapter_list_cache(
@@ -2566,44 +2562,114 @@ impl BookService {
     }
 }
 
-fn apply_login_check_js(source: &BookSource, res: FetchResponse) -> FetchResponse {
+/// 取日志里第一条可用于诊断的脚本错误。
+///
+/// `[正文 JS]` / `[目录 JS]` 这类**规则级**前缀必须包含在内: 书源脚本抛出的
+/// 业务提示(如"本书源为VIP专属内容")正是通过它们传出来的, 漏掉会让正文
+/// 解析失败退化成静默的空串。
+fn first_js_error(logs: &[String]) -> Option<&str> {
+    logs.iter()
+        .find(|line| {
+            ["[脚本]", "[jsLib]", "[http]", "[正文 JS]", "[目录 JS]", "[详情 JS]"]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .map(String::as_str)
+}
+
+/// 从日志里提取脚本抛出的**用户可读提示**（去掉 `[xxx JS] JS 异常:` 一类的
+/// 内部前缀），供界面直接展示。
+fn first_js_message(logs: &[String]) -> Option<String> {
+    let raw = first_js_error(logs)?;
+    let text = raw
+        .split_once("JS 异常:")
+        .map(|(_, rest)| rest)
+        .unwrap_or(raw)
+        .trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// 执行 `loginCheckJs`。语义与 legado 一致: 脚本的返回值即"处理后的响应"
+/// (返回 `result` 表示放行, 返回新响应对象表示替换)。脚本里的
+/// `source.login()` 会被记录, 由调用方用已存登录信息重跑登录。
+/// 返回 `(响应, 是否请求了重新登录)`。
+fn apply_login_check_js(source: &BookSource, res: FetchResponse) -> Result<(FetchResponse, bool), AppError> {
     let Some(script) = source
         .login_check_js
         .as_deref()
         .filter(|script| !script.trim().is_empty())
     else {
-        return res;
+        return Ok((res, false));
     };
 
-    with_source(source,|| {
+    with_source(source, || {
+        crate::parser::js::take_login_effects();
         let str_response = StrResponse::from(res.clone());
+        let response_json = serde_json::to_value(&str_response).unwrap_or_else(|_| json!({}));
+        // legado: loginCheckJs 里 `java.getStrResponse()` 返回当前响应。
+        crate::parser::js::set_last_response(&response_json.to_string());
         let mut bindings = HashMap::new();
-        bindings.insert(
-            "result".to_string(),
-            serde_json::to_value(&str_response).unwrap_or_else(|_| json!({})),
-        );
+        // legado 的 `result` 是 StrResponse 对象: 脚本按方法调用
+        // (`result.code()`/`result.body()`), 必须用 Resp() 包装。
+        bindings.insert("result".to_string(), crate::parser::js::resp_binding(&response_json));
+        let login_requested = |()| crate::parser::js::take_login_effects().login;
         match eval_js_with_bindings(script, &res.body, &res.url, &bindings) {
             Ok(output) if !output.trim().is_empty() => {
-                if let Ok(next) = serde_json::from_str::<StrResponse>(&output) {
-                    FetchResponse::from(next)
+                // 识别"替换响应"：带宿主信封标记，或含可辨识的响应字段
+                // (code/url/headers/isSuccessful)。纯书源数据(如详情 JSON)
+                // 不能被当信封 —— 否则会把正常正文替换成空响应(HTTP 0)，
+                // 表现为"目录没有了但也不报错"。
+                if let Some(next) = parse_resp_envelope(&output) {
+                    Ok((FetchResponse::from(next), login_requested(())))
                 } else {
-                    FetchResponse {
-                        body: output,
-                        ..res
-                    }
+                    Ok((
+                        FetchResponse {
+                            body: output,
+                            ..res
+                        },
+                        login_requested(()),
+                    ))
                 }
             }
-            Ok(_) => res,
+            Ok(_) => Ok((res, login_requested(()))),
             Err(err) => {
+                // 校验脚本本身出错时不能把整个搜索/详情链路打断:
+                // 绝大多数源在没有会话时只是想让脚本原样放行。
                 tracing::warn!(
                     "loginCheckJs failed for {}: {:?}",
                     source.book_source_name,
                     err
                 );
-                res
+                Ok((res, false))
             }
         }
     })
+}
+
+/// 识别 loginCheckJs 返回的"替换响应"信封。
+///
+/// 判定条件(满足其一):
+/// - 宿主 `Resp` 对象序列化出的信封(带 `__respEnvelope` 标记)
+/// - 显式含 `code` 且是有效 HTTP 状态码(>=100)，同时带 `body`/`url` 之一
+///
+/// 纯书源数据(如详情 JSON `{name,author,bookUrl,...}`)两条都不满足，
+/// 因此不会被误当信封把正常正文替换成空响应。
+fn parse_resp_envelope(output: &str) -> Option<StrResponse> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    let object = value.as_object()?;
+    let marked = object.get("__respEnvelope").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let has_code = object
+        .get("code")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|code| code >= 100);
+    if !marked && !(has_code && (object.contains_key("body") || object.contains_key("url"))) {
+        return None;
+    }
+    serde_json::from_value(value).ok()
 }
 
 fn parse_explore_kinds(source: &BookSource) -> Result<Vec<ExploreKind>, AppError> {
@@ -2887,7 +2953,7 @@ fn merge_source_candidate(candidates: &mut Vec<SearchBook>, candidate: SearchBoo
     let origin = normalize_source_url(&candidate.origin);
     if let Some(index) = candidates
         .iter()
-        .position(|item| normalize_source_url(&item.origin) == origin)
+        .position(|item| normalize_source_url(&item.origin) == origin && item.book_url == candidate.book_url)
     {
         candidates[index] = candidate;
     } else {
@@ -2922,6 +2988,25 @@ fn books_match_for_delete(existing: &Book, target: &Book) -> bool {
         && !target.author.is_empty()
         && existing.name == target.name
         && existing.author == target.author
+}
+
+fn apply_book_read_config_override(book: &mut Book) {
+    if let Some(use_replace_rule) = crate::parser::js::book_read_config_override(&book.origin, &book.book_url)
+        .and_then(|config| config.get("useReplaceRule").and_then(serde_json::Value::as_bool))
+    {
+        book.read_config.get_or_insert_with(Default::default).use_replace_rule = Some(use_replace_rule);
+    }
+}
+
+fn merge_book_read_config(existing: &Book, incoming: &mut Book) {
+    let Some(existing_config) = &existing.read_config else { return; };
+    let config = incoming.read_config.get_or_insert_with(Default::default);
+    if config.use_replace_rule.is_none() {
+        config.use_replace_rule = existing_config.use_replace_rule;
+    }
+    for (key, value) in &existing_config.extra {
+        config.extra.entry(key.clone()).or_insert_with(|| value.clone());
+    }
 }
 
 fn sanitize_book_urls(book: &mut Book) {
@@ -3047,9 +3132,10 @@ mod tests {
 
     #[test]
     fn source_cookie_keys_do_not_share_same_domain_sources() {
-        let first = BookService::source_cookie_key("default", "https://a.example.com");
-        let second = BookService::source_cookie_key("default", "https://b.example.com");
-        assert_ne!(first, second);
+        let http = HttpClient::new(5, None).unwrap();
+        let first = http.source_context("default", "https://a.example.com", None).unwrap();
+        let second = http.source_context("default", "https://b.example.com", None).unwrap();
+        assert!(!Arc::ptr_eq(&first.session.cookies, &second.session.cookies));
     }
 
     #[test]
@@ -3322,6 +3408,22 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert!(candidates.iter().any(|item| item.origin == "https://source-a.test"));
         assert!(candidates.iter().any(|item| item.origin == "https://source-b.test"));
+    }
+
+    #[test]
+    fn merging_books_preserves_multiple_addresses_with_the_same_origin() {
+        let existing = Book {
+            name: "测试书目".to_string(), author: "测试作者".to_string(),
+            book_url: "data:;base64,station-a".to_string(), origin: "聚合测试".to_string(),
+            ..Book::default()
+        };
+        let mut incoming = Book { book_url: "data:;base64,station-b".to_string(), ..existing.clone() };
+        merge_book_source_candidates(&existing, &mut incoming);
+        ensure_current_source_candidate(&mut incoming);
+        let candidates = incoming.source_candidates.unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].book_url, existing.book_url);
+        assert_eq!(candidates[1].book_url, incoming.book_url);
     }
 
     #[tokio::test]

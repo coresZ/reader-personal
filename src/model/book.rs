@@ -2,6 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use super::search::SearchBook;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BookReadConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_replace_rule: Option<bool>,
+    /// Preserve the remaining Legado reading settings during book round trips.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Book {
@@ -13,6 +23,8 @@ pub struct Book {
     pub cover_url: Option<String>,
     pub toc_url: Option<String>,
     pub charset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_config: Option<BookReadConfig>,
     pub custom_cover_url: Option<String>,
     /// 用户自定义书名/作者/简介之前的原始值, 用于「还原」。
     ///

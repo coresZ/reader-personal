@@ -1,6 +1,8 @@
 import { computed, nextTick, ref } from 'vue'
 import type { ComputedRef, Ref } from 'vue'
 import type { useReaderStore } from '../stores/reader'
+import { getReaderTextWidth } from '../utils/readerTextWidth'
+import { parseReaderParagraph } from '../utils/readerParagraphRange'
 
 type ReaderStore = ReturnType<typeof useReaderStore>
 const HORIZONTAL_PAGE_SIDE_PADDING = 24
@@ -42,10 +44,19 @@ export function useHorizontalPaging(
   scrollContainerRef: Ref<HTMLElement | undefined>,
 ) {
   const horizontalPageIndex = ref(0)
+  /** **屏宽**(= 容器宽)。一屏恰好一页, 翻页位移 = 索引 × 屏宽。
+   *  注意这不是行宽: 行宽由「页面宽度」设置在页内单独控制(见 `horizontalTextWidth`)。 */
   const horizontalPageStep = ref(1)
+  /** 一页内正文列的宽度(行宽), 由设置里的「页面宽度」决定。 */
+  const horizontalTextWidth = ref(0)
   const horizontalPageStepStyle = computed(() => `${Math.max(1, horizontalPageStep.value)}px`)
   const horizontalPages = ref<string[]>([])
   const isHorizontalAtEnd = ref(false)
+
+  /** 最后一页的索引。一屏一页, 所以末页索引就是页数 - 1。 */
+  const horizontalLastPageStart = computed(() =>
+    Math.max(0, horizontalPages.value.length - 1),
+  )
 
   function escapeHtml(input: string) {
     return input
@@ -100,24 +111,6 @@ export function useHorizontalPaging(
     return paragraph.outerHTML
   }
 
-  function parseParagraphHtml(paragraphHtml: string) {
-    const wrapper = document.createElement('div')
-    wrapper.innerHTML = paragraphHtml
-    const paragraph = wrapper.querySelector('p')
-    if (!paragraph) return null
-    return {
-      style: paragraph.getAttribute('style') || '',
-      className: paragraph.getAttribute('class') || '',
-      text: (paragraph.textContent || '').trimEnd(),
-    }
-  }
-
-  function buildParagraphHtml(style: string, text: string, className = '') {
-    const stylePart = style ? ` style="${style}"` : ''
-    const classPart = className ? ` class="${className}"` : ''
-    return `<p${classPart}${stylePart}>${escapeHtml(text)}</p>`
-  }
-
   function firstVisibleChar(text: string) {
     return text.trimStart().charAt(0)
   }
@@ -127,9 +120,9 @@ export function useHorizontalPaging(
     return value.length > 0 && value.length <= 3 && Array.from(value).every((char) => PUNCTUATION_ONLY_CHARS.has(char))
   }
 
-  function adjustFitCountForReadableStart(text: string, fitCount: number) {
+  function adjustFitCountForReadableStart(text: string[], fitCount: number) {
     if (fitCount <= 0 || fitCount >= text.length) return fitCount
-    if (!NON_STARTING_PUNCTUATION.has(firstVisibleChar(text.slice(fitCount)))) return fitCount
+    if (!NON_STARTING_PUNCTUATION.has(firstVisibleChar(text.slice(fitCount).join('')))) return fitCount
 
     const minIndex = Math.max(1, fitCount - MAX_PUNCTUATION_BACKTRACK)
     for (let idx = fitCount - 1; idx >= minIndex; idx -= 1) {
@@ -143,7 +136,10 @@ export function useHorizontalPaging(
   function extractTextFromHtml(html: string) {
     const wrapper = document.createElement('div')
     wrapper.innerHTML = html
-    return wrapper.textContent || ''
+    return {
+      text: wrapper.textContent || '',
+      hasMedia: Boolean(wrapper.querySelector('img, svg, math, video, audio, iframe, canvas, object, embed, table')),
+    }
   }
 
   function prependTextToFirstParagraph(html: string, text: string) {
@@ -170,8 +166,8 @@ export function useHorizontalPaging(
     const mergedPages: string[] = []
     for (let idx = 0; idx < pendingPages.length; idx += 1) {
       const page = pendingPages[idx]
-      const text = extractTextFromHtml(page)
-      if (isPunctuationOnlyText(text)) {
+      const { text, hasMedia } = extractTextFromHtml(page)
+      if (!hasMedia && isPunctuationOnlyText(text)) {
         const punctuation = text.trim()
         if (mergedPages.length) {
           mergedPages[mergedPages.length - 1] = appendTextToLastParagraph(mergedPages[mergedPages.length - 1], punctuation)
@@ -187,23 +183,58 @@ export function useHorizontalPaging(
     return mergedPages
   }
 
-  function buildHorizontalParagraphs() {
+  function buildHorizontalBlocks() {
     const root = document.createElement('div')
     root.innerHTML = formattedContent.value
-    return Array.from(root.querySelectorAll('p')).map((node) => normalizeParagraphHtml(node.outerHTML))
+    const blocks: string[] = []
+    let inline: Node[] = []
+    const blockTags = new Set(['DIV', 'SECTION', 'ARTICLE', 'BLOCKQUOTE', 'UL', 'OL', 'TABLE', 'PRE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6'])
+    const flushInline = () => {
+      if (inline.some((node) => node instanceof Element || (node.textContent || '').trim())) {
+        const paragraph = document.createElement('p')
+        inline.forEach((node) => paragraph.appendChild(node.cloneNode(true)))
+        blocks.push(normalizeParagraphHtml(paragraph.outerHTML))
+      }
+      inline = []
+    }
+    const visit = (node: Node) => {
+      if (!(node instanceof Element)) { inline.push(node); return }
+      if (node.tagName === 'P') {
+        flushInline()
+        blocks.push(normalizeParagraphHtml(node.outerHTML))
+      } else if (node.querySelector('p')) {
+        flushInline()
+        node.childNodes.forEach(visit)
+        flushInline()
+      } else if (blockTags.has(node.tagName)) {
+        flushInline()
+        blocks.push(node.outerHTML)
+      } else {
+        inline.push(node)
+      }
+    }
+    root.childNodes.forEach(visit)
+    flushInline()
+    return blocks
   }
 
+  /** 屏宽恒等于容器宽(一屏一页), 并算出页内正文行宽。
+   *
+   *  这里修的是一个**语义混淆**: 旧实现把「页面宽度」同时当成了屏宽和行宽 ——
+   *  屏宽 = min(容器宽, 设置值), 于是 1920 宽的窗口里每页只有 800px, 一屏会同时
+   *  露出当前页和下一页的左半, 右边还留一大片空白, 用户只能把窗口拖窄来回避。
+   *
+   *  现在两者分开: 屏宽 = 容器宽(一屏恰好一页), 「页面宽度」只管页内正文列多宽;
+   *  窗口比它宽时正文居中、两侧留白(居中由 CSS 的 margin auto 完成)。 */
   function updateHorizontalMetrics() {
     const container = scrollContainerRef.value
     if (!container || !isHorizontalPageMode.value) return
-    // 页宽取「容器宽」与「设置里的页面宽度」的较小者 —— 左右分页此前直接用容器
-    // 全宽, 于是「页面宽度」在这个模式下完全失效(页宽恒等于窗口宽度)。
-    // 取较小者既让设置生效, 也保证窗口比 pageWidth 窄时不会溢出。
-    const pageWidth = config.value.pageWidth
-    const usable = Number.isFinite(pageWidth) && pageWidth > 0
-      ? Math.min(container.clientWidth, pageWidth)
-      : container.clientWidth
-    horizontalPageStep.value = Math.max(1, usable)
+    const containerWidth = Math.max(1, container.clientWidth)
+    horizontalPageStep.value = containerWidth
+    // 可用宽度 = 屏宽扣掉页容器左右 padding。与 .horizontal-page 的 padding 一致,
+    // 也必须是测量正文时用的同一个值, 否则分页与实际排版会不一致。
+    const availableWidth = Math.max(1, containerWidth - HORIZONTAL_PAGE_SIDE_PADDING * 2)
+    horizontalTextWidth.value = getReaderTextWidth(availableWidth, config.value.pageWidth)
   }
 
   function getHorizontalPageMeasure(container: HTMLElement) {
@@ -212,8 +243,14 @@ export function useHorizontalPaging(
       HORIZONTAL_PAGE_MIN_BOTTOM_GUARD,
       Math.ceil(lineHeightPx * HORIZONTAL_PAGE_BOTTOM_GUARD_LINES),
     )
+    // 正文按**行宽**测量(不是屏宽): 页容器两侧的 padding 已在 availableWidth 里
+    // 扣掉, 所以这里直接用行宽作为测量宽度, 与 .horizontal-page-content 的实际
+    // 宽度保持一致。
+    const textWidth = horizontalTextWidth.value > 0
+      ? horizontalTextWidth.value
+      : Math.max(120, horizontalPageStep.value - HORIZONTAL_PAGE_SIDE_PADDING * 2)
     return {
-      innerWidth: Math.max(120, horizontalPageStep.value - HORIZONTAL_PAGE_SIDE_PADDING * 2),
+      innerWidth: Math.max(120, textWidth),
       pageHeight: Math.max(160, container.clientHeight - HORIZONTAL_PAGE_VERTICAL_PADDING * 2 - bottomGuard),
     }
   }
@@ -225,8 +262,7 @@ export function useHorizontalPaging(
       return
     }
     updateHorizontalMetrics()
-    const maxPage = Math.max(0, horizontalPages.value.length - 1)
-    isHorizontalAtEnd.value = horizontalPageIndex.value >= maxPage
+    isHorizontalAtEnd.value = horizontalPageIndex.value >= horizontalLastPageStart.value
   }
 
   async function rebuildHorizontalPages() {
@@ -243,9 +279,13 @@ export function useHorizontalPaging(
     const { innerWidth, pageHeight } = getHorizontalPageMeasure(container)
     const title = (store.currentChapter?.title || '加载中...').trim()
     const titleHtml = `<h1 class="horizontal-flow-title">${escapeHtml(title)}</h1>`
-    const paragraphs = buildHorizontalParagraphs()
+    const paragraphs = buildHorizontalBlocks()
 
     const measurer = document.createElement('div')
+    measurer.className = 'chapter-text horizontal-page-content'
+    for (const attribute of Array.from(container.attributes)) {
+      if (attribute.name.startsWith('data-v-')) measurer.setAttribute(attribute.name, attribute.value)
+    }
     measurer.style.position = 'fixed'
     measurer.style.left = '-99999px'
     measurer.style.top = '0'
@@ -302,10 +342,10 @@ export function useHorizontalPaging(
       blockHtml: string,
       options: { isContinuation: boolean; minRemainingLines?: number },
     ) => {
-      const parsed = parseParagraphHtml(blockHtml)
-      if (!parsed || parsed.text.length <= 1) return null
+      const parsed = parseReaderParagraph(blockHtml)
+      if (!parsed || parsed.tokens.length <= 1) return null
 
-      const { style, text, className } = parsed
+      const { style, tokens: text, className } = parsed
       const currentHeight = measureContentHeight(currentParts)
       const remainingHeight = measurer.clientHeight - currentHeight
       const minRemainingHeight = (options.minRemainingLines || 0) * config.value.fontSize * config.value.lineHeight
@@ -318,7 +358,7 @@ export function useHorizontalPaging(
       while (left <= right) {
         const mid = Math.floor((left + right) / 2)
         const tryStyle = buildSegmentStyle(style, options.isContinuation, mid < text.length)
-        const tryHtml = buildParagraphHtml(tryStyle, text.slice(0, mid), segmentClassName)
+        const tryHtml = parsed.slice(0, mid, tryStyle, segmentClassName)
         if (!overflows([...currentParts, tryHtml])) {
           fitCount = mid
           left = mid + 1
@@ -330,21 +370,21 @@ export function useHorizontalPaging(
       if (fitCount <= 0) return null
 
       fitCount = adjustFitCountForReadableStart(text, fitCount)
-      if (fitCount <= 0 || (fitCount < text.length && isPunctuationOnlyText(text.slice(0, fitCount)))) return null
+      if (fitCount <= 0 || (fitCount < text.length && isPunctuationOnlyText(text.slice(0, fitCount).join('')))) return null
 
       const hasMoreText = fitCount < text.length
       const fitStyle = buildSegmentStyle(style, options.isContinuation, hasMoreText)
       return {
-        html: buildParagraphHtml(fitStyle, text.slice(0, fitCount), segmentClassName),
+        html: parsed.slice(0, fitCount, fitStyle, segmentClassName),
         remainingHtml: hasMoreText
-          ? buildParagraphHtml(style, text.slice(fitCount), removeIndentClass(className))
+          ? parsed.slice(fitCount, text.length, style, removeIndentClass(className))
           : '',
       }
     }
 
     const appendOversizedParagraph = (blockHtml: string, isContinuation = false) => {
-      const parsed = parseParagraphHtml(blockHtml)
-      if (!parsed || parsed.text.length <= 1) {
+      const parsed = parseReaderParagraph(blockHtml)
+      if (!parsed || parsed.tokens.length <= 1) {
         pages.push(blockHtml)
         return
       }
@@ -417,7 +457,11 @@ export function useHorizontalPaging(
 
     document.body.removeChild(measurer)
     horizontalPages.value = mergedPages
-    horizontalPageIndex.value = Math.min(horizontalPageIndex.value, mergedPages.length - 1)
+    // 重建后页数可能变少: 夹进有效范围, 否则索引会指向不存在的页(画面停在空白处)。
+    horizontalPageIndex.value = Math.max(
+      0,
+      Math.min(horizontalLastPageStart.value, horizontalPageIndex.value),
+    )
 
     container.scrollTo({ left: 0, behavior: 'auto' })
     updateHorizontalEndState()
@@ -427,8 +471,10 @@ export function useHorizontalPaging(
     const container = scrollContainerRef.value
     if (!container || !isHorizontalPageMode.value || touchMoving) return
     updateHorizontalMetrics()
-    const maxPage = Math.max(0, horizontalPages.value.length - 1)
-    horizontalPageIndex.value = Math.max(0, Math.min(maxPage, horizontalPageIndex.value))
+    horizontalPageIndex.value = Math.max(
+      0,
+      Math.min(horizontalLastPageStart.value, horizontalPageIndex.value),
+    )
     if (container.scrollLeft !== 0) {
       container.scrollTo({ left: 0, behavior: 'auto' })
     }
@@ -446,8 +492,10 @@ export function useHorizontalPaging(
     horizontalPageIndex,
     horizontalPageStep,
     horizontalPageStepStyle,
+    horizontalTextWidth,
     horizontalPages,
     isHorizontalAtEnd,
+    horizontalLastPageStart,
     rebuildHorizontalPages,
     updateHorizontalMetrics,
     updateHorizontalEndState,

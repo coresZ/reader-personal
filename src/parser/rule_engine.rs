@@ -108,24 +108,37 @@ impl RuleEngine {
         strip_mode_prefix(rule)
     }
 
+    fn parse_search_list(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        rule: &SearchRule,
+        list_rule: &str,
+    ) -> Vec<SearchBook> {
+        match self.detect_mode(list_rule, body) {
+            ParseMode::JsonPath => self.search_books_json(source, body, base_url, rule, list_rule),
+            ParseMode::XPath => self.search_books_xpath(source, body, base_url, rule, list_rule),
+            ParseMode::Js => self.search_books_js(source, body, base_url, rule, list_rule),
+            ParseMode::Regex => self.search_books_regex(source, body, base_url, rule, list_rule),
+            ParseMode::Css => self.search_books_html(source, body, base_url, rule, list_rule),
+        }
+    }
+
     pub fn search_books(&self, source: &BookSource, body: &str, base_url: &str) -> Vec<SearchBook> {
         with_source(source,|| {
+            if let Some(pattern) = source.book_url_pattern.as_deref().filter(|p| !p.trim().is_empty()) {
+                match regex::Regex::new(&format!("^(?:{pattern})$")) {
+                    Ok(pattern) if pattern.is_match(base_url) => {
+                        return self.search_detail_fallback(source, body, base_url).into_iter().collect();
+                    }
+                    Err(err) => push_js_log(format!("[书籍地址规则] {err}")),
+                    _ => {}
+                }
+            }
             let rule = source.rule_search.clone().unwrap_or_default();
             let (list_rule, reverse) = normalize_list_rule(rule.book_list.as_deref().unwrap_or(""));
-            let mode = self.detect_mode(list_rule, body);
-            let mut results = match mode {
-                ParseMode::JsonPath => {
-                    self.search_books_json(source, body, base_url, &rule, list_rule)
-                }
-                ParseMode::XPath => {
-                    self.search_books_xpath(source, body, base_url, &rule, list_rule)
-                }
-                ParseMode::Js => self.search_books_js(source, body, base_url, &rule, list_rule),
-                ParseMode::Regex => {
-                    self.search_books_regex(source, body, base_url, &rule, list_rule)
-                }
-                ParseMode::Css => self.search_books_html(source, body, base_url, &rule, list_rule),
-            };
+            let mut results = self.parse_search_list(source, body, base_url, &rule, list_rule);
 
             if results.is_empty()
                 && source
@@ -162,20 +175,7 @@ impl RuleEngine {
                 })
                 .unwrap_or_else(|| source.rule_search.clone().unwrap_or_default());
             let (list_rule, reverse) = normalize_list_rule(rule.book_list.as_deref().unwrap_or(""));
-            let mode = self.detect_mode(list_rule, body);
-            let mut results = match mode {
-                ParseMode::JsonPath => {
-                    self.search_books_json(source, body, base_url, &rule, list_rule)
-                }
-                ParseMode::XPath => {
-                    self.search_books_xpath(source, body, base_url, &rule, list_rule)
-                }
-                ParseMode::Js => self.search_books_js(source, body, base_url, &rule, list_rule),
-                ParseMode::Regex => {
-                    self.search_books_regex(source, body, base_url, &rule, list_rule)
-                }
-                ParseMode::Css => self.search_books_html(source, body, base_url, &rule, list_rule),
-            };
+            let mut results = self.parse_search_list(source, body, base_url, &rule, list_rule);
             if reverse {
                 results.reverse();
             }
@@ -193,6 +193,10 @@ impl RuleEngine {
         with_source(source,|| {
             let rule = source.rule_book_info.clone().unwrap_or_default();
             let mut context = HashMap::new();
+            let prepared = rule.init.as_deref().filter(|s| !s.trim().is_empty()).map(|init| {
+                self.prepare_rule_body(init, body, base_url).unwrap_or_default()
+            });
+            let body = prepared.as_deref().unwrap_or(body);
 
             let mode = self.detect_mode(rule.name.as_deref().unwrap_or(""), body);
             match mode {
@@ -224,6 +228,39 @@ impl RuleEngine {
         })
     }
 
+    fn prepare_rule_body(&self, rule: &str, body: &str, base_url: &str) -> anyhow::Result<String> {
+        match self.detect_mode(rule, body) {
+            ParseMode::Js => {
+                let (output, remaining_rule) = eval_leading_js_rule(rule, body, base_url)?;
+                if remaining_rule.is_empty() {
+                    Ok(output)
+                } else {
+                    self.prepare_rule_body(remaining_rule, &output, base_url)
+                }
+            }
+            ParseMode::Css | ParseMode::XPath => Ok(Self::eval_rule_elements(rule, body).first()
+                .and_then(|value| value["outerHtml"].as_str()).unwrap_or("").to_string()),
+            _ => Ok(self.extract_content(rule, body)),
+        }
+    }
+
+    fn parse_toc_list(
+        &self,
+        body: &str,
+        base_url: &str,
+        rule: &TocRule,
+        list_rule: &str,
+        context: &mut HashMap<String, String>,
+    ) -> (Vec<BookChapter>, Vec<String>) {
+        match self.detect_mode(list_rule, body) {
+            ParseMode::JsonPath => parse_chapter_list_json(body, base_url, rule, self.strip_mode_prefix(list_rule), context),
+            ParseMode::XPath => parse_chapter_list_xpath(body, base_url, rule, self.strip_mode_prefix(list_rule), context),
+            ParseMode::Js => self.parse_chapter_list_js(body, base_url, rule, list_rule, context),
+            ParseMode::Regex => self.parse_chapter_list_regex(body, base_url, rule, list_rule),
+            ParseMode::Css => parse_chapter_list_html(body, base_url, rule, list_rule, context),
+        }
+    }
+
     pub fn chapter_list(
         &self,
         source: &BookSource,
@@ -238,40 +275,9 @@ impl RuleEngine {
             let (list_rule, reverse) =
                 normalize_list_rule(rule.chapter_list.as_deref().unwrap_or(""));
             let prepared_body = prepare_toc_body(body, base_url, &rule);
-            let mode = self.detect_mode(list_rule, &prepared_body);
-            let (mut chapters, next_urls) = match mode {
-                ParseMode::JsonPath => parse_chapter_list_json(
-                    &prepared_body,
-                    base_url,
-                    &rule,
-                    list_rule,
-                    &mut context,
-                ),
-                ParseMode::XPath => parse_chapter_list_xpath(
-                    &prepared_body,
-                    base_url,
-                    &rule,
-                    list_rule,
-                    &mut context,
-                ),
-                ParseMode::Js => self.parse_chapter_list_js(
-                    &prepared_body,
-                    base_url,
-                    &rule,
-                    list_rule,
-                    &mut context,
-                ),
-                ParseMode::Regex => {
-                    self.parse_chapter_list_regex(&prepared_body, base_url, &rule, list_rule)
-                }
-                ParseMode::Css => parse_chapter_list_html(
-                    &prepared_body,
-                    base_url,
-                    &rule,
-                    list_rule,
-                    &mut context,
-                ),
-            };
+            let (mut chapters, next_urls) = self.parse_toc_list(
+                &prepared_body, base_url, &rule, list_rule, &mut context,
+            );
                 apply_toc_format_js(&mut chapters, rule.format_js.as_deref(), base_url);
                 if reverse {
                     chapters.reverse();
@@ -311,18 +317,27 @@ impl RuleEngine {
                 }
             }
 
-            if let Some(content_rule) = rule.content.clone() {
-                // legado 混合规则 `选择器@js:脚本` / `选择器<js>脚本</js>`: 先按选择器提取, 结果作为 result 交给 JS。
-                // 整条是 JS 时直接以页面源码为 result。
-                let (selector_rule, script) = if matches!(
-                    self.detect_mode(&content_rule, &content_body),
-                    ParseMode::Js
-                ) {
-                    (String::new(), Some(self.strip_mode_prefix(&content_rule).to_string()))
-                } else {
-                    let (pure, js) = extract_js(&content_rule);
-                    (pure.to_string(), js.map(str::to_string))
-                };
+            if let Some(mut content_rule) = rule.content.clone() {
+                // Execute leading scripts before selecting their returned content,
+                // including aggregate rules ending in </js>$.content.
+                while matches!(self.detect_mode(&content_rule, &content_body), ParseMode::Js) {
+                    match eval_leading_js_rule(&content_rule, &content_body, base_url) {
+                        Ok((output, remaining_rule)) => {
+                            content_body = output;
+                            content_rule = remaining_rule.to_string();
+                            if content_rule.is_empty() { break; }
+                        }
+                        Err(err) => {
+                            push_js_log(format!("[正文 JS] {err}"));
+                            tracing::warn!("content js failed for {}: {err}", source.book_source_name);
+                            content_body.clear();
+                            content_rule.clear();
+                            break;
+                        }
+                    }
+                }
+                let (pure, js) = extract_js(&content_rule);
+                let (selector_rule, script) = (pure.to_string(), js.map(str::to_string));
 
                 let mut content = if selector_rule.trim().is_empty() {
                     content_body.clone()
@@ -347,7 +362,14 @@ impl RuleEngine {
                 }
 
                 if let Some(replace) = rule.replace_regex.as_deref() {
-                    content = apply_legado_regex(&content, replace);
+                    if matches!(self.detect_mode(replace, &content), ParseMode::Js) {
+                        match eval_js(self.strip_mode_prefix(replace), &content, base_url) {
+                            Ok(result) => content = result,
+                            Err(err) => push_js_log(format!("[正文替换] {err}")),
+                        }
+                    } else {
+                        content = apply_legado_regex(&content, replace);
+                    }
                 }
 
                 return content;
@@ -596,10 +618,15 @@ impl RuleEngine {
         rule: &SearchRule,
         list_rule: &str,
     ) -> Vec<SearchBook> {
-        let output = match eval_js(self.strip_mode_prefix(list_rule), body, base_url) {
+        let (output, remaining_rule) = match eval_leading_js_rule(list_rule, body, base_url) {
             Ok(result) => result,
             Err(_) => return vec![],
         };
+        // Legado executes each segment in order: the result of <js> feeds the
+        // following JSONPath/CSS rule instead of becoming JavaScript source.
+        if !remaining_rule.is_empty() {
+            return self.parse_search_list(source, &output, base_url, rule, remaining_rule);
+        }
 
         if let Some(items) = parse_js_output_items(&output) {
             let mut out = Vec::with_capacity(items.len());
@@ -736,10 +763,13 @@ impl RuleEngine {
         list_rule: &str,
         ctx: &mut HashMap<String, String>,
     ) -> (Vec<BookChapter>, Vec<String>) {
-        let output = match eval_js(self.strip_mode_prefix(list_rule), body, base_url) {
+        let (output, remaining_rule) = match eval_leading_js_rule(list_rule, body, base_url) {
             Ok(result) => result,
             Err(_) => return (vec![], vec![]),
         };
+        if !remaining_rule.is_empty() {
+            return self.parse_toc_list(&output, base_url, rule, remaining_rule, ctx);
+        }
 
         if let Some(items) = parse_js_output_items(&output) {
             let mut out = Vec::with_capacity(items.len());
@@ -1609,7 +1639,7 @@ fn resolve_url(base: &str, url: &str) -> String {
     if url.is_empty() {
         return base.to_string();
     }
-    if url.starts_with("http://") || url.starts_with("https://") {
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
         return url.to_string();
     }
     if url.starts_with("//") {
@@ -1694,8 +1724,24 @@ fn interpolate_common_templates(
             if expr.is_empty() {
                 return String::new();
             }
+            if let Some(rule) = expr.strip_prefix("@@") {
+                return RuleEngine::eval_rule_on(rule, input, base_url, true).join("\n");
+            }
             if let Some(val) = ctx.get(expr) {
                 return val.clone();
+            }
+            // `{{$.xxx}}` 是 JSON 语境的当前节点引用; HTML 模板路径不能把它当 JS 求值
+            // （`$ is not defined`）。尝试把 input 按 JSON 解析后走 JSONPath, 失败则留空。
+            if let Some(json_path) = expr.strip_prefix("$.") {
+                if let Ok(v) = serde_json::from_str::<Value>(input) {
+                    if let Some(val) = jsonpath::jsonpath_first_string(&v, &format!("$.{json_path}")) {
+                        return val;
+                    }
+                }
+                return String::new();
+            }
+            if expr.starts_with('$') {
+                return String::new();
             }
             eval_js(expr, input, base_url).unwrap_or_default()
         })
@@ -1808,6 +1854,9 @@ fn extract_js(rule: &str) -> (&str, Option<&str>) {
         let js = &rule[idx + 4..];
         return (pure, Some(js));
     }
+    if let Some(script) = rule.trim().strip_prefix("js:") {
+        return ("", Some(script));
+    }
     (rule, None)
 }
 
@@ -1869,6 +1918,14 @@ fn eval_field_html_single_with_ctx(
 ) -> Option<String> {
     // Handle mode forcing prefixes
     let rule = rule.trim();
+    // 先分离规则中任意位置的 @put 段
+    let (stripped, puts) = split_inline_put_rules(rule);
+    for (key, val_rule) in puts {
+        let val = eval_field_html_with_ctx(&val_rule, el, base_url, ctx).unwrap_or_default();
+        ctx.insert(key.clone(), val.clone());
+        put_rule_variable(&key, &val, base_url);
+    }
+    let rule = stripped.as_str();
     if rule.starts_with("@css:") {
         let pure = &rule[5..];
         return eval_field_html_with_ctx(pure, el, base_url, ctx);
@@ -2049,6 +2106,17 @@ fn eval_field_xpath_single_with_ctx(
         return None;
     }
 
+    // 先分离规则中任意位置的 @put 段
+    let (stripped, puts) = split_inline_put_rules(rule);
+    for (key, val_rule) in puts {
+        let val = eval_field_xpath_with_ctx(&val_rule, node, base_url, ctx).unwrap_or_default();
+        ctx.insert(key.clone(), val.clone());
+        put_rule_variable(&key, &val, base_url);
+    }
+    let rule = stripped.as_str();
+    if rule.trim().is_empty() {
+        return None;
+    }
     let interpolated_rule = interpolate_common_templates(rule, &node.string_value(), base_url, ctx);
     let had_templates = interpolated_rule != rule;
     let (pure_rule, regex_part) = split_legado_regex(&interpolated_rule);
@@ -2146,6 +2214,21 @@ fn xpath_eval_strings(node: sxd_xpath::nodeset::Node<'_>, xpath: &str) -> Vec<St
     }
 }
 
+fn eval_json_item_js(script: &str, item: &Value, base_url: &str) -> anyhow::Result<String> {
+    let input = item_raw_string(item);
+    let pipe_row = item.as_array().is_some_and(|items| items.iter().all(Value::is_string));
+    if !item.is_object() && (!item.is_array() || pipe_row) {
+        return eval_js(script, &input, base_url);
+    }
+    let bindings = HashMap::from([("result".to_string(), item.clone())]);
+    // Gson/JSON objects in Legado support member access and stringify to JSON.
+    // Keep JSON.parse(result) rules working alongside result.book_id rules.
+    let script = format!(
+        "Object.defineProperty(globalThis.result, Symbol.toPrimitive, {{value: function () {{ return JSON.stringify(this); }}}});\n{script}"
+    );
+    eval_js_with_bindings(&script, &input, base_url, &bindings)
+}
+
 fn eval_field_json_with_ctx(
     rule: &str,
     v: &Value,
@@ -2154,6 +2237,11 @@ fn eval_field_json_with_ctx(
 ) -> Option<String> {
     if let Some(res) = try_put_get_json(rule, v, base_url, ctx) {
         return Some(res);
+    }
+    let trimmed = rule.trim();
+    if trimmed.starts_with("<js>") || trimmed.starts_with("@js:") || trimmed.starts_with("js:") {
+        // || and && inside a script are JavaScript operators, not field fallbacks.
+        return eval_field_json_single_with_ctx(trimmed, v, base_url, ctx);
     }
 
     // legado 字段级链式: `&&`(拼接) / `||`(首个非空) / `%%`(按索引交织)
@@ -2210,7 +2298,16 @@ fn eval_field_json_single_with_ctx(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
+    // 先分离规则中任意位置的 @put 段（如 `title@put:{"bid":"$.id"}`）
+    let (stripped, puts) = split_inline_put_rules(rule);
+    for (key, val_rule) in puts {
+        let val = eval_field_json_with_ctx(&val_rule, v, base_url, ctx).unwrap_or_default();
+        ctx.insert(key.clone(), val.clone());
+        put_rule_variable(&key, &val, base_url);
+    }
+    let rule = stripped.as_str();
     let interpolated_rule = interpolate_json_templates(rule, v, base_url, ctx);
+    let had_templates = interpolated_rule != rule;
     let (pure_rule, regex_part) = split_legado_regex(&interpolated_rule);
     let (pure, js) = extract_js(&pure_rule);
 
@@ -2228,18 +2325,17 @@ fn eval_field_json_single_with_ctx(
     } else {
         pick_json_field(v, Some(pure)).unwrap_or_default()
     };
+    if text.is_empty() && had_templates && !pure.is_empty() {
+        text = pure.to_string();
+    }
 
     if let Some(script) = js {
-        // legado 兼容: `@js:` 字段规则(无纯文本部分)以当前 item 的"原始串"作为
-        // `result`/`input`。item 可能是 JSON 对象(→ `JSON.parse(result).xxx`),
-        // 也可能是管道串数组(→ `result.split('|')[n]`, 此时按 `|` 重拼)。
-        // 否则传入已提取的纯文本(如有), 保持既有行为。
-        let js_input = if pure.is_empty() {
-            item_raw_string(v)
+        let result = if pure.is_empty() {
+            eval_json_item_js(script, v, base_url)
         } else {
-            text.clone()
+            eval_js(script, &text, base_url)
         };
-        if let Ok(res) = eval_js(script, &js_input, base_url) {
+        if let Ok(res) = result {
             text = res;
         }
     }
@@ -2255,6 +2351,60 @@ fn eval_field_json_single_with_ctx(
     }
 }
 
+fn inline_put_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?i)@put:(\{[^}]+?\})").unwrap())
+}
+
+/// 分离规则中**任意位置**的 `@put:{...}` 段（legado putPattern 语义，
+/// 如七猫的 `title@put:{"bid":"$.id"}`），返回剩余取值规则与
+/// `(key, 值规则)` 列表，由调用方在当前节点上求值后写入。
+fn split_inline_put_rules(rule: &str) -> (String, Vec<(String, String)>) {
+    if !rule.contains("@put:") {
+        return (rule.to_string(), Vec::new());
+    }
+    let re = inline_put_re();
+    let mut rest = String::with_capacity(rule.len());
+    let mut puts = Vec::new();
+    let mut last = 0usize;
+    for captures in re.captures_iter(rule) {
+        let Some(matched) = captures.get(0) else { continue };
+        rest.push_str(&rule[last..matched.start()]);
+        last = matched.end();
+        let Some(inner) = captures
+            .get(1)
+            .and_then(|g| g.as_str().strip_prefix('{'))
+            .and_then(|s| s.strip_suffix('}'))
+        else {
+            continue;
+        };
+        // 先按 JSON 对象解析（值里可以含逗号），失败再降级按逗号劈开。
+        // 与 legado 的 GSON.fromJsonObject 行为一致。
+        let parsed = serde_json::from_str::<HashMap<String, String>>(&format!("{{{inner}}}"));
+        if let Ok(map) = parsed {
+            puts.extend(map);
+        } else {
+            for part in inner.split(',') {
+                if let Some(idx) = part.find(':') {
+                    let key = part[..idx].trim().trim_matches('"').to_string();
+                    let val_rule = part[idx + 1..].trim().trim_matches('"').to_string();
+                    puts.push((key, val_rule));
+                }
+            }
+        }
+    }
+    rest.push_str(&rule[last..]);
+    (rest, puts)
+}
+
+/// legado 的 `@put:{...}` 除写入本次解析上下文外, 还落到
+/// chapter/book/source 变量链（与 JS `java.get(key)` 同一存储）,
+/// 否则跨阶段（详情 @put → 正文 java.get）取不到值。
+fn put_rule_variable(key: &str, val: &str, base_url: &str) {
+    let script = format!("java.put({}, {})", serde_json::json!(key), serde_json::json!(val));
+    let _ = eval_js(&script, "", base_url);
+}
+
 fn try_put_get_html(
     rule: &str,
     el: &scraper::ElementRef,
@@ -2267,11 +2417,12 @@ fn try_put_get_html(
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
                 if let Some(idx) = part.find(':') {
-                    let key = part[..idx].trim();
+                    let key = part[..idx].trim().trim_matches('"').to_string();
                     let val_rule = part[idx + 1..].trim().trim_matches('"');
                     let val =
                         eval_field_html_with_ctx(val_rule, el, base_url, ctx).unwrap_or_default();
-                    ctx.insert(key.to_string(), val);
+                    ctx.insert(key.clone(), val.clone());
+                    put_rule_variable(&key, &val, base_url);
                 }
             }
         }
@@ -2299,11 +2450,12 @@ fn try_put_get_html_doc(
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
                 if let Some(idx) = part.find(':') {
-                    let key = part[..idx].trim();
+                    let key = part[..idx].trim().trim_matches('"').to_string();
                     let val_rule = part[idx + 1..].trim().trim_matches('"');
                     let val = eval_field_html_doc_with_ctx(val_rule, doc, base_url, ctx)
                         .unwrap_or_default();
-                    ctx.insert(key.to_string(), val);
+                    ctx.insert(key.clone(), val.clone());
+                    put_rule_variable(&key, &val, base_url);
                 }
             }
         }
@@ -2331,11 +2483,12 @@ fn try_put_get_json(
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
                 if let Some(idx) = part.find(':') {
-                    let key = part[..idx].trim();
+                    let key = part[..idx].trim().trim_matches('"').to_string();
                     let val_rule = part[idx + 1..].trim().trim_matches('"');
                     let val =
                         eval_field_json_with_ctx(val_rule, v, base_url, ctx).unwrap_or_default();
-                    ctx.insert(key.to_string(), val);
+                    ctx.insert(key.clone(), val.clone());
+                    put_rule_variable(&key, &val, base_url);
                 }
             }
         }
@@ -2363,11 +2516,12 @@ fn try_put_get_xpath(
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
                 if let Some(idx) = part.find(':') {
-                    let key = part[..idx].trim();
+                    let key = part[..idx].trim().trim_matches('"').to_string();
                     let val_rule = part[idx + 1..].trim().trim_matches('"');
                     let val = eval_field_xpath_with_ctx(val_rule, node, base_url, ctx)
                         .unwrap_or_default();
-                    ctx.insert(key.to_string(), val);
+                    ctx.insert(key.clone(), val.clone());
+                    put_rule_variable(&key, &val, base_url);
                 }
             }
         }
@@ -2469,6 +2623,21 @@ fn strip_mode_prefix(rule: &str) -> &str {
     rule
 }
 
+fn eval_leading_js_rule<'a>(rule: &'a str, body: &str, base_url: &str) -> anyhow::Result<(String, &'a str)> {
+    let (script, remaining_rule) = split_leading_js_rule(rule);
+    Ok((eval_js(script, body, base_url)?, remaining_rule))
+}
+
+fn split_leading_js_rule(rule: &str) -> (&str, &str) {
+    let rule = rule.trim();
+    if let Some(rest) = rule.strip_prefix("<js>") {
+        if let Some((script, tail)) = rest.split_once("</js>") {
+            return (script, tail.trim());
+        }
+    }
+    (strip_mode_prefix(rule), "")
+}
+
 fn strip_js_rule(rule: &str) -> &str {
     let rule = rule.trim();
     if let Some(rest) = rule
@@ -2552,7 +2721,14 @@ fn parse_js_output_items(output: &str) -> Option<Vec<Value>> {
     // JSON 数组 / 对象 → 现有行为
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         return match value {
-            Value::Array(items) => Some(items),
+            Value::Array(items) => Some(items.into_iter().map(|item| {
+                if let Value::String(raw) = &item {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+                        if parsed.is_object() || parsed.is_array() { return parsed; }
+                    }
+                }
+                item
+            }).collect()),
             Value::Object(_) => Some(vec![value]),
             _ => None,
         };

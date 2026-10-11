@@ -4,6 +4,7 @@ import { useAppStore } from './app'
 import { nightThemeIndex, useReaderStore } from './reader'
 import {
   getBookContent,
+  getBookInfo,
   getChapterList,
   saveBookProgress,
   type ContentLoadStage,
@@ -13,6 +14,7 @@ import { requestOpenAISpeechAudio } from '../utils/openaiSpeech'
 
 vi.mock('../api/bookshelf', () => ({
   getChapterList: vi.fn(),
+  getBookInfo: vi.fn(),
   getBookContent: vi.fn(),
   saveBookProgress: vi.fn(),
   setBookSource: vi.fn(),
@@ -60,6 +62,10 @@ describe('reader local txt chapters', () => {
       clear: vi.fn(() => storage.clear()),
     })
     vi.mocked(getBookContent).mockReset()
+    vi.mocked(getBookInfo).mockReset()
+    vi.mocked(getBookInfo).mockResolvedValue({
+      name: '测试书籍', author: '测试作者', origin: 'test-source', bookUrl: 'https://example.test/book',
+    })
     vi.mocked(getChapterList).mockReset()
     vi.mocked(saveBookProgress).mockReset()
     vi.mocked(saveBookProgress).mockResolvedValue('ok')

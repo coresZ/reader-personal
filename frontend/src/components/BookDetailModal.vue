@@ -123,7 +123,7 @@
               <div class="loading-spinner"></div>
               正在查找其他书源...
             </div>
-            <div v-else-if="!sourceCandidates.length" class="source-empty">
+            <div v-else-if="!sourceCandidates.length && !sourcesIncomplete" class="source-empty">
               未找到其他书源
             </div>
             <div v-else class="source-list">
@@ -135,9 +135,20 @@
                 @click="selectSource(cand)"
               >
                 <span class="source-radio" :class="{ checked: selectedSource?.origin === cand.origin && selectedSource?.bookUrl === cand.bookUrl }" />
-                <span class="source-name">{{ sourceNameByOrigin(cand.origin) }}</span>
+                <span class="source-name">
+                  {{ sourceNameByOrigin(cand.origin) }}
+                  <small v-if="cand.author && normalizeSourceSwitchAuthor(cand.author) !== normalizeSourceSwitchAuthor(book?.author)" class="source-author">{{ cand.author }}</small>
+                </span>
                 <span v-if="cand.lastChapter" class="source-latest">{{ cand.lastChapter }}</span>
               </div>
+            </div>
+            <div v-if="sourcesLoading && sourceCandidates.length" class="source-loading">
+              <div class="loading-spinner"></div>
+              继续查找其他书源...
+            </div>
+            <div v-if="sourcesIncomplete && !sourcesLoading" class="source-incomplete" role="status">
+              <span>部分书源访问失败，可重试。</span>
+              <button type="button" @click="loadSourceCandidates(detailLoadId, detailKey, true)">重试</button>
             </div>
           </div>
 
@@ -245,7 +256,7 @@ import { useReaderStore } from '../stores/reader'
 import { useAppStore } from '../stores/app'
 import type { Book, SearchBook, BookChapter } from '../types'
 import { isLocalBook } from '../utils/localBook'
-import { matchesSourceSwitchAuthor, searchMergeKey } from '../utils/searchRank'
+import { matchesSourceSwitchTitle, mergeSourceCandidates, normalizeSourceSwitchAuthor, searchMergeKey, sourceCandidateKey } from '../utils/searchRank'
 import { deleteBookCover, uploadBookCover } from '../api/bookCover'
 import {
   canRevertToOrigin,
@@ -286,6 +297,7 @@ const chaptersLoading = ref(false)
 const showAllChapters = ref(false)
 const sourceCandidates = ref<SearchBook[]>([])
 const sourcesLoading = ref(false)
+const sourcesIncomplete = ref(false)
 const selectedSource = ref<SearchBook | null>(null)
 const sourceCatalog = ref(new Map<string, string>())
 const removingFromShelf = ref(false)
@@ -373,7 +385,7 @@ function sourceKey(origin: string): string {
 }
 
 function candidateKey(candidate: SearchBook): string {
-  return `${sourceKey(candidate.origin)}::${candidate.bookUrl}`
+  return sourceCandidateKey(candidate)
 }
 
 function sourceCatalogSignature(): string {
@@ -421,15 +433,17 @@ function closeSourceSSE() {
   sourceSSE = null
 }
 
-function loadSourceCandidates(loadId: number, bookKey: string) {
+function loadSourceCandidates(loadId: number, bookKey: string, refresh = false) {
   const b = props.book
   if (!b || !b.name) {
     return
   }
   closeSourceSSE()
   sourcesLoading.value = true
-  const current = toSearchBook(b as Book)
-  const storedCandidates = (b as Book).sourceCandidates || []
+  sourcesIncomplete.value = false
+  if (refresh) sourceCandidatesCache.delete(sourceCandidatesCacheKey(bookKey))
+  const current = toSearchBook(b)
+  const storedCandidates = b.sourceCandidates || []
   const initialCandidates = [current, ...storedCandidates]
   const cachedCandidates = sourceCandidatesCache.get(sourceCandidatesCacheKey(bookKey))
   if (cachedCandidates) {
@@ -441,51 +455,73 @@ function loadSourceCandidates(loadId: number, bookKey: string) {
   // 先显示当前书源和已经保存的候选，其他书源搜索完成后逐个追加。
   setSourceCandidates(initialCandidates)
 
-  const stream = getAvailableBookSourceSSE({
-    url: b.bookUrl,
-    name: b.name,
-    author: b.author,
-    origin: b.origin,
-    lastIndex: -1,
-    resultLimit: 100,
-    concurrentCount: 12,
-  })
-  sourceSSE = stream
-  let completed = false
+  const requestPage = (lastIndex: number) => {
+    const stream = getAvailableBookSourceSSE({
+      url: b.bookUrl,
+      name: b.name,
+      author: b.author,
+      origin: b.origin,
+      lastIndex,
+      concurrentCount: 12,
+      refresh: refresh ? 1 : undefined,
+    })
+    sourceSSE = stream
 
-  const finish = (cacheResult: boolean) => {
-    if (completed) return
-    completed = true
-    if (sourceSSE === stream) sourceSSE = null
-    if (!isCurrentDetail(loadId, bookKey)) return
-    sourcesLoading.value = false
-    if (cacheResult) {
-      storeSourceCandidatesCache(
-        sourceCandidatesCacheKey(bookKey),
-        sourceCandidates.value.slice(),
-      )
-    }
-  }
-
-  stream.onmessage = (event) => {
-    if (sourceSSE !== stream || !isCurrentDetail(loadId, bookKey)) {
+    const isActive = () => sourceSSE === stream && isCurrentDetail(loadId, bookKey)
+    const finish = (cacheResult: boolean) => {
       stream.close()
-      return
+      if (!isActive()) return
+      sourceSSE = null
+      sourcesLoading.value = false
+      if (cacheResult) {
+        storeSourceCandidatesCache(
+          sourceCandidatesCacheKey(bookKey),
+          sourceCandidates.value.slice(),
+        )
+      }
     }
-    const data = event.data as { data?: SearchBook[] }
-    if (Array.isArray(data.data) && data.data.length > 0) {
-      setSourceCandidates([...sourceCandidates.value, ...data.data])
+
+    stream.onmessage = (event) => {
+      if (!isActive()) {
+        stream.close()
+        return
+      }
+      const data = event.data as { data?: SearchBook[] }
+      if (Array.isArray(data.data) && data.data.length > 0) {
+        setSourceCandidates([...sourceCandidates.value, ...data.data])
+      }
+    }
+
+    stream.addEventListener('end', (event) => {
+      if (!isActive()) {
+        stream.close()
+        return
+      }
+      const payload = event.data as { hasMore?: boolean; lastIndex?: number; hasErrors?: boolean }
+      sourcesIncomplete.value ||= payload.hasErrors === true
+      if (
+        payload.hasMore === true
+        && typeof payload.lastIndex === 'number'
+        && Number.isInteger(payload.lastIndex)
+        && payload.lastIndex > lastIndex
+      ) {
+        stream.close()
+        requestPage(payload.lastIndex)
+        return
+      }
+      finish(payload.hasMore !== true && !sourcesIncomplete.value)
+    })
+    stream.onerror = () => {
+      if (!isActive()) return
+      sourcesIncomplete.value = true
+      finish(false)
     }
   }
 
-  stream.addEventListener('end', (event) => {
-    const payload = event.data as { hasMore?: boolean }
-    finish(payload.hasMore !== true)
-  })
-  stream.onerror = () => finish(false)
+  requestPage(-1)
 }
 
-function toSearchBook(book: Book): SearchBook {
+function toSearchBook(book: Book | SearchBook): SearchBook {
   return {
     name: book.name,
     author: book.author,
@@ -494,32 +530,25 @@ function toSearchBook(book: Book): SearchBook {
     coverUrl: book.coverUrl,
     intro: book.intro,
     kind: book.kind,
-    lastChapter: book.latestChapterTitle,
+    lastChapter: (book as SearchBook).lastChapter || (book as Book).latestChapterTitle,
   }
 }
 
 function setSourceCandidates(candidates: SearchBook[]) {
   const previousSelection = selectedSource.value ? candidateKey(selectedSource.value) : ''
-  const currentOrigin = sourceKey(props.book?.origin || '')
-  const currentAuthor = props.book?.author
-  const seenSources = new Set<string>()
-  sourceCandidates.value = candidates.map((candidate) => ({
+  const currentKey = props.book ? sourceCandidateKey(props.book) : ''
+  const currentTitle = props.book?.name || ''
+  sourceCandidates.value = mergeSourceCandidates(candidates.map((candidate) => ({
     ...candidate,
     origin: canonicalSourceOrigin(candidate.origin),
-  })).filter((candidate) => {
-    if (!candidate.origin || !candidate.bookUrl) return false
-    if (!matchesSourceSwitchAuthor(currentAuthor, candidate.author)) return false
-    const originKey = sourceKey(candidate.origin)
-    if (!sourceCatalog.value.has(originKey) || seenSources.has(originKey)) {
-      return false
-    }
-    seenSources.add(originKey)
-    return true
-  })
+  })).filter((candidate) => (
+    matchesSourceSwitchTitle(currentTitle, candidate.name)
+    && sourceCatalog.value.has(sourceKey(candidate.origin))
+  )))
   selectedSource.value = sourceCandidates.value.find((candidate) => (
     candidateKey(candidate) === previousSelection
   )) || sourceCandidates.value.find((candidate) => (
-    sourceKey(candidate.origin) === currentOrigin
+    candidateKey(candidate) === currentKey
   )) || sourceCandidates.value[0] || null
 }
 
@@ -1089,6 +1118,9 @@ async function removeFromShelf() {
   font-size: var(--text-sm);
 }
 
+.source-incomplete { display: flex; align-items: center; gap: 12px; margin-top: 12px; color: var(--color-text-secondary); font-size: var(--text-sm); }
+.source-incomplete button { padding: 4px 10px; border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-bg); color: var(--color-text); cursor: pointer; }
+
 .source-list {
   border: 1px solid var(--color-border-light);
   border-radius: var(--radius-md);
@@ -1153,6 +1185,15 @@ async function removeFromShelf() {
 
 .source-item.selected .source-name {
   color: var(--color-primary);
+}
+
+.source-author {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--text-xs);
+  font-weight: 400;
+  color: var(--color-text-tertiary);
 }
 
 .source-latest {

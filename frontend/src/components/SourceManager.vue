@@ -103,43 +103,7 @@
       @close="subscriptionPanelVisible = false"
     />
 
-    <Transition name="scale">
-      <div v-if="loginPreviewVisible" class="login-preview-container" @click.self="loginPreviewVisible = false">
-        <div class="login-preview-modal">
-          <div class="login-preview-header">
-            <div>
-              <h3>书源登录页</h3>
-              <p>{{ loginPreviewUrl }}</p>
-            </div>
-            <button class="icon-btn" type="button" @click="loginPreviewVisible = false" title="关闭">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M18 6 6 18M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
-          <div class="login-cookie-import">
-            <p class="login-cookie-tip">
-              应用内的 QQ/微信登录会跳转到系统浏览器完成，登录状态保存在浏览器中，本应用无法直接读取。
-              请在浏览器登录成功后，复制登录后的 Cookie（开发者工具 → Application → Cookies，或抓包），粘贴到下方导入：
-            </p>
-            <textarea
-              v-model="manualCookieText"
-              rows="2"
-              placeholder="手动导入登录 Cookie(抓包获取, 形如 a=1; b=2; ...)"
-            ></textarea>
-            <button
-              class="mini-btn primary"
-              type="button"
-              :disabled="!manualCookieText.trim() || cookieImporting"
-              @click="importManualCookie"
-            >
-              {{ cookieImporting ? '导入中...' : '导入 Cookie' }}
-            </button>
-          </div>
-          <iframe class="login-preview-frame" :src="loginPreviewFrameUrl"></iframe>
-        </div>
-      </div>
-    </Transition>
+    <SourceLoginDialog v-model="loginPreviewVisible" :source="loginSource" />
   </Teleport>
 </template>
 
@@ -151,8 +115,6 @@ import {
   deleteBookSource,
   deleteBookSources,
   deleteInvalidBookSources,
-  loginBookSource,
-  setBookSourceCookie,
   saveBookSource,
   saveBookSources,
   testBookSources,
@@ -163,7 +125,6 @@ import {
   pinBookSource,
   unpinBookSource,
 } from '../api/source'
-import { readerOrigin } from '../api/scheme'
 import { useAppStore } from '../stores/app'
 import { useSourceStore } from '../stores/source'
 import type { BookSource } from '../types'
@@ -176,6 +137,7 @@ import {
 } from '../utils/sourceSelection'
 import { chunkBookSourceUrls, mergeBookSourceTestResponses } from '../utils/sourceTesting'
 import SourceEditorPanel from './source-manager/SourceEditorPanel.vue'
+import SourceLoginDialog from './source-manager/SourceLoginDialog.vue'
 import SourceFilterBar from './source-manager/SourceFilterBar.vue'
 import SourceList from './source-manager/SourceList.vue'
 import { showContextMenu } from '../composables/useContextMenu'
@@ -221,10 +183,7 @@ const editorText = ref(JSON.stringify(createEmptySource(), null, 2))
 const resetSignal = ref(0)
 const sourceLoginLoading = ref(false)
 const loginPreviewVisible = ref(false)
-const loginPreviewUrl = ref('')
-const loginPreviewFrameUrl = ref('')
-const manualCookieText = ref('')
-const cookieImporting = ref(false)
+const loginSource = ref<BookSource | null>(null)
 
 const groupList = computed(() => getBookSourceGroups(sources.value))
 
@@ -259,7 +218,7 @@ const partiallyFilteredSelected = computed(() =>
 const canLoginSource = computed(() => {
   try {
     const parsed = JSON.parse(editorText.value) as BookSource
-    return Boolean(parsed.bookSourceUrl?.trim() && parsed.loginUrl?.trim())
+    return Boolean(parsed.bookSourceUrl?.trim() && parsed.bookSourceName?.trim())
   } catch {
     return false
   }
@@ -601,73 +560,20 @@ async function saveEditor() {
 async function handleSourceLogin() {
   try {
     const parsed = JSON.parse(editorText.value) as BookSource
-    if (!parsed.bookSourceUrl?.trim()) {
-      throw new Error('书源链接不能为空')
+    if (!parsed.bookSourceUrl?.trim() || !parsed.bookSourceName?.trim()) {
+      throw new Error('请填写书源名称和地址')
     }
-    if (!parsed.loginUrl?.trim()) {
-      throw new Error('当前书源未配置 loginUrl')
-    }
-
     sourceLoginLoading.value = true
-    if (!editingSource.value || editingSource.value.bookSourceUrl !== parsed.bookSourceUrl) {
-      await saveBookSource(parsed)
-      await loadSources()
-      const latest = sources.value.find((item) => item.bookSourceUrl === parsed.bookSourceUrl)
-      if (latest) {
-        editSource(latest)
-      }
-    }
-
-    const result = await loginBookSource(parsed.bookSourceUrl)
-    const check = typeof result.checkResult === 'string' && result.checkResult.trim()
-      ? `，校验结果：${result.checkResult}`
-      : ''
-    if (result.url?.trim()) {
-      loginPreviewUrl.value = result.url
-      loginPreviewFrameUrl.value = buildLoginProxyUrl(result.loginSession, result.url)
-      loginPreviewVisible.value = true
-    }
-    appStore.showToast(`书源登录请求已完成，状态 ${result.status}${check}`, 'success')
-  } catch (e: unknown) {
-    appStore.showToast((e as Error).message || '书源登录失败', 'error')
+    await saveBookSource(parsed)
+    await loadSources()
+    if (!props.modelValue) return
+    loginSource.value = parsed
+    loginPreviewVisible.value = true
+  } catch (error: unknown) {
+    appStore.showToast(error instanceof Error ? error.message : '打开登录失败', 'error')
   } finally {
     sourceLoginLoading.value = false
   }
-}
-
-async function importManualCookie() {
-  const cookie = manualCookieText.value.trim()
-  if (!cookie) return
-  try {
-    const parsed = JSON.parse(editorText.value) as BookSource
-    if (!parsed.bookSourceUrl?.trim()) throw new Error('书源链接不能为空')
-    cookieImporting.value = true
-    const res = await setBookSourceCookie(parsed.bookSourceUrl, cookie)
-    if (res.saved) {
-      appStore.showToast('Cookie 已导入, VIP 章节将自动携带登录态', 'success')
-      manualCookieText.value = ''
-      loginPreviewVisible.value = false
-    } else {
-      appStore.showToast('Cookie 导入失败', 'error')
-    }
-  } catch (e: unknown) {
-    appStore.showToast((e as Error).message || 'Cookie 导入失败', 'error')
-  } finally {
-    cookieImporting.value = false
-  }
-}
-
-function buildLoginProxyUrl(loginSession: string, targetUrl: string) {
-  // 登录域直接直连: 部分站点登录页 JS 依赖 document.domain=<自身域名>,
-  // 经 reader 代理 origin 会抛 SecurityError 导致登录功能失效。
-  // 直连真实域名时页面功能完整; 登录 Cookie 通过「导入 Cookie」粘贴抓包值写入。
-  if (/^https?:\/\/([\w-]+\.)?(qidian|yuewen)\.com/i.test(targetUrl)) {
-    return targetUrl
-  }
-  const params = new URLSearchParams()
-  params.set('loginSession', loginSession)
-  params.set('url', targetUrl)
-  return `${readerOrigin}/bookSourceProxy?${params.toString()}`
 }
 
 function triggerFileImport() {
@@ -902,92 +808,6 @@ watch(() => props.modelValue, (v) => {
 .mini-btn:hover,
 .icon-btn:hover {
   background: var(--color-bg-hover);
-}
-
-.login-preview-container {
-  position: fixed;
-  inset: 0;
-  z-index: calc(var(--z-modal) + 2);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: rgba(0, 0, 0, 0.35);
-}
-
-.login-preview-modal {
-  width: min(980px, 100%);
-  height: min(86vh, 900px);
-  background: var(--color-bg-elevated);
-  border-radius: var(--radius-xl);
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-  box-shadow: var(--shadow-xl);
-}
-
-.login-preview-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--color-border-light);
-}
-
-.login-preview-header h3 {
-  margin: 0;
-  font-size: 16px;
-  font-weight: 700;
-}
-
-.login-preview-header p {
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--color-text-tertiary);
-  word-break: break-all;
-}
-
-.login-preview-frame {
-  flex: 1;
-  width: 100%;
-  border: none;
-  background: #fff;
-}
-
-.login-cookie-import {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--color-border-light);
-  background: var(--color-bg);
-}
-
-.login-cookie-import textarea {
-  width: 100%;
-  min-height: 54px;
-  padding: 8px 10px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  background: var(--color-bg-field, var(--color-bg));
-  color: var(--color-text-primary);
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 12px;
-  resize: vertical;
-  box-sizing: border-box;
-}
-
-.login-cookie-import textarea:focus {
-  outline: none;
-  border-color: var(--color-primary);
-}
-
-.login-cookie-tip {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--color-text-tertiary);
 }
 
 @media (max-width: 900px) {

@@ -46,28 +46,30 @@ export function isSearchResultRelevant(
 /** Keep the complete source hit when merging rows, so the detail modal does
  * not have to rediscover a source that the initial search already found. */
 export function initializeSearchResult(book: SearchBook): SearchBook {
-  const candidate = searchSourceCandidate(book)
+  const candidates = mergeSourceCandidates([book], book.sourceCandidates ?? [])
   return {
     ...book,
-    bookSourceUrls: book.origin ? [book.origin] : [],
-    sourceCandidates: candidate.origin && candidate.bookUrl ? [candidate] : [],
+    bookSourceUrls: Array.from(new Set([
+      ...(book.bookSourceUrls ?? []),
+      book.origin,
+      ...candidates.map((candidate) => candidate.origin),
+    ].filter(Boolean))),
+    sourceCandidates: candidates,
   }
 }
 
 export function mergeSearchResult(existing: SearchBook, incoming: SearchBook): SearchBook {
-  const urls = new Set(existing.bookSourceUrls ?? (existing.origin ? [existing.origin] : []))
-  if (incoming.origin) urls.add(incoming.origin)
-
-  const candidates = [...(existing.sourceCandidates ?? [searchSourceCandidate(existing)])]
-  for (const candidate of incoming.sourceCandidates ?? [searchSourceCandidate(incoming)]) {
-    if (!candidate.origin || !candidate.bookUrl) continue
-    const sameSourceIndex = candidates.findIndex((item) => item.origin === candidate.origin)
-    if (sameSourceIndex === -1) {
-      candidates.push(candidate)
-    } else if (!candidates[sameSourceIndex].bookUrl) {
-      candidates[sameSourceIndex] = candidate
-    }
-  }
+  const candidates = mergeSourceCandidates(
+    [existing, ...(existing.sourceCandidates ?? [])],
+    [incoming, ...(incoming.sourceCandidates ?? [])],
+  )
+  const urls = new Set([
+    ...(existing.bookSourceUrls ?? []),
+    ...(incoming.bookSourceUrls ?? []),
+    existing.origin,
+    incoming.origin,
+    ...candidates.map((candidate) => candidate.origin),
+  ].filter(Boolean))
 
   return {
     ...existing,
@@ -80,6 +82,40 @@ export function mergeSearchResult(existing: SearchBook, incoming: SearchBook): S
     updateTime: existing.updateTime || incoming.updateTime,
     wordCount: existing.wordCount || incoming.wordCount,
   }
+}
+
+/** A source can return several editions or aggregate sites for the same book. */
+export function sourceCandidateKey(candidate: Pick<SearchBook, 'origin' | 'bookUrl'>): string {
+  return JSON.stringify([candidate.origin.trim().replace(/\/+$/, ''), candidate.bookUrl])
+}
+
+/** Keep every distinct link, updating repeated hits with their latest metadata. */
+export function mergeSourceCandidates(
+  current: readonly SearchBook[],
+  incoming: readonly SearchBook[] = [],
+): SearchBook[] {
+  const candidates = new Map<string, SearchBook>()
+  for (const book of [...current, ...incoming]) {
+    if (!book.origin.trim() || !book.bookUrl.trim()) continue
+    const candidate = searchSourceCandidate(book)
+    const key = sourceCandidateKey(candidate)
+    const previous = candidates.get(key)
+    candidates.set(key, previous ? {
+      ...previous,
+      ...candidate,
+      name: candidate.name || previous.name,
+      author: candidate.author || previous.author,
+      originName: candidate.originName || previous.originName,
+      originGroup: candidate.originGroup || previous.originGroup,
+      coverUrl: candidate.coverUrl || previous.coverUrl,
+      intro: candidate.intro || previous.intro,
+      kind: candidate.kind || previous.kind,
+      lastChapter: candidate.lastChapter || previous.lastChapter,
+      updateTime: candidate.updateTime || previous.updateTime,
+      wordCount: candidate.wordCount || previous.wordCount,
+    } : candidate)
+  }
+  return Array.from(candidates.values())
 }
 
 function searchSourceCandidate(book: SearchBook): SearchBook {
@@ -111,14 +147,10 @@ export function normalizeSourceSwitchAuthor(value?: string): string {
   return normalizeSearchAuthor((value || '').replace(/\s+/g, ''))
 }
 
-/** Keep a candidate when its author is missing or matches the current book. */
-export function matchesSourceSwitchAuthor(
-  currentAuthor: string | undefined,
-  candidateAuthor: string | undefined,
-): boolean {
-  const current = normalizeSourceSwitchAuthor(currentAuthor)
-  const candidate = normalizeSourceSwitchAuthor(candidateAuthor)
-  return !current || !candidate || current === candidate
+/** Legado's default source switch matches the complete, whitespace-normalized title. */
+export function matchesSourceSwitchTitle(currentTitle: string, candidateTitle: string): boolean {
+  const current = currentTitle.replace(/\s+/g, '')
+  return current.length > 0 && current === candidateTitle.replace(/\s+/g, '')
 }
 
 function normalizeSearchText(value: string): string {
