@@ -21,6 +21,7 @@ vi.mock('../api/invoke', () => ({
   post: vi.fn(),
   invokeEnvelope: vi.fn(),
   invokeRaw: vi.fn(),
+  invokeUpload: vi.fn(),
 }))
 
 const { readerOrigin } = await import('../api/scheme')

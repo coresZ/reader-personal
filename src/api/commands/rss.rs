@@ -1,3 +1,4 @@
+use crate::api::commands::{decode_header_file_name, decode_upload_body};
 use crate::api::AppState;
 use serde::Deserialize;
 use serde_json::Value;
@@ -134,10 +135,13 @@ pub async fn read_remote_rss_source_file(
 
 #[tauri::command]
 pub async fn read_rss_source_file(
-    file: Vec<u8>,
-    file_name: String,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    // 扩展名判断先于 body 解码：与原实现一致，非法扩展名一律返回
+    // "No json file uploaded"，而不是先报 body 形式的错。
+    let file_name = decode_header_file_name(&request)?;
     if file_name.ends_with(".json") || file_name.ends_with(".txt") {
+        let file = decode_upload_body(request.body())?;
         let text = String::from_utf8_lossy(&file);
         let sources: Vec<RssSource> = serde_json::from_str(&text).or_else(|_| {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {

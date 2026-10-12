@@ -3,15 +3,19 @@ import {
   createWebdavFileBlob,
   decodeWebdavFileText,
   syncLegadoBookProgress,
+  uploadFilesToWebdav,
   uploadLegadoBookProgress,
 } from './webdav'
-import { invokeEnvelope } from './invoke'
+import { invokeEnvelope, invokeUpload } from './invoke'
 
 vi.mock('./invoke', () => ({
   get: vi.fn(),
   post: vi.fn(),
   invokeEnvelope: vi.fn(),
   invokeRaw: vi.fn(),
+  // 本文件的模块图当前不触达上传，但 mock 需与 invoke.ts 的导出保持一致，
+  // 否则将来重构引入命名导入时会以 "invokeUpload is not a function" 报错。
+  invokeUpload: vi.fn(),
 }))
 
 describe('webdav binary file conversion', () => {
@@ -77,5 +81,48 @@ describe('webdav binary file conversion', () => {
     expect(invokeEnvelope).toHaveBeenCalledWith('upload_legado_book_progress', {
       req: { config, progress },
     })
+  })
+})
+
+describe('uploadFilesToWebdav', () => {
+  /** 多文件改为「逐文件调用」：每个文件一次 invokeUpload，字节走二进制通道，
+   *  文件名与目标目录走 header（值经 encodeURIComponent 以承载中文）。 */
+  it('uploads each file in one call with name and path headers', async () => {
+    const calls: Array<{ command: string; headers: Record<string, string>; blob: Blob }> = []
+    vi.mocked(invokeUpload).mockImplementation(async (command, headers, blob) => {
+      calls.push({ command, headers, blob: blob as Blob })
+      const name = decodeURIComponent(headers['x-reader-file-name'])
+      return [{ name, size: 1, path: `/${name}`, lastModified: 0, isDirectory: false }]
+    })
+
+    const files = [
+      { file: new Blob(['a']), name: '第一本.json' },
+      { file: new Blob(['b']), name: 'book two.json' },
+    ]
+    const entries = await uploadFilesToWebdav(files, '/备份')
+
+    expect(calls.map((c) => c.command)).toEqual([
+      'upload_file_to_webdav',
+      'upload_file_to_webdav',
+    ])
+    // 顺序与传入一致
+    expect(calls.map((c) => c.headers['x-reader-file-name'])).toEqual([
+      encodeURIComponent('第一本.json'),
+      encodeURIComponent('book two.json'),
+    ])
+    // 目标目录同样走 header，中文目录可还原
+    for (const call of calls) {
+      expect(decodeURIComponent(call.headers['x-reader-webdav-path'])).toBe('/备份')
+    }
+    // 每个文件传的是自己的 Blob
+    expect(calls.map((c) => c.blob)).toEqual(files.map((f) => f.file))
+    // 返回值是各次结果的汇总
+    expect(entries.map((e) => e.name)).toEqual(['第一本.json', 'book two.json'])
+  })
+
+  it('makes no call for an empty file list', async () => {
+    vi.mocked(invokeUpload).mockClear()
+    expect(await uploadFilesToWebdav([], '/')).toEqual([])
+    expect(invokeUpload).not.toHaveBeenCalled()
   })
 })

@@ -1,4 +1,5 @@
-import { get, post, invokeEnvelope } from './invoke'
+import { get, post, invokeUpload } from './invoke'
+import { FILE_NAME_HEADER, encodeFileName } from './uploadHeader'
 import type { RssArticle, RssSource } from '../types'
 
 export function getRssSources() {
@@ -42,9 +43,11 @@ export function readRemoteRssSourceFile(url: string) {
   return post<string[]>('/readRemoteRssSourceFile', { url }).then((r) => r.data)
 }
 
+/** 读取本地 RSS 源 JSON。字节走 octet-stream 快速通道, 文件名走 IPC header。 */
 export async function readRssSourceFile(file: File) {
-  return invokeEnvelope<RssSource[]>('read_rss_source_file', {
-    fileName: file.name,
-    file: new Uint8Array(await file.arrayBuffer()),
-  })
+  return invokeUpload<RssSource[]>(
+    'read_rss_source_file',
+    { [FILE_NAME_HEADER]: encodeFileName(file.name) },
+    file,
+  )
 }

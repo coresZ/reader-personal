@@ -1,3 +1,4 @@
+use crate::api::commands::{decode_header_file_name, decode_upload_body};
 use crate::api::AppState;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -122,12 +123,16 @@ pub async fn list_custom_fonts(
 #[tauri::command]
 pub async fn upload_custom_font(
     state: tauri::State<'_, AppState>,
-    file: Vec<u8>,
-    file_name: String,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<ApiResponse<CustomFontEntry>, AppError> {
+    // 顺序与改动前一致：先校验大小，再处理文件名。
+    // `decode_header_file_name` 会因缺 header/空名报错，若放在大小校验之前，
+    // "超大文件 + 坏文件名"的报错文案就会与原实现不同。
+    let file = decode_upload_body(request.body())?;
     if file.is_empty() || file.len() > MAX_FONT_BYTES {
         return Err(AppError::BadRequest("字体文件为空或超过 32 MB".to_string()));
     }
+    let file_name = decode_header_file_name(&request)?;
     let original = PathBuf::from(&file_name);
     let extension = original
         .extension()
@@ -263,12 +268,14 @@ fn book_cover_path_from_url(state: &AppState, url: &str) -> Option<PathBuf> {
 #[tauri::command]
 pub async fn upload_book_cover(
     state: tauri::State<'_, AppState>,
-    file: Vec<u8>,
-    file_name: String,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<ApiResponse<String>, AppError> {
+    // 顺序与改动前一致：先校验大小，再处理文件名（理由同 upload_custom_font）。
+    let file = decode_upload_body(request.body())?;
     if file.is_empty() || file.len() > MAX_BOOK_COVER_BYTES {
         return Err(AppError::BadRequest("封面图片为空或超过 8 MB".to_string()));
     }
+    let file_name = decode_header_file_name(&request)?;
     let extension = PathBuf::from(&file_name)
         .extension()
         .and_then(|value| value.to_str())

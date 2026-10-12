@@ -1,4 +1,8 @@
-import { get, post, invokeEnvelope, invokeRaw } from './invoke'
+import { get, post, invokeEnvelope, invokeRaw, invokeUpload } from './invoke'
+import { FILE_NAME_HEADER, encodeFileName } from './uploadHeader'
+
+/** WebDAV 目标目录的 IPC header，与 Rust 侧 `WEBDAV_PATH_HEADER` 必须一致。 */
+const WEBDAV_PATH_HEADER = 'x-reader-webdav-path'
 
 export interface WebdavFileEntry {
   name: string
@@ -157,13 +161,19 @@ function toUint8Array(bytes: WebdavBinaryResponse['bytes']) {
 }
 
 export async function uploadFilesToWebdav(files: Array<{ file: Blob; name: string }>, path = '/') {
-  const uploadFiles = await Promise.all(
-    files.map(async (item) => ({
-      name: item.name,
-      file: new Uint8Array(await item.file.arrayBuffer()),
-    })),
-  )
-  return invokeEnvelope<WebdavFileEntry[]>('upload_file_to_webdav', { path, files: uploadFiles })
+  const uploaded: WebdavFileEntry[] = []
+  for (const item of files) {
+    const entries = await invokeUpload<WebdavFileEntry[]>(
+      'upload_file_to_webdav',
+      {
+        [FILE_NAME_HEADER]: encodeFileName(item.name),
+        [WEBDAV_PATH_HEADER]: encodeFileName(path),
+      },
+      item.file,
+    )
+    uploaded.push(...entries)
+  }
+  return uploaded
 }
 
 export function createWebdavBackupArchive(

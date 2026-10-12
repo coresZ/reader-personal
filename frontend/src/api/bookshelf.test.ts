@@ -8,6 +8,7 @@ vi.mock('./invoke', () => ({
   post: vi.fn(),
   invokeEnvelope: vi.fn(),
   invokeRaw: vi.fn(),
+  invokeUpload: vi.fn(),
 }))
 
 describe('getCoverUrl', () => {

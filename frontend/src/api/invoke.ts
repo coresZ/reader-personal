@@ -143,4 +143,33 @@ export async function invokeEnvelope<T>(
   return res.data as T
 }
 
-export default { get, post, invokeRaw, invokeEnvelope }
+/**
+ * 上传二进制文件专用：把字节作为**顶层** payload 交给 Tauri。
+ *
+ * 为什么不能复用 `invokeEnvelope` —— Tauri 只在载荷本身是二进制时才走
+ * octet-stream 通道（tauri 的 process-ipc-message-fn.js: 顶层 ArrayBuffer /
+ * ArrayBufferView / Array 才命中）。一旦把 `Uint8Array` 塞进对象（如
+ * `{ fileName, file }`），就落进 `JSON.stringify` 分支，那里对 Uint8Array 做
+ * `Array.from(val)` —— 每个字节变成一个十进制数字、平均 3.57 个字符。
+ * 一本 50MB 的 TXT 会因此涨到约 178MB 字符串再被 Rust 解析回字节，
+ * 纯编码就要 1.8s 以上，这正是"导入本地书比初版慢几倍"的主因。
+ *
+ * 顶层传字节后，附带信息（文件名等）改走 IPC 的 header。注意 header 值只能是
+ * ASCII，中文文件名必须在调用方先 encodeURIComponent，Rust 侧再解码。
+ *
+ * 参数收 `Blob` 而非 `File`：WebDAV 上传传的是 `Blob`（无 .name），
+ * `File` 是其子类，因此两类调用点都能用。
+ */
+export async function invokeUpload<T>(
+  command: string,
+  commandHeaders: Record<string, string>,
+  file: Blob,
+): Promise<T> {
+  const res = await invoke<ApiResponse<T>>(command, new Uint8Array(await file.arrayBuffer()), {
+    headers: commandHeaders,
+  })
+  if (!res.isSuccess) throw new Error(res.errorMsg || '请求失败')
+  return res.data as T
+}
+
+export default { get, post, invokeRaw, invokeEnvelope, invokeUpload }

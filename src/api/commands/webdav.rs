@@ -1,3 +1,4 @@
+use crate::api::commands::{decode_header_file_name, decode_upload_body};
 use crate::api::AppState;
 use crate::error::error::{ApiResponse, AppError};
 use crate::util::time::now_ts;
@@ -96,11 +97,9 @@ pub struct WebdavDeleteListRequest {
     pub path: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct WebdavUploadFile {
-    pub name: String,
-    pub file: Vec<u8>,
-}
+/// 上传目标目录（相对 WebDAV 根）。与文件名 header 一样走 header，值经
+/// percent-encode（目录名可能含中文）。
+const WEBDAV_PATH_HEADER: &str = "x-reader-webdav-path";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,38 +230,80 @@ pub async fn save_webdav_file_as(
     })))
 }
 
+/// 还原 percent-encoded 的 WebDAV 目标目录（纯函数，便于单测）。
+///
+/// header 缺失或解码失败都回退为空串 —— 与原先 `path: None` 一样按根目录处理
+/// （`normalize_rel_path` 对 `""` 与 `"/"` 等价）。
+fn parse_webdav_path_header(raw: Option<&str>) -> String {
+    raw.and_then(|value| urlencoding::decode(value).ok())
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_default()
+}
+
+/// 校验上传文件名必须是单独一层名字，不能带目录或 `..`。
+///
+/// `file_name` 最终用于 `dir.join(&file_name)`，若允许 `../x` 就能写到目标目录
+/// 之外（`decode_header_file_name` 只做 trim 与非空校验，不拦路径）。正常 UI
+/// 下 `File.name` 不含分隔符，但直接调 IPC 可以构造，因此在这里兜住。
+///
+/// 复用 `normalize_rel_path`: 它把 `.` 当无意义片段、拦下 `..`。
+/// 反斜杠单独拦一次 —— `normalize_rel_path` 只按 `/` 切分，而 Windows 上
+/// `\` 同样是路径分隔符。
+fn validate_upload_file_name(file_name: &str) -> Result<(), AppError> {
+    let parts = normalize_rel_path(file_name)?;
+    // 必须恰好一层，且与原名完全一致 —— 借此排除 "a/b"、"a\\b" 这类形态。
+    if parts.len() == 1 && parts[0] == file_name && !file_name.contains('\\') {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest("文件名无效".to_string()))
+    }
+}
+
+/// 上传单个文件到 WebDAV 目录。
+///
+/// 原实现一次收 `Vec<WebdavUploadFile>`（每个文件一个 `Vec<u8>` 字段），
+/// 那要求把所有文件字节塞进一个 JSON 对象 —— 会被逐字节序列化成十进制数字
+/// 数组（见 `decode_upload_body` 注释）。改为前端逐个文件调用本命令，字节走
+/// octet-stream 快速通道，文件名与目标目录走 header。
+///
+/// 返回值仍是与原先一致的**单元素数组**，前端无需改解析逻辑。
 #[tauri::command]
 pub async fn upload_file_to_webdav(
     state: tauri::State<'_, AppState>,
-    files: Vec<WebdavUploadFile>,
-    path: Option<String>,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
-    let home = webdav_home(&state, &user_ns).await?;
-    let path = path.unwrap_or_else(|| "/".to_string());
-    let mut file_list = Vec::new();
+    let file_name = decode_header_file_name(&request)?;
+    validate_upload_file_name(&file_name)?;
+    let file = decode_upload_body(request.body())?;
+    let path = parse_webdav_path_header(
+        request
+            .headers()
+            .get(WEBDAV_PATH_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    );
 
+    let home = webdav_home(&state, &user_ns).await?;
     let rel = normalize_rel_path(&path)?;
     let dir = join_parts(&home, &rel);
     fs::create_dir_all(&dir)
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
-    for upload in files {
-        let target = dir.join(&upload.name);
-        fs::write(&target, &upload.file)
-            .await
-            .map_err(|e| AppError::Internal(e.into()))?;
-        let meta = fs::metadata(&target)
-            .await
-            .map_err(|e| AppError::Internal(e.into()))?;
-        file_list.push(serde_json::json!({
-            "name": upload.name,
-            "size": meta.len(),
-            "path": target.to_string_lossy().replace(home.to_string_lossy().as_ref(), ""),
-            "lastModified": meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(now_ts()),
-            "isDirectory": meta.is_dir()
-        }));
-    }
+
+    let target = dir.join(&file_name);
+    fs::write(&target, &*file)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+    let meta = fs::metadata(&target)
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+    let file_list = vec![serde_json::json!({
+        "name": file_name,
+        "size": meta.len(),
+        "path": target.to_string_lossy().replace(home.to_string_lossy().as_ref(), ""),
+        "lastModified": meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(now_ts()),
+        "isDirectory": meta.is_dir()
+    })];
     Ok(ApiResponse::ok(Value::from(file_list)))
 }
 
@@ -1370,6 +1411,61 @@ fn read_backup_archive(bytes: Vec<u8>) -> Result<HashMap<String, String>, AppErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 目标目录走 header。缺失/空/中文/空格的还原，以及"根目录"回退，
+    /// 都必须与原先 `path: Option<String>`（None → "/"）行为一致。
+    #[test]
+    fn webdav_path_header_restores_directory() {
+        // 缺失与空串都回退为空串 → normalize_rel_path 视作根目录
+        assert_eq!(parse_webdav_path_header(None), "");
+        assert_eq!(parse_webdav_path_header(Some("")), "");
+        // "/" 也是根目录（前端的默认值）
+        assert_eq!(parse_webdav_path_header(Some("%2F")), "/");
+        // 与前端 encodeURIComponent 一致：中文目录、含空格目录
+        assert_eq!(
+            parse_webdav_path_header(Some("%E4%B9%A6%E7%B1%8D")),
+            "书籍"
+        );
+        assert_eq!(parse_webdav_path_header(Some("/my%20dir")), "/my dir");
+        assert_eq!(parse_webdav_path_header(Some("/a/b")), "/a/b");
+    }
+
+    /// 空串与 "/" 必须解析出同一个目标目录，否则根目录上传会跑到别处。
+    #[test]
+    fn webdav_root_path_forms_are_equivalent() {
+        assert_eq!(normalize_rel_path("").unwrap(), normalize_rel_path("/").unwrap());
+        assert!(normalize_rel_path("").unwrap().is_empty());
+    }
+
+    /// 上传目录里的 `..` 必须被拦住（`encodeURIComponent('..') === '..'`，
+    /// 前端不会替我们转义它）。这条守住的是路径穿越防线。
+    #[test]
+    fn webdav_path_rejects_parent_traversal() {
+        assert!(normalize_rel_path("../etc").is_err());
+        assert!(normalize_rel_path("/a/../../b").is_err());
+        // 单层目录名里含点号是合法的，不该被误拦
+        assert!(normalize_rel_path("/my..dir").is_ok());
+    }
+
+    /// 上传文件名必须只有一层：`dir.join(&file_name)` 不能逃出目标目录。
+    /// 正常文件名要放行，含分隔符或 `..` 的一律拒绝。
+    #[test]
+    fn webdav_upload_file_name_rejects_path_escapes() {
+        // 合法：普通名、含点号的名、中文名、含空格的名
+        for ok in ["a.txt", "my..dir.txt", "书籍.json", "book two.zip"] {
+            assert!(
+                validate_upload_file_name(ok).is_ok(),
+                "应当接受: {ok}"
+            );
+        }
+        // 非法：父目录逃逸、绝对/相对路径、反斜杠（Windows 分隔符）
+        for bad in ["../evil.txt", "a/../../b.txt", "/etc/passwd", "a/b.txt", "..\\evil.txt", "a\\b.txt", ".."] {
+            assert!(
+                validate_upload_file_name(bad).is_err(),
+                "应当拒绝: {bad}"
+            );
+        }
+    }
 
     #[test]
     fn compatible_backup_archive_round_trip() {

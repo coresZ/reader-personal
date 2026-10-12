@@ -1,4 +1,5 @@
-import { get, post, invokeEnvelope } from './invoke'
+import { get, post, invokeEnvelope, invokeUpload } from './invoke'
+import { FILE_NAME_HEADER, encodeFileName } from './uploadHeader'
 import type { BookSource, BookSourceTestResponse } from '../types'
 import { MAX_SOURCE_TEST_BATCH_SIZE } from '../utils/sourceTesting'
 import { Channel } from '@tauri-apps/api/core'
@@ -101,11 +102,13 @@ export function readRemoteSourceFile(url: string) {
   return post<string[]>('/readRemoteSourceFile', { url }).then((r) => r.data)
 }
 
+/** 读取本地书源 JSON。字节走 octet-stream 快速通道, 文件名走 IPC header。 */
 export async function readSourceFile(file: File) {
-  return invokeEnvelope<BookSource[]>('read_source_file', {
-    fileName: file.name,
-    file: new Uint8Array(await file.arrayBuffer()),
-  })
+  return invokeUpload<BookSource[]>(
+    'read_source_file',
+    { [FILE_NAME_HEADER]: encodeFileName(file.name) },
+    file,
+  )
 }
 
 export function exportBookSources(sources: BookSource[]) {

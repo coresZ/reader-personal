@@ -1,3 +1,4 @@
+use crate::api::commands::{decode_header_file_name, decode_upload_body};
 use crate::api::AppState;
 use crate::error::error::{ApiResponse, AppError};
 use crate::model::{book::Book, book_chapter::BookChapter, book_source::BookSource, search::SearchBook};
@@ -1138,13 +1139,17 @@ pub async fn get_bookshelf(
 #[tauri::command]
 pub async fn upload_txt_book(
     state: tauri::State<'_, AppState>,
-    file: Vec<u8>,
-    file_name: String,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
+    // 顺序与改动前一致：先校验大小，再解文件名。
+    // `decode_header_file_name` 会因缺 header/空名报错，若放在大小校验之前，
+    // "超大文件 + 坏文件名"的报错文案就会与原实现不同。
+    let file = decode_upload_body(request.body())?;
     if file.len() > MAX_TXT_UPLOAD_BYTES {
         return Err(AppError::BadRequest("TXT 文件不能超过 50MB".to_string()));
     }
+    let file_name = decode_header_file_name(&request)?;
     let book = state
         .local_txt_book_service
         .import_txt_book(&user_ns, &file_name, &file)
@@ -1158,13 +1163,14 @@ pub async fn upload_txt_book(
 #[tauri::command]
 pub async fn upload_epub_book(
     state: tauri::State<'_, AppState>,
-    file: Vec<u8>,
-    file_name: String,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
+    let file = decode_upload_body(request.body())?;
     if file.len() > MAX_EPUB_UPLOAD_BYTES {
         return Err(AppError::BadRequest("EPUB 文件不能超过 80MB".to_string()));
     }
+    let file_name = decode_header_file_name(&request)?;
     let book = state
         .local_epub_book_service
         .import_epub_book(&user_ns, &file_name, &file)
@@ -1178,13 +1184,14 @@ pub async fn upload_epub_book(
 #[tauri::command]
 pub async fn upload_pdf_book(
     state: tauri::State<'_, AppState>,
-    file: Vec<u8>,
-    file_name: String,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
+    let file = decode_upload_body(request.body())?;
     if file.len() > MAX_PDF_UPLOAD_BYTES {
         return Err(AppError::BadRequest("PDF 文件不能超过 100MB".to_string()));
     }
+    let file_name = decode_header_file_name(&request)?;
     let book = state
         .local_pdf_book_service
         .import_pdf_book(&user_ns, &file_name, &file)
@@ -3152,7 +3159,8 @@ mod tests {
         take_available_source_sse_matches, GetAvailableBookSourceRequest,
         SearchCancellationGuard, SEARCH_CANCELLATIONS, SEARCH_CANCEL_REQUESTS,
         SEARCH_CANCEL_REQUEST_TTL,
-    };    use crate::error::error::AppError;
+    };
+    use crate::error::error::AppError;
     use crate::model::book_chapter::BookChapter;
     use crate::model::{book::Book, search::SearchBook};
     use futures::StreamExt;

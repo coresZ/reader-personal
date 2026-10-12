@@ -1,4 +1,5 @@
-import { invokeEnvelope } from './invoke'
+import { invokeEnvelope, invokeUpload } from './invoke'
+import { FILE_NAME_HEADER, encodeFileName } from './uploadHeader'
 
 /** 书籍自定义封面。
  *
@@ -10,12 +11,16 @@ export const MAX_BOOK_COVER_BYTES = 8 * 1024 * 1024
 
 export const BOOK_COVER_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif'] as const
 
-/** 上传封面, 返回可直接存进 `Book.customCoverUrl` 的 URL。 */
+/** 上传封面, 返回可直接存进 `Book.customCoverUrl` 的 URL。
+ *
+ *  字节走 Tauri 的 octet-stream 快速通道, 文件名走 IPC header —— 详见
+ *  `invokeUpload` 与 `uploadHeader.ts` 的说明。 */
 export async function uploadBookCover(file: File) {
-  return invokeEnvelope<string>('upload_book_cover', {
-    fileName: file.name,
-    file: new Uint8Array(await file.arrayBuffer()),
-  })
+  return invokeUpload<string>(
+    'upload_book_cover',
+    { [FILE_NAME_HEADER]: encodeFileName(file.name) },
+    file,
+  )
 }
 
 /** 删除本应用存下的封面文件。

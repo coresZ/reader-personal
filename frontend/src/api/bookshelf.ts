@@ -1,6 +1,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core'
-import { get, post, invokeEnvelope } from './invoke'
+import { get, post, invokeUpload } from './invoke'
 import { readerOrigin } from './scheme'
+import { FILE_NAME_HEADER, encodeFileName } from './uploadHeader'
 import type { ApiResponse, Book, BookChapter, BookGroup } from '../types'
 
 export function getBookshelf() {
@@ -19,25 +20,23 @@ export function saveBooks(books: Partial<Book>[]) {
   return post<Book[]>('/saveBooks', books).then((r) => r.data)
 }
 
+/**
+ * 本地书籍上传。
+ *
+ * 文件名走 header（IPC header 值只能是 ASCII，中文名先 percent-encode，
+ * Rust 侧 `decode_header_file_name` 还原）；字节作为顶层 payload 走 Tauri 的
+ * octet-stream 快速通道，避免被 JSON 序列化成十进制数字数组。
+ */
 export async function uploadTxtBook(file: File) {
-  return invokeEnvelope<Book>('upload_txt_book', {
-    fileName: file.name,
-    file: new Uint8Array(await file.arrayBuffer()),
-  })
+  return invokeUpload<Book>('upload_txt_book', { [FILE_NAME_HEADER]: encodeFileName(file.name) }, file)
 }
 
 export async function uploadEpubBook(file: File) {
-  return invokeEnvelope<Book>('upload_epub_book', {
-    fileName: file.name,
-    file: new Uint8Array(await file.arrayBuffer()),
-  })
+  return invokeUpload<Book>('upload_epub_book', { [FILE_NAME_HEADER]: encodeFileName(file.name) }, file)
 }
 
 export async function uploadPdfBook(file: File) {
-  return invokeEnvelope<Book>('upload_pdf_book', {
-    fileName: file.name,
-    file: new Uint8Array(await file.arrayBuffer()),
-  })
+  return invokeUpload<Book>('upload_pdf_book', { [FILE_NAME_HEADER]: encodeFileName(file.name) }, file)
 }
 
 export function deleteBook(book: Partial<Book>) {
