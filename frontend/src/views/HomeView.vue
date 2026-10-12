@@ -157,7 +157,10 @@
     <!-- Group Select Modal -->
     <GroupSelectModal
       v-model="showGroupSelect"
-      @select="handleSetGroup"
+      :books="groupEditTargets"
+      :book-count="groupEditTargets.length"
+      :submitting="groupSaving"
+      @confirm="handleGroupConfirm"
     />
     <GroupManagerModal v-model="showGroupManager" />
 
@@ -167,7 +170,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useBookshelfStore } from '../stores/bookshelf'
 import { useReaderStore } from '../stores/reader'
@@ -190,8 +193,10 @@ const appStore = useAppStore()
 
 const showDetail = ref(false)
 const showGroupSelect = ref(false)
-/** 右键「移入分组」时记住目标书; 为空表示走批量(编辑模式多选)路径。 */
+/** 右键「调整分组」时记住目标书; 为空表示走批量(编辑模式多选)路径。 */
 const groupTargetBookUrl = ref('')
+/** 分组落盘进行中: 传给弹窗禁用保存按钮。 */
+const groupSaving = ref(false)
 const showGroupManager = ref(false)
 const showCacheManager = ref(false)
 const showExportModal = ref(false)
@@ -205,6 +210,19 @@ watch(showDetail, (visible) => {
 const openingBookUrl = ref('')
 const localBookFileInputRef = ref<HTMLInputElement | null>(null)
 const localBookUploading = ref(false)
+
+/** 分组编辑器的目标书: 右键单本时是那一本, 批量时是所有选中书。
+ *
+ *  用 computed 而不是打开时快照 —— 弹窗开着时用户没法改选中集, 但 store
+ *  数据可能在后台刷新, 引用最新对象能保证勾选状态基于最新位域初始化。 */
+const groupEditTargets = computed(() => {
+  const target = groupTargetBookUrl.value
+  if (target) {
+    const book = shelfStore.books.find((b) => b.bookUrl === target)
+    return book ? [book] : []
+  }
+  return shelfStore.books.filter((b) => shelfStore.selectedBookUrls.has(b.bookUrl))
+})
 
 onMounted(async () => {
   let skipOfflineRestore = false
@@ -307,8 +325,8 @@ function handleBookContextMenu({ book, event }: { book: Book | SearchBook; event
     { label: '查看详情', action: () => handleBookInfo(book) },
     { label: '编辑信息', action: () => openDetail(book, true) },
     { divider: true },
-    // 单本移入分组: 记下这本书, 选中集此时必然是空的(编辑模式不弹本菜单)。
-    { label: '移入分组', action: () => openGroupSelect(book.bookUrl) },
+    // 单本分组调整: 记下这本书, 选中集此时必然是空的(编辑模式不弹本菜单)。
+    { label: '调整分组', action: () => openGroupSelect(book.bookUrl) },
     { label: '缓存管理', action: () => { showCacheManager.value = true } },
     { divider: true },
     { label: '删除', danger: true, action: () => handleDeleteBook(book) },
@@ -339,30 +357,39 @@ async function handleBulkMove() {
   openGroupSelect('')
 }
 
-/** 打开分组选择弹窗。`bookUrl` 非空表示单本移入, 空表示批量(编辑模式多选)。 */
+/** 打开分组编辑弹窗。`bookUrl` 非空表示单本调整, 空表示批量(编辑模式多选)。 */
 function openGroupSelect(bookUrl: string) {
   groupTargetBookUrl.value = bookUrl
   showGroupSelect.value = true
 }
 
-async function handleSetGroup(groupId: number) {
+/** 弹窗确认时按勾选位掩码落盘: 勾选即加入分组, 取消勾选即移出。 */
+async function handleGroupConfirm(mask: number) {
   const target = groupTargetBookUrl.value
+  groupSaving.value = true
   try {
     if (target) {
-      // 单本: 右键菜单路径。不能走 bulkSetGroup —— 那时选中集为空, 会静默什么都不做。
-      await shelfStore.setBookGroup(target, groupId)
-      appStore.showToast('已移入分组', 'success')
+      await shelfStore.setBooksGroupMask([target], mask)
+      appStore.showToast('分组已更新', 'success')
     } else {
-      const count = shelfStore.selectedBookUrls.size
-      await shelfStore.bulkSetGroup(groupId)
-      appStore.showToast(`成功将 ${count} 本书移至新分组`, 'success')
+      const urls = [...shelfStore.selectedBookUrls]
+      await shelfStore.setBooksGroupMask(urls, mask)
+      appStore.showToast(`已调整 ${urls.length} 本书的分组`, 'success')
+      shelfStore.clearSelection()
     }
+    showGroupSelect.value = false
   } catch (e: any) {
-    appStore.showToast(e.message, 'error')
+    // 失败时**保留** target 且不关弹窗: 用户在弹窗里重试仍是单本语义 ——
+    // 若在 finally 里清掉, 重试会退化成「0 本书的批量」, 显示成功却没保存。
+    appStore.showToast(e.message || '分组更新失败', 'error')
   } finally {
-    groupTargetBookUrl.value = ''
+    groupSaving.value = false
   }
 }
+// 弹窗最终关闭(成功或用户放弃)时才清 target, 与保存失败的重试互不冲突。
+watch(showGroupSelect, (visible) => {
+  if (!visible) groupTargetBookUrl.value = ''
+})
 async function handleReorderBooks(payload: { draggedUrl: string; targetUrl: string }) {
   try {
     await shelfStore.reorderBooks(payload.draggedUrl, payload.targetUrl)

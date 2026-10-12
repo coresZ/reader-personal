@@ -47,6 +47,31 @@ pub async fn build_state(cfg: &AppConfig) -> anyhow::Result<AppState> {
     let user_service = Arc::new(UserService::new(cfg.clone(), pool.clone()));
     user_service.migrate_legacy_users_from_json().await?;
     let book_group_service = Arc::new(BookGroupService::new(json_document_service.clone()));
+    // 一次性修复 issue #9 的存量数据: 旧版给新分组分配 max+1 产生非 2 幂 id,
+    // 书加入后同时命中多个分组。幂等, 干净数据不写任何文件。
+    // 失败只记日志、不阻断启动 —— 迁移本身是修复性操作, 数据越脏越不该让
+    // 应用起不来; 下次启动会重试(先书架后分组的落盘顺序保证可重入)。
+    let book_service_for_read = book_service.clone();
+    let book_service_for_write = book_service.clone();
+    match book_group_service
+        .migrate_non_power_of_two_group_ids(
+            "default",
+            // 闭包持有自己的 Arc 克隆, future 才不借用 bootstrap 的局部变量。
+            move || {
+                let service = book_service_for_read.clone();
+                async move { service.get_bookshelf("default").await }
+            },
+            move |books| {
+                let service = book_service_for_write.clone();
+                async move { service.save_books("default", books).await.map(|_| ()) }
+            },
+        )
+        .await
+    {
+        Ok(true) => tracing::info!("已迁移非 2 幂分组 id(修复书籍同时出现在多个分组的问题)"),
+        Ok(false) => {}
+        Err(err) => tracing::error!("分组 id 迁移失败(不阻断启动, 下次启动重试): {err}"),
+    }
     let reading_stats_service = Arc::new(ReadingStatsService::new(pool.clone()));
     let update_service = Arc::new(UpdateService::new(
         json_document_service.clone(),

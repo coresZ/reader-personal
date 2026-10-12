@@ -1,3 +1,4 @@
+import { invokeEnvelope } from '../api/invoke'
 import { getBookmarks, deleteBookmarks, saveBookmarks } from '../api/bookmark'
 import {
   deleteBookGroups,
@@ -354,10 +355,12 @@ async function clearCustomFonts() {
  *  这些负数当成「缺 id」改写掉, 破坏从 Legado 导入的分组语义。 */
 function normalizeGroupIds(groups: BookGroup[]): BookGroup[] {
   const used = new Set(groups.map((g) => g.groupId).filter((id) => id !== 0))
+  // 补出来的 id 必须是 2 的幂 —— 书的 group 是位域, 非 2 幂 id 会让书同时
+  // 命中多个分组(issue #9)。used 里的非 2 幂旧 id 不在幂序列上, 天然无冲突。
   let next = 1
   return groups.map((group) => {
     if (group.groupId !== 0) return group
-    while (used.has(next)) next += 1
+    while (used.has(next)) next *= 2
     used.add(next)
     return { ...group, groupId: next }
   })
@@ -420,6 +423,11 @@ export async function restoreWebdavBackup(
       await importReadingStats(payload.readingStats).catch(() => undefined)
     }
   }
+
+  // 旧版本备份可能带非 2 幂的分组 id(saveBookGroupOrder 整表覆盖会原样写回),
+  // 书架会重新出现「一本书同时在多个分组」的串扰。迁移只在启动时跑, 这里
+  // 立即修一次, 免得用户以为修复无效; 失败静默 —— 下次启动还会兜底重试。
+  await invokeEnvelope('repair_book_groups', {}).catch(() => undefined)
 }
 
 function parseArchiveList(files: Record<string, string>, name: string): JsonRecord[] {

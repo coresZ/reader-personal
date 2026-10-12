@@ -81,6 +81,42 @@ pub async fn save_book_group_order(
     Ok(ApiResponse::ok(serde_json::json!("success")))
 }
 
+/// 修复非 2 幂的分组 id(与启动迁移同一逻辑)。
+///
+/// WebDAV 恢复旧版备份会经 `saveBookGroupOrder` 整表覆盖, 把非 2 幂的脏 id
+/// 原样写回 —— 迁移只在启动时跑, 恢复后不重启的话书架继续串扰, 用户会以为
+/// 「修复无效」。恢复流程末尾调用本命令立即修复, 免去重启。
+#[tauri::command]
+pub async fn repair_book_groups(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<Value>, AppError> {
+    let user_ns = "default";
+    let reader = state.book_service.clone();
+    let writer = state.book_service.clone();
+    let migrated = state
+        .book_group_service
+        .migrate_non_power_of_two_group_ids(
+            user_ns,
+            move || {
+                let service = reader.clone();
+                async move { service.get_bookshelf(user_ns).await }
+            },
+            move |books| {
+                let service = writer.clone();
+                async move {
+                    service
+                        .save_books(user_ns, books)
+                        .await
+                        .map(|_| ())
+                }
+            },
+        )
+        .await?;
+    Ok(ApiResponse::ok(
+        serde_json::json!({ "migrated": migrated }),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SaveBookGroupIdParam {
     #[serde(rename = "bookUrl")]

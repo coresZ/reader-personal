@@ -9,6 +9,11 @@ import {
 } from './webdavBackup'
 import { importCustomFonts, importLocalBooks, importReadingStats } from '../api/backup'
 
+vi.mock('../api/invoke', () => ({
+  // restoreWebdavBackup 末尾会调 repair_book_groups 立即修复旧备份里的
+  // 非 2 幂分组 id; 测试环境没有 Tauri IPC, 直接空实现。
+  invokeEnvelope: vi.fn(async () => ({ migrated: false })),
+}))
 vi.mock('../api/bookmark', () => ({
   getBookmarks: vi.fn(async () => []),
   deleteBookmarks: vi.fn(async () => undefined),

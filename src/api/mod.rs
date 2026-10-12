@@ -73,6 +73,7 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
         commands::book_group::delete_book_group,
         commands::book_group::delete_book_groups,
         commands::book_group::save_book_group_order,
+        commands::book_group::repair_book_groups,
         commands::book_group::save_book_group_id,
         commands::book_group::add_book_group_multi,
         commands::book_group::remove_book_group_multi,

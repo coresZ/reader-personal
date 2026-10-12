@@ -103,13 +103,17 @@ export const useBookshelfStore = defineStore('bookshelf', () => {
   }
 
   async function saveGroup(groupName: string, groupId = 0) {
+    // 记住刷新前的 id 集 —— 新建后列表里**多出来的**那个才是本次分配的 id。
+    // 不能按名字找: 后端不查重名, 同名时 find 命中的是旧分组, 勾选会挂错。
+    const knownIds = new Set(groups.value.map((group) => group.groupId))
     await apiSaveBookGroup({
       groupId,
       groupName,
       orderNo: groups.value.length,
     })
     await fetchGroups()
-    return groups.value.find((group) => group.groupName === groupName)?.groupId || groupId
+    if (groupId !== 0) return groupId
+    return groups.value.find((group) => !knownIds.has(group.groupId))?.groupId ?? 0
   }
 
   async function removeGroup(groupId: number) {
@@ -237,6 +241,31 @@ export const useBookshelfStore = defineStore('bookshelf', () => {
     await fetchBooks()
   }
 
+  /** 把一组书的 `group` 位域整体设置为 `mask`(勾选式分组编辑器的落盘入口)。
+   *
+   *  mask 直接是「这些书最终属于哪些分组」的位域: 老位全部失效, 新位以它
+   *  为准 —— 勾选即加入、取消勾选即移出(issue #9: 此前完全没有移出入口)。
+   *  用 saveBooks 整表覆盖一次, 避免逐本 N 个 IPC 往返。
+   *
+   *  与 setBookGroup/bulkSetGroup 的「赋值语义」不同, 本方法支持一本书同时
+   *  属于多个分组(Legado 位域原生语义), 也就是编辑器里勾选多个分组。 */
+  async function setBooksGroupMask(bookUrls: string[], mask: number) {
+    if (!bookUrls.length) return
+    const snapshot = books.value.slice()
+    const next = snapshot.map((book) => (
+      bookUrls.includes(book.bookUrl) ? { ...book, group: mask } : book
+    ))
+    books.value = next
+    try {
+      await apiSaveBooks(next)
+    } catch (error) {
+      // 落盘失败必须回滚内存, 理由同 removeGroups 的注释。
+      books.value = snapshot
+      throw error
+    }
+    await refreshRecentBooks()
+  }
+
   async function bulkSetGroup(groupId: number) {
     const urls = Array.from(selectedBookUrls.value)
     // 并发设置分组, 避免选中 50 本书时串行等 50 个往返
@@ -303,6 +332,6 @@ export const useBookshelfStore = defineStore('bookshelf', () => {
     searchScope, searchGroup, searchSourceUrl, startSearch, clearSearch, isSearchMode,
     editMode,
     selectedBookUrls, toggleSelection, selectAll, clearSelection,
-    bulkDelete, bulkSetGroup, setBookGroup, reorderBooks, moveBookToFront,
+    bulkDelete, bulkSetGroup, setBookGroup, setBooksGroupMask, reorderBooks, moveBookToFront,
   }
 })
