@@ -90,8 +90,22 @@ async fn source_panel_route(
         return text_response(404, "panel not found");
     };
     let target = params.get(if namespaced { "__readerPanelUrl" } else { "url" });
+    // 面板页 JS 改写自身 URL 的 query 后整页导航时(书山聚合登录页的
+    // `sw('register')`: `new URL(location.href)` + searchParams.set +
+    // location.href), 改动只落在代理 URL 的外层 query 上 —— 桥脚本的
+    // proxyUrl() 把上游 query 复制到外层, 且初始加载会按设计删掉
+    // __readerPanelUrl。只认 __readerPanelUrl 会让这类导航退回改写前的 URL,
+    // 页面永远停在原状态(点注册始终停在登录页)。
+    //
+    // 注意这里**不改变**抓取/静态渲染的判据: 存有面板 HTML 的形式
+    // (showBrowser(url, html), 如内嵌设置页)仍只在显式导航(target 存在)时
+    // 抓取上游, 其余继续静态渲染, 保持既有行为。合并只影响进入 fetch 分支后
+    // 实际请求的上游地址。
+    let base = target.map(String::as_str).unwrap_or(&entry.url);
+    let merged = merge_panel_outer_query(base, &params, namespaced);
+    let navigation = merged.as_deref().or(target.map(String::as_str));
     if target.is_some() || (entry.html.is_empty() && !entry.url.starts_with("data:")) {
-        return match fetch_source_panel_page(state, panel_id, &entry, target.map(String::as_str), request).await {
+        return match fetch_source_panel_page(state, panel_id, &entry, navigation, request).await {
             Ok(response) => response,
             Err(error) => text_response(502, &error.to_string()),
         };
@@ -103,6 +117,102 @@ async fn source_panel_route(
         .header(http::header::CACHE_CONTROL, "no-store")
         .body(html.into_bytes())
         .unwrap_or_else(|_| http::Response::new(Vec::new()))
+}
+
+/// 把代理 URL 外层 query 合并进上游 URL。
+///
+/// 面板内 JS 用 `new URL(location.href)` + `searchParams.set` + `location.href`
+/// 这类整页导航改写自身 query 时(书山聚合登录页的 `sw('register')`), 改动只会
+/// 落在代理 URL 的外层 query 上, 而 `__readerPanelUrl` 仍是改写前的地址。不透传
+/// 就会永远停在原状态(点注册始终回到登录页)。
+///
+/// 合并采用「外层覆盖内层」语义: 同为 `mode` 时以外层为准, 其余上游参数保留。
+/// 返回 `None` 表示无需合并(没有额外参数、外层与 base 一致、非 http(s)、或 base
+/// 不是绝对 URL), 调用方沿用原 target。
+fn merge_panel_outer_query(
+    base: &str,
+    params: &HashMap<String, String>,
+    namespaced: bool,
+) -> Option<String> {
+    let mut url = Url::parse(base).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    // 只排除本协议的传输字段。namespaced 形式下 `url`/`panelId` 可能是上游页面
+    // 自己的业务参数, 不能一并丢掉。
+    let transport: [&str; 2] = if namespaced {
+        ["__readerPanelId", "__readerPanelUrl"]
+    } else {
+        ["panelId", "url"]
+    };
+    let mut outer: Vec<(&str, &str)> = params
+        .iter()
+        .filter(|(key, _)| !transport.contains(&key.as_str()))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    // `params` 是 HashMap, 迭代序随机; 排序让追加顺序可复现(日志、缓存键)。
+    outer.sort_unstable();
+    if outer.is_empty() {
+        return None;
+    }
+
+    let existing: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    // 面板内导航的常态是外层 query 复制自上游(`proxyUrl` 的 `proxy.search = url.search`),
+    // 此时每个外层参数都已在 base 中原样存在, 无事可做 —— 返回 `None` 让调用方
+    // 沿用原 target, 避免 query 解码/重编码往返(如 `%20` → `+`、`%zz` → `%25zz`)
+    // 改写上游 URL 形式。上游按 query 原文签名/比对时, 这种改写会让请求失配。
+    let pending: Vec<(&str, &str)> = outer
+        .into_iter()
+        .filter(|&(key, value)| {
+            !existing
+                .iter()
+                .any(|(name, current)| name.as_str() == key && current.as_str() == value)
+        })
+        .collect();
+    if pending.is_empty() {
+        return None;
+    }
+
+    // 纯追加(无同名冲突, 即书山聚合点注册这类场景)时直接在原 query 后拼接,
+    // 保留既有片段原文 —— `query_pairs` 重建会把 `%20` 变 `+`、`%zz` 变
+    // `%25zz`, 上游按 query 原文签名/比对时会失配。
+    let overrides = pending
+        .iter()
+        .any(|(key, _)| existing.iter().any(|(name, _)| name.as_str() == *key));
+    if !overrides {
+        let mut query = url.query().unwrap_or_default().to_string();
+        for (key, value) in &pending {
+            if !query.is_empty() {
+                query.push('&');
+            }
+            query.push_str(&urlencoding::encode(key));
+            query.push('=');
+            query.push_str(&urlencoding::encode(value));
+        }
+        url.set_query(Some(&query));
+        return Some(url.to_string());
+    }
+
+    // 与桥脚本的 `searchParams.set` 一致: 同名参数先整体删除再追加, 而不是只覆盖
+    // 第一项 —— 上游 `?a=1&a=2` 遇外层 `a=3` 应得 `?a=3`, 不是 `?a=3&a=2`。
+    let mut merged: Vec<(String, String)> = existing
+        .into_iter()
+        .filter(|(name, _)| !pending.iter().any(|(key, _)| name == key))
+        .collect();
+    for (key, value) in pending {
+        merged.push((key.to_string(), value.to_string()));
+    }
+    url.set_query(None);
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in &merged {
+            pairs.append_pair(key, value);
+        }
+    }
+    Some(url.to_string())
 }
 
 /// 组装面板页: 面板 HTML + 注入的宿主桥脚本。面板不存在时返回 `None`。
@@ -1085,12 +1195,47 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
     var id = url.searchParams.get(url.searchParams.has("__readerPanelId") ? "__readerPanelId" : "panelId");
     return url.origin === panelOrigin && url.pathname === "/sourcePanel" && id === panelId;
   }}
+  // 面板页 JS 用 location.href 改写自身 query 做整页导航时(书山聚合登录页的
+  // sw('register')), 改动落在代理 URL 的外层 query 上, 而初始加载会按设计删掉
+  // __readerPanelUrl。不并回真实 URL, 导航就会退回改动前的地址 —— 点注册永远
+  // 停在登录页。同名参数以**外层为准**且整体替换(与 searchParams.set 一致),
+  // 与服务端 merge_panel_outer_query 的语义严格对应。
+  function mergeOuterQuery(from, to) {{
+    var namespaced = from.searchParams.has("__readerPanelId");
+    var skip = namespaced ? ["__readerPanelId", "__readerPanelUrl"] : ["panelId", "url"];
+    var pending = [];
+    from.searchParams.forEach(function (value, key) {{
+      if (skip.indexOf(key) >= 0) return;
+      // 已原样存在则跳过: 面板内导航的外层 query 常态是复制自上游, 此时不触碰
+      // to 的 query, 避免 searchParams 重新序列化(%20 → +、%zz → %25zz)改写
+      // 上游 URL 形式。
+      if (to.searchParams.getAll(key).indexOf(value) >= 0) return;
+      pending.push([key, value]);
+    }});
+    if (!pending.length) return to;
+    // 无同名冲突时直接追加到原文末尾, 与 Rust 侧的纯追加路径一致, 不改写既有
+    // query 片段; 有冲突才走 searchParams.delete + set(整体替换同名项)。
+    var conflicts = pending.some(function (pair) {{ return to.searchParams.has(pair[0]); }});
+    if (conflicts) {{
+      for (var i = 0; i < pending.length; i++) {{
+        to.searchParams.delete(pending[i][0]);
+        to.searchParams.set(pending[i][0], pending[i][1]);
+      }}
+      return to;
+    }}
+    var extra = pending.map(function (pair) {{
+      return encodeURIComponent(pair[0]) + "=" + encodeURIComponent(pair[1]);
+    }}).join("&");
+    var raw = to.search.replace(/^\?/, "");
+    to.search = (raw ? raw + "&" : "") + extra;
+    return to;
+  }}
   function realUrl(raw) {{
     var url = new URL(raw, pageUrl || window.location.href);
     if (isPanelUrl(url)) {{
       var original = panelTarget(url) || initialPageUrl;
       if (original) {{
-        var decoded = new URL(original);
+        var decoded = mergeOuterQuery(url, new URL(original));
         if (url.hash) decoded.hash = url.hash;
         return decoded;
       }}
@@ -1782,6 +1927,111 @@ mod tests {
         .unwrap();
         assert_eq!(target, "https://www.deqixss.com/login.php?jumpurl=https://www.deqixss.com/");
         assert!(proxy_target_matches_source(&target, "https://www.deqixss.com/"));
+    }
+
+    #[test]
+    fn panel_outer_query_overrides_upstream_query() {
+        // 书山聚合登录页 `sw('register')` 把 mode 写进代理 URL 外层 query,
+        // 初始加载已删掉 __readerPanelUrl(桥的 proxyUrl(url, storedHtml=true)),
+        // 合并必须把 mode=register 送到上游, 否则页面永远是登录态。
+        let params = parse_query("__readerPanelId=panel-1&mode=register");
+        let merged = merge_panel_outer_query("https://v1.vossc.com/user_login", &params, true).unwrap();
+        assert_eq!(merged, "https://v1.vossc.com/user_login?mode=register");
+        // 与真实域名校验配合, 合并结果仍在书源域名内
+        assert!(proxy_target_matches_source(&merged, "https://v1.vossc.com"));
+    }
+
+    #[test]
+    fn panel_outer_query_preserves_other_upstream_params() {
+        // 外层与内层同名时外层优先; 内层独有的参数保留。
+        let params = parse_query("__readerPanelId=panel-1&mode=register&page=3");
+        let merged = merge_panel_outer_query("https://example.com/list?mode=login&keep=1", &params, true).unwrap();
+        // 用有序序列断言, 不用 HashMap 收集(query_pairs 收集到 HashMap 会天然去重, 掩盖重复项问题)。
+        let pairs: Vec<(String, String)> = Url::parse(&merged).unwrap()
+            .query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        assert!(pairs.contains(&("mode".into(), "register".into())));
+        assert!(pairs.contains(&("keep".into(), "1".into())));
+        assert!(pairs.contains(&("page".into(), "3".into())));
+        // 被覆盖的旧值不得残留
+        assert!(!pairs.contains(&("mode".into(), "login".into())));
+    }
+
+    #[test]
+    fn panel_outer_query_replaces_every_duplicate_key() {
+        // review P1: 外层 `a=3` 必须整体替换上游 `?a=1&a=2`, 得 `?a=3` 而不是
+        // `?a=3&a=2` —— 后者会静默改变上游请求语义, 且与 JS 的 searchParams.set
+        // (删全部同名再设一个)不一致。
+        let params = parse_query("__readerPanelId=panel-1&a=3");
+        let merged = merge_panel_outer_query("https://example.com/x?a=1&a=2", &params, true).unwrap();
+        let pairs: Vec<(String, String)> = Url::parse(&merged).unwrap()
+            .query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        assert_eq!(pairs, vec![("a".to_string(), "3".to_string())]);
+    }
+
+    #[test]
+    fn panel_outer_query_leaves_identical_upstream_query_untouched() {
+        // review P5/P6: 面板内导航的外层 query 常态是 proxyUrl 复制自上游。
+        // 参数原样存在时必须返回 None, 让调用方沿用原 target, 不做
+        // query_pairs 解码/重编码往返(否则 %20 变 +、%zz 变 %25zz, 上游按
+        // query 原文签名时会失配), 也不因 HashMap 迭代序造成结果不稳定。
+        let base = "https://example.com/x?q=a%20b%2Fc&sig=%zz&keep=1";
+        let params = parse_query("__readerPanelId=panel-1&q=a%20b%2Fc&sig=%zz&keep=1");
+        assert!(merge_panel_outer_query(base, &params, true).is_none());
+    }
+
+    #[test]
+    fn panel_outer_query_skips_transport_and_untouched_cases() {
+        // 只有传输字段 → 无需合并, 调用方沿用原 target(不改变既有行为)。
+        let params = parse_query("__readerPanelId=panel-1&__readerPanelUrl=https%3A%2F%2Fexample.com%2Fx");
+        assert!(merge_panel_outer_query("https://example.com/x", &params, true).is_none());
+        // 非 namespaced 形态排除 url/panelId, 但上游自己的业务参数不可丢。
+        let params = parse_query("panelId=panel-1&url=https%3A%2F%2Fexample.com%2Fx&mode=register");
+        let merged = merge_panel_outer_query("https://example.com/x", &params, false).unwrap();
+        assert_eq!(merged, "https://example.com/x?mode=register");
+        // Non-http(s) 与 data: 面板不参与合并。
+        let params = parse_query("__readerPanelId=panel-1&mode=register");
+        assert!(merge_panel_outer_query("data:text/html,<p>x</p>", &params, true).is_none());
+        // base 不是绝对 URL(相对路径且无 scheme)时返回 None。
+        assert!(merge_panel_outer_query("/relative/path", &params, true).is_none());
+    }
+
+    #[test]
+    fn panel_outer_query_appends_without_rewriting_existing_query() {
+        // review P5: 纯追加场景(书山聚合点注册)不得重建整串 query, 否则
+        // `%20` 会被重编码成 `+`, 上游按 query 原文签名时会失配。
+        let params = parse_query("__readerPanelId=panel-1&mode=register");
+        let merged = merge_panel_outer_query("https://example.com/x?q=a%20b&sig=%zz", &params, true).unwrap();
+        assert!(merged.contains("q=a%20b"), "既有片段的原文必须保留: {merged}");
+        assert!(merged.contains("sig=%zz"), "非法百分号序列不得被改写: {merged}");
+        assert!(merged.ends_with("&mode=register"), "新参数追加在末尾: {merged}");
+    }
+
+    #[test]
+    fn panel_outer_query_has_stable_order_for_multiple_new_params() {
+        // review P6: params 是 HashMap, 迭代序随机; 排序后追加顺序可复现。
+        let params = parse_query("__readerPanelId=panel-1&zz=1&aa=2&mm=3");
+        let first = merge_panel_outer_query("https://example.com/x", &params, true).unwrap();
+        let second = merge_panel_outer_query("https://example.com/x", &params, true).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, "https://example.com/x?aa=2&mm=3&zz=1");
+    }
+
+    /// 书山聚合登录页的端到端链路: 初始加载(删掉 __readerPanelUrl)后页面 JS
+    /// 改写外层 query 触发注册导航, 上游必须收到 mode=register 才能渲染注册态。
+    #[test]
+    fn panel_register_navigation_reaches_upstream_with_mode() {
+        // 初始加载形态: proxyUrl(url, storedHtml=true) 会删掉 __readerPanelUrl
+        let initial = "http://reader.localhost/sourcePanel?__readerPanelId=panel-1";
+        let params = parse_query("__readerPanelId=panel-1");
+        assert!(merge_panel_outer_query("https://v1.vossc.com/user_login", &params, true).is_none());
+        // 页面 sw('register') 等价: 在 location.href 上加 mode 后整页导航
+        let navigated = format!("{initial}&mode=register");
+        let params = parse_query("__readerPanelId=panel-1&mode=register");
+        let merged = merge_panel_outer_query("https://v1.vossc.com/user_login", &params, true).unwrap();
+        assert_eq!(merged, "https://v1.vossc.com/user_login?mode=register");
+        assert!(proxy_target_matches_source(&merged, "https://v1.vossc.com"));
+        // 面板 URL 自身不得被当成上游地址
+        assert!(!proxy_target_matches_source(&navigated, "https://v1.vossc.com"));
     }
 
     fn proxy_test_service(root: &std::path::Path) -> crate::service::book_service::BookService {
