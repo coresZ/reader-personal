@@ -1219,6 +1219,26 @@ describe('reader config storage hardening', () => {
     expect(readerStore.readerTheme.body).toBe('#aabbcc')
     expect(readerStore.readerTheme.fontColor).toBe('#123456')
   })
+
+  it('defaults the hover reveal switch to off for pre-existing storage', () => {
+    // issue #7 问题 1: 悬停呼出会吃掉边缘正文的点击, 默认关闭。
+    // 老用户存档里没有这个字段, 升级后同样应该是关闭的。
+    stubStorage({ readConfig: JSON.stringify({ fontSize: 20 }) })
+
+    expect(useReaderStore().config.hoverRevealControls).toBe(false)
+  })
+
+  it('falls back to off when the stored hover switch is not a boolean', () => {
+    stubStorage({ readConfig: JSON.stringify({ hoverRevealControls: 'yes' }) })
+
+    expect(useReaderStore().config.hoverRevealControls).toBe(false)
+  })
+
+  it('restores an explicitly enabled hover switch from storage', () => {
+    stubStorage({ readConfig: JSON.stringify({ hoverRevealControls: true }) })
+
+    expect(useReaderStore().config.hoverRevealControls).toBe(true)
+  })
 })
 
 describe('reader page background image', () => {

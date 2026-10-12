@@ -109,6 +109,10 @@ export interface ReadConfig {
   selectAction: 'popup' | 'ignore'
   chineseMode: 'simplified' | 'traditional'
   enablePreload: boolean
+  /** 桌面指针靠近阅读区边缘时自动展开工具栏/悬浮钮。
+   *  默认关闭: 边缘热区会吃掉正文的点击(左右各 84px), 用户反馈鼠标停在边缘就弹按钮、
+   *  可点区域变少且容易误触(issue #7 问题 1)。需要的人可在「更多」里开启。 */
+  hoverRevealControls: boolean
   backgroundImage: string
   backgroundOpacity: number
   applyBackgroundToReader: boolean
@@ -136,6 +140,9 @@ const defaultConfig: ReadConfig = {
   selectAction: 'ignore',
   chineseMode: 'simplified',
   enablePreload: false,
+  // 默认关闭: 边缘热区会吃掉正文点击, 用户反馈"可点区域变少、还要小心别误点按钮"
+  // (issue #7 问题 1)。想用悬停呼出的人可在设置「更多」里开启。
+  hoverRevealControls: false,
   backgroundImage: '',
   backgroundOpacity: DEFAULT_READER_BACKGROUND_OPACITY,
   applyBackgroundToReader: true,
@@ -178,6 +185,10 @@ function loadConfig(): ReadConfig {
         applyBackgroundToReader: typeof savedConfig.applyBackgroundToReader === 'boolean'
           ? savedConfig.applyBackgroundToReader
           : true,
+        // 旧存档没有这个字段时按默认(关闭)处理, 非布尔值也回落默认, 避免脏数据开启悬停。
+        hoverRevealControls: typeof savedConfig.hoverRevealControls === 'boolean'
+          ? savedConfig.hoverRevealControls
+          : defaultConfig.hoverRevealControls,
         // 自定义配色来自 localStorage, 必须收紧为合法色值再进 style。
         fontColor: normalizeReaderColor(savedConfig.fontColor),
         readerBackgroundColor: normalizeReaderColor(savedConfig.readerBackgroundColor),

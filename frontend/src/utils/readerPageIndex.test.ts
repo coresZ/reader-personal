@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   clampReaderPageIndex,
   getReaderLastPage,
+  readerLandingPageIndexAfterPrevChapter,
   readerPageIndexFromProgress,
 } from './readerPageIndex'
 
@@ -63,5 +64,57 @@ describe('readerPageIndexFromProgress', () => {
     expect(readerPageIndexFromProgress(2, 11)).toBe(10)
     expect(readerPageIndexFromProgress(0.5, 0)).toBe(0)
     expect(readerPageIndexFromProgress(Number.NaN, 11)).toBe(0)
+  })
+})
+
+describe('readerLandingPageIndexAfterPrevChapter', () => {
+  it('lands on the last page of the chapter it just entered', () => {
+    // 往前翻跨章: 目标必须是上一章末页。落到第 0 页就是标题页, 用户看到的现象
+    // 就是"翻上一页还是标题页"。
+    expect(readerLandingPageIndexAfterPrevChapter({
+      intentIndex: 3,
+      currentIndex: 3,
+      loading: false,
+      totalPages: 7,
+    })).toBe(6)
+  })
+
+  it('returns the first page when the chapter fits in a single page', () => {
+    // 只有一页时末页即首页 —— 此时不该再往前翻, 由调用方按"索引 0"处理。
+    expect(readerLandingPageIndexAfterPrevChapter({
+      intentIndex: 0,
+      currentIndex: 0,
+      loading: false,
+      totalPages: 1,
+    })).toBe(0)
+  })
+
+  it('refuses to land while the chapter content is still loading', () => {
+    // 加载中时 horizontalPages 还是上一章的分页结果, 此时落位会把页数算错。
+    expect(readerLandingPageIndexAfterPrevChapter({
+      intentIndex: 3,
+      currentIndex: 3,
+      loading: true,
+      totalPages: 7,
+    })).toBeNull()
+  })
+
+  it('refuses to land once another chapter change has happened since', () => {
+    // 残留的意图不能在之后任意一次重建时把用户拽到末页。
+    expect(readerLandingPageIndexAfterPrevChapter({
+      intentIndex: 3,
+      currentIndex: 4,
+      loading: false,
+      totalPages: 7,
+    })).toBeNull()
+  })
+
+  it('refuses to land without a pending intent', () => {
+    expect(readerLandingPageIndexAfterPrevChapter({
+      intentIndex: null,
+      currentIndex: 3,
+      loading: false,
+      totalPages: 7,
+    })).toBeNull()
   })
 })

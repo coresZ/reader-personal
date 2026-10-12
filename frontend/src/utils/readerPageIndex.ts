@@ -37,3 +37,24 @@ export function readerPageIndexFromProgress(
   const safeProgress = Number.isFinite(progress) ? Math.max(0, Math.min(1, progress)) : 0
   return clampReaderPageIndex(Math.round(safeProgress * (total - 1)), total)
 }
+
+/** 「左右分页往前翻跨章」的落位页索引; 不该落位时返回 null。
+ *
+ *  往前翻到章首再翻一次会进上一章, 目标应是上一章的**末页** —— 新章第 0 页是标题页,
+ *  落到那里看起来就像"翻页没生效"(用户会以为卡在标题页, 再翻一次又进了更上一章)。
+ *
+ *  两个必须同时满足的条件:
+ *  - `intentIndex === currentIndex`: 换章才刚发生。若不比对, 残留的意图会在之后任意
+ *    一次重建时把用户拽到末页。
+ *  - `!loading`: 正文还在请求中时分页仍是**上一章**的, 此时落位会算错页数。 */
+export function readerLandingPageIndexAfterPrevChapter(options: {
+  intentIndex: number | null
+  currentIndex: number
+  loading: boolean
+  totalPages: number
+}): number | null {
+  const { intentIndex, currentIndex, loading, totalPages } = options
+  if (intentIndex === null || loading) return null
+  if (intentIndex !== currentIndex) return null
+  return getReaderLastPage(totalPages)
+}

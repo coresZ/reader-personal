@@ -535,6 +535,16 @@
 
       <section v-show="activeSettingsTab === 'more'" class="settings-group">
 
+      <!-- 悬停呼出工具栏: 默认关闭。开启后鼠标移到阅读区边缘会自动弹出工具栏与悬浮钮,
+           代价是边缘热区吃掉正文的点击(左右各 84px), 因此作为可选功能。 -->
+      <div class="setting-row">
+        <label>悬停呼出工具栏</label>
+        <div class="btn-group">
+          <button class="opt-btn" :class="{ active: config.hoverRevealControls }" title="鼠标移到阅读区上下左右边缘时自动展开工具栏与悬浮钮" @click="store.updateConfig('hoverRevealControls', true)">开启</button>
+          <button class="opt-btn" :class="{ active: !config.hoverRevealControls }" title="鼠标移到边缘不再弹出按钮，边缘区域的点击可以正常用于翻页" @click="store.updateConfig('hoverRevealControls', false)">关闭</button>
+        </div>
+      </div>
+
       <!-- 快捷键: 以「功能」为主轴, 一个功能可绑多个按键 -->
       <div class="setting-block">
         <div class="setting-block-head">

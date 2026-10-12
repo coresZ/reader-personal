@@ -362,7 +362,11 @@ import {
   cancelPageScrollAnimation,
   getReaderPageStep,
 } from '../utils/readerPaging'
-import { clampReaderPageIndex, readerPageIndexFromProgress } from '../utils/readerPageIndex'
+import {
+  clampReaderPageIndex,
+  readerLandingPageIndexAfterPrevChapter,
+  readerPageIndexFromProgress,
+} from '../utils/readerPageIndex'
 import { splitBrParagraphs } from '../utils/readerParagraph'
 import { resolveReaderBackground } from '../utils/readerColor'
 import {
@@ -590,9 +594,11 @@ function collapseControlsByClick() {
   }
 }
 
-/** 是否支持悬停展开: 桌面指针 + 非迷你窗口。 */
+/** 是否支持悬停展开: 桌面指针 + 非迷你窗口 + 用户没有关掉这个功能。 */
 function syncHoverPointerSupport() {
-  supportsHoverPointer.value = !!hoverMediaQuery?.matches && !appStore.miniMode
+  supportsHoverPointer.value = !!hoverMediaQuery?.matches
+    && !appStore.miniMode
+    && config.value.hoverRevealControls
   if (!supportsHoverPointer.value) {
     hoverPointerInZone = false
     hoverPointerOnControls = false
@@ -643,6 +649,10 @@ const pendingLegadoPageRestore = ref<{
 let pendingRestoreAttempts = 0
 let skipPositionRestoreIndex: number | null = null
 let skipPositionRestoreUntil = 0
+
+/** 「往前翻跨章」的落位意图: 目标章(上一章)的索引, 期望落在它的**末页**。
+ *  分页重建完成后由 applyPendingPrevChapterLanding 消费(见那边的说明)。 */
+let pendingPrevChapterLandingIndex: number | null = null
 
 /** 标记某章节的进入来自滚动/主动跳转, 无需恢复上次阅读位置。带 1 秒过期,
  *  避免残留标记误吞后续打开书籍时的位置恢复(如阅读器内书架换书不重挂载)。 */
@@ -810,6 +820,9 @@ function scheduleHorizontalRebuild() {
     const progress = previousMax > 0 ? horizontalPageIndex.value / previousMax : 0
     void rebuildHorizontalPages().then(() => {
       if (!isHorizontalPageMode.value) return
+      // 与排版参数 watcher 同源: 未兑现的跨章回退落位优先(它才是用户此刻的意图),
+      // 但只有真兑现了才让路, 否则照常按比例映射 —— 悬空的意图不该让 resize 失去定位。
+      if (applyPendingPrevChapterLanding()) return
       if (pendingLegadoPageRestore.value) return
       horizontalPageIndex.value = readerPageIndexFromProgress(
         progress,
@@ -1147,6 +1160,10 @@ function pageBackward() {
   if (!container) return
   if (isHorizontalPageMode.value) {
     if (horizontalPageIndex.value <= 0) {
+      // 跨到上一章时要把落点定在**上一章末页**。不标记的话 prevChapter 会走
+      // scrollToTop 把索引清 0 —— 新章第 0 页是标题页, 于是往前翻看起来像没动
+      // (用户反馈的正是这个: 翻上一页还是标题页), 再翻一次又进了更上一章。
+      markLandOnPrevChapterLastPage()
       prevChapter()
       return
     }
@@ -1161,6 +1178,56 @@ function pageBackward() {
     return
   }
   scrollPageBy(container, -step)
+}
+
+/** 声明"这次进上一章要落在末页"。只在左右分页下的跨章回退调用。 */
+function markLandOnPrevChapterLastPage() {
+  const targetIndex = store.currentIndex - 1
+  if (targetIndex < 0) return
+  pendingPrevChapterLandingIndex = targetIndex
+}
+
+function clearPendingPrevChapterLanding() {
+  pendingPrevChapterLandingIndex = null
+}
+
+/** 分页重建完成后，把"跨章回退"的落位意图兑现。
+ *
+ *  为什么必须异步兑现: 换章后 `horizontalPages` 还是**上一章**的分页结果, 索引
+ *  此刻写任何值都会被 `store.currentIndex` watcher 的 resetHorizontalPagePosition()
+ *  清成 0, 而真正的分页要等正文到达后由 rebuildHorizontalPages() 重建。所以这里只在
+ *  每次重建完成后判定一次, 命中就把索引放到末页。
+ *
+ *  返回值 = **本次是否真的兑现了落位**。调用方据此决定要不要让路: 只有返回 true
+ *  才说明位置已经由意图决定, 否则必须继续走各自的默认逻辑 —— 否则一次加载失败
+ *  留下的悬空意图会让排版/resize 的比例映射永久失效(见调用点)。
+ *
+ *  位置恢复的干扰已在标记处排除: 跨章回退调用的是 prevChapter() 而非 jumpFromCatalog,
+ *  没有 markSkipPositionRestore, 但 loadSavedReadingPosition 只在章节切到**已存进度
+ *  所在章**时才产出 pending, 回退到上一章时它的 chapterIndex 与 currentIndex 不符,
+ *  恢复逻辑自己会放弃。 */
+function applyPendingPrevChapterLanding(): boolean {
+  if (pendingPrevChapterLandingIndex === null) return false
+  // 意图只在"等目标章就绪"的窗口内有效: 目标章本身, 或还没切过去的上一章(加载中)。
+  // 其它索引说明用户已经去了别处(又跳章了/回退失败), 立刻作废 —— 留着它会在之后
+  // 某次无关的重建(调字号、resize)里被兑现, 把用户送到别章的末页。
+  if (store.currentIndex !== pendingPrevChapterLandingIndex
+    && store.currentIndex !== pendingPrevChapterLandingIndex + 1) {
+    clearPendingPrevChapterLanding()
+    return false
+  }
+  const landing = readerLandingPageIndexAfterPrevChapter({
+    intentIndex: pendingPrevChapterLandingIndex,
+    currentIndex: store.currentIndex,
+    loading: store.loading,
+    totalPages: horizontalPages.value.length,
+  })
+  // 还不能兑现(正文没到/页数还是旧章的): 保留意图, 让调用方继续走默认逻辑。
+  if (landing === null) return false
+  clearPendingPrevChapterLanding()
+  horizontalPageIndex.value = landing
+  syncHorizontalPageState()
+  return true
 }
 
 // Navigation
@@ -1250,10 +1317,26 @@ async function jumpToRenderedContinuousChapter(targetIndex: number) {
 
 async function prevChapter() {
   const targetIndex = store.currentIndex - 1
-  if (targetIndex < 0) return
+  if (targetIndex < 0) {
+    clearPendingPrevChapterLanding()
+    return
+  }
 
   if (!isContinuousMode.value) {
+    // 跨章回退(在章首再往前翻)已经声明"要落在上一章末页"。这一条必须在 await
+    // 之前取: 加载完成后索引清零的时机取决于 watcher 与微任务的先后, 事后再判断
+    // 已经不可靠。
+    const landingPending = isHorizontalPageMode.value
+      && pendingPrevChapterLandingIndex === targetIndex
     await store.prevChapter()
+    if (landingPending) {
+      // 落位改由 applyPendingPrevChapterLanding 在分页重建后兑现。这里**不能**走
+      // scrollToTop —— 它把索引清 0, 而新章第 0 页是标题页, 于是"往前翻"停在标题页
+      // (issue #7 的问题 2), 而且刚兑现的落位会被它当场覆盖。
+      // 章节没切成功(书源报错)时意图作废, 免得之后落到无关章节的末页。
+      if (store.currentIndex !== targetIndex) clearPendingPrevChapterLanding()
+      return
+    }
     scrollToTop('instant')
     return
   }
@@ -1288,6 +1371,9 @@ async function nextChapter() {
 async function jumpFromCatalog(targetIndex: number) {
   if (targetIndex < 0 || targetIndex >= store.chapters.length) return
 
+  // 主动跳章是明确的"去这一章开头"意图, 与"跨章回退落末页"互斥: 残留的意图会在
+  // 分页重建后被兑现, 把用户送到目标章的末页。
+  clearPendingPrevChapterLanding()
   markSkipPositionRestore(targetIndex)
   pendingRestorePosition.value = null
   pendingRestoreAttempts = 0
@@ -2920,7 +3006,15 @@ onMounted(async () => {
     hoverMediaQuery = window.matchMedia('(hover: hover) and (pointer: fine)')
     hoverMediaQuery.addEventListener('change', syncHoverPointerSupport)
     syncHoverPointerSupport()
-    hoverSupportStop = watch(() => appStore.miniMode, syncHoverPointerSupport)
+    hoverSupportStop = watch(
+      [() => appStore.miniMode, () => config.value.hoverRevealControls],
+      ([, hoverReveal]) => {
+        syncHoverPointerSupport()
+        // 用户刚关掉悬停展开时, 已弹出的工具栏要一并收起: 指针此后不再触发展开/收起
+        // 判定, 留在屏幕上的那条工具栏只能靠点击正文中部才能关掉。
+        if (!hoverReveal && showControls.value && !store.activePanel) showControls.value = false
+      },
+    )
     store.fetchVoices()
   applySystemTheme(store.isNight ? 'dark' : appStore.theme, store.currentTheme.body)
   if (typeof window !== 'undefined' && window.speechSynthesis) {
@@ -3019,7 +3113,7 @@ watch(() => store.currentIndex, () => {
   loadedReaderImageSizes.clear()
   if (!isHorizontalPageMode.value) return
   resetHorizontalPagePosition()
-  rebuildHorizontalPages()
+  void rebuildHorizontalPages().then(applyPendingPrevChapterLanding)
   updateHorizontalEndState()
 })
 
@@ -3034,6 +3128,12 @@ watch(
     const progress = previousMax > 0 ? horizontalPageIndex.value / previousMax : 0
     void rebuildHorizontalPages().then(() => {
       if (!isHorizontalPageMode.value) return
+      // 未兑现的跨章回退落位优先: 这次重建可能就是它唯一的机会(用户恰好在"进上一章"
+      // 的窗口里改了字号, 后面不会再有 rebuild 来兑现)。而下面算出的 progress 来自
+      // **旧章**的索引比例, 写回去会把用户从"上一章末页"拉到按比例映射的位置, 极端
+      // 情况就是回标题页 —— 本次要修的 bug 本身。
+      // 只有真的兑现了才让路; 还不能兑现(正文没到/页数还是旧章的)就照常走比例映射。
+      if (applyPendingPrevChapterLanding()) return
       // 远端进度正在精确恢复时不要抢位置, 交给那套机制。
       if (pendingLegadoPageRestore.value) return
       horizontalPageIndex.value = readerPageIndexFromProgress(
@@ -3052,7 +3152,9 @@ watch(
     loadedReaderImageSizes.clear()
     if (!isHorizontalPageMode.value) return
     if (!pendingLegadoPageRestore.value) horizontalPageIndex.value = 0
-    rebuildHorizontalPages()
+    // 跨章回退时正文到达触发的这次重建, 才是"新章分页就绪"的主路径(见
+    // applyPendingPrevChapterLanding); 上面刚把索引清 0, 这里紧接着兑现落位。
+    void rebuildHorizontalPages().then(applyPendingPrevChapterLanding)
   },
 )
 
