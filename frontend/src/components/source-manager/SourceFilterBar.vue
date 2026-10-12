@@ -33,6 +33,12 @@
     <div v-if="selectedCount > 0" class="selection-tools">
       <span>已选 {{ selectedCount }}</span>
       <button class="mini-btn danger" type="button" @click="$emit('delete-selection')">删除选中</button>
+      <button class="mini-btn" type="button" @click="$emit('more-selection', $event)">
+        更多
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12">
+          <path d="m6 9 6 6 6-6" />
+        </svg>
+      </button>
     </div>
   </section>
 </template>
@@ -53,6 +59,7 @@ defineEmits<{
   'update:filterGroup': [value: string]
   'toggle-current-selection': []
   'delete-selection': []
+  'more-selection': [event: MouseEvent]
 }>()
 </script>
 
@@ -139,6 +146,9 @@ defineEmits<{
 
 .mini-btn {
   min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 7px 10px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);

@@ -75,11 +75,13 @@ impl BookSourceService {
             .get(user_ns, book_source_url)
             .await?
             .ok_or_else(|| AppError::NotFound("bookSource not found".to_string()))?;
+        // None 与 0 同权参与比较(与 `list` 的排序一致): 若只统计已设置的正值,
+        // "沉底所选"产生的正序号会让 pin 分配到正值, 反而排在普通(None=0)源之后。
         let min_order = self
             .list(user_ns)
             .await?
             .into_iter()
-            .filter_map(|s| s.custom_order)
+            .map(|s| s.custom_order.unwrap_or(0))
             .min()
             .unwrap_or(0);
         source.custom_order = Some(min_order - 1);
@@ -125,12 +127,17 @@ impl BookSourceService {
                 out.push(s);
             }
         }
-        // Pinned sources (lower custom_order) come first; unpinned (None) sort
-        // last, then by name. This ordering drives multi-source search, 换源,
-        // and the source manager list.
+        // Pinned sources (lower custom_order) come first; 沉底 (larger positive
+        // custom_order) last; 未设置 (None) 与 0 同级按名称排. This ordering
+        // drives multi-source search, 换源, and the source manager list.
+        //
+        // None 必须视为 0 而不是 i32::MAX: 前端搜索结果已经按 `customOrder ?? 0`
+        // 排序(SearchResults), 后端若把 None 当最大值, 两侧顺序会不一致; 且
+        // "沉底所选"给选中源分配的正数序号将永远压不过未设置的源(i32::MAX),
+        // 置底形同虚设, unpin(置 0) 也会把源错误地顶到所有未设置源之前.
         out.sort_by(|a, b| {
-            let oa = a.custom_order.unwrap_or(i32::MAX);
-            let ob = b.custom_order.unwrap_or(i32::MAX);
+            let oa = a.custom_order.unwrap_or(0);
+            let ob = b.custom_order.unwrap_or(0);
             oa.cmp(&ob).then_with(|| a.book_source_name.cmp(&b.book_source_name))
         });
         Ok(out)

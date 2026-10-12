@@ -30,6 +30,68 @@ export function getBookSourceGroups(sources: Pick<BookSource, 'bookSourceGroup'>
   return Array.from(groups).sort()
 }
 
+/** legado `BookSource.addGroup` 的前端对应: 合并分组集合后以逗号拼接。 */
+export function addBookSourceGroups(source: BookSource, groupsInput: string): BookSource {
+  const additions = splitBookSourceGroupNames(groupsInput)
+  if (!additions.length) return source
+  const current = splitBookSourceGroupNames(source.bookSourceGroup || '')
+  const merged = Array.from(new Set([...current, ...additions]))
+  return { ...source, bookSourceGroup: merged.join(',') }
+}
+
+/** legado `BookSource.removeGroup` 的前端对应: 差集为空时清掉分组字段。 */
+export function removeBookSourceGroups(source: BookSource, groupsInput: string): BookSource {
+  const removals = new Set(splitBookSourceGroupNames(groupsInput))
+  if (!removals.size) return source
+  const remaining = splitBookSourceGroupNames(source.bookSourceGroup || '')
+    .filter((group) => !removals.has(group))
+  return { ...source, bookSourceGroup: remaining.length ? remaining.join(',') : '' }
+}
+
+function splitBookSourceGroupNames(value: string) {
+  return value
+    .split(/[,;；、]/)
+    .map((group) => group.trim())
+    .filter(Boolean)
+}
+
+/**
+ * 批量置顶/沉底(参考 legado topSource/bottomSource):
+ * 以现有最小/最大 customOrder 为基准连续取值, 保持选中项之间的相对顺序。
+ * 返回更新后的完整列表(仅选中项的 customOrder 被改写, 其余原样返回)。
+ *
+ * 排序语义依赖后端 `BookSourceService::list` 的 None → 0 处理:
+ * 置顶分配负数排在一切普通源之前; 沉底分配比现有最大值更大的正数排在最后。
+ */
+export function moveBookSourcesToEdge(
+  sources: BookSource[],
+  selectedUrls: ReadonlySet<string>,
+  edge: 'top' | 'bottom',
+) {
+  const selected = sources.filter((source) => selectedUrls.has(source.bookSourceUrl))
+  if (!selected.length) return sources
+  if (edge === 'top') {
+    // reduce 而非 Math.min(0, ...arr): 数万书源时 spread 会撞 V8 参数上限抛 RangeError。
+    const minOrder = sources.reduce((acc, source) => Math.min(acc, source.customOrder ?? 0), 0)
+    // 列表中靠前的选中项获得更小的序号(排更前), 保持选中项原有相对顺序。
+    const targets = new Map(
+      selected.map((source, index) => [source.bookSourceUrl, minOrder - selected.length + index]),
+    )
+    return sources.map((source) => {
+      const order = targets.get(source.bookSourceUrl)
+      return order === undefined ? source : { ...source, customOrder: order }
+    })
+  }
+  const maxOrder = sources.reduce((acc, source) => Math.max(acc, source.customOrder ?? 0), 0)
+  const targets = new Map(
+    selected.map((source, index) => [source.bookSourceUrl, maxOrder + 1 + index]),
+  )
+  return sources.map((source) => {
+    const order = targets.get(source.bookSourceUrl)
+    return order === undefined ? source : { ...source, customOrder: order }
+  })
+}
+
 export function filterBookSources(
   sources: BookSource[],
   filterText: string,

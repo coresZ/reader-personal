@@ -49,6 +49,7 @@
             @update:filter-group="filterGroup = $event"
             @toggle-current-selection="toggleFilteredSelection"
             @delete-selection="removeSelectedSources"
+            @more-selection="handleSelectionMore"
           />
 
           <div class="content-grid">
@@ -104,6 +105,16 @@
     />
 
     <SourceLoginDialog v-model="loginPreviewVisible" :source="loginSource" />
+
+    <SourceGroupPrompt
+      :visible="groupPromptVisible"
+      :title="groupPromptMode === 'add' ? '添加到分组' : '从分组移除'"
+      :message="`将对选中的 ${selectedFilteredSources.length} 个书源${groupPromptMode === 'add' ? '添加' : '移除'}以下分组`"
+      :confirm-text="groupPromptMode === 'add' ? '添加' : '移除'"
+      :suggestions="groupList"
+      @confirm="handleGroupPromptConfirm"
+      @close="groupPromptVisible = false"
+    />
   </Teleport>
 </template>
 
@@ -129,10 +140,13 @@ import { useAppStore } from '../stores/app'
 import { useSourceStore } from '../stores/source'
 import type { BookSource } from '../types'
 import {
+  addBookSourceGroups,
   filterBookSources,
   getBookSourceGroups,
   getBookSourceStats,
   getVisibleSelection,
+  moveBookSourcesToEdge,
+  removeBookSourceGroups,
   toBookSourceDeletePayload,
 } from '../utils/sourceSelection'
 import { chunkBookSourceUrls, mergeBookSourceTestResponses } from '../utils/sourceTesting'
@@ -143,6 +157,7 @@ import SourceList from './source-manager/SourceList.vue'
 import { showContextMenu } from '../composables/useContextMenu'
 import SourceManagerHeader from './source-manager/SourceManagerHeader.vue'
 import SourceSubscriptionPanel from './source-manager/SourceSubscriptionPanel.vue'
+import SourceGroupPrompt from './source-manager/SourceGroupPrompt.vue'
 
 type SourceSubscription = {
   url: string
@@ -184,6 +199,10 @@ const resetSignal = ref(0)
 const sourceLoginLoading = ref(false)
 const loginPreviewVisible = ref(false)
 const loginSource = ref<BookSource | null>(null)
+
+/** "更多"菜单里的分组操作输入弹窗(参考 legado 的 suggestion 输入框)。 */
+const groupPromptVisible = ref(false)
+const groupPromptMode = ref<'add' | 'remove'>('add')
 
 const groupList = computed(() => getBookSourceGroups(sources.value))
 
@@ -355,6 +374,114 @@ async function removeSelectedSources() {
   } catch (e: unknown) {
     appStore.showToast((e as Error).message || '批量删除失败', 'error')
   }
+}
+
+/**
+ * "更多"菜单(参考 legado book_source_sel 多选操作菜单):
+ * 启用/停用、分组增删、发现开关、置顶/沉底、导出/测试所选。
+ * 分享与校验间隔两项为 Android 特有语义, 桌面端由导出替代、间隔无数据模型, 不做。
+ */
+function handleSelectionMore(event: MouseEvent) {
+  const count = selectedFilteredSources.value.length
+  if (!count) {
+    appStore.showToast('请先选择要操作的书源', 'warning')
+    return
+  }
+  showContextMenu(event, [
+    { label: `启用选中（${count}）`, action: () => setSelectedEnabled(true) },
+    { label: `停用选中（${count}）`, action: () => setSelectedEnabled(false) },
+    { divider: true },
+    { label: '添加到分组…', action: () => openGroupPrompt('add') },
+    { label: '从分组移除…', action: () => openGroupPrompt('remove') },
+    { divider: true },
+    { label: '启用发现', action: () => setSelectedExploreEnabled(true) },
+    { label: '停用发现', action: () => setSelectedExploreEnabled(false) },
+    { divider: true },
+    { label: '置顶所选', action: () => moveSelectedSources('top') },
+    { label: '沉底所选', action: () => moveSelectedSources('bottom') },
+    { divider: true },
+    { label: '导出所选', action: () => exportSelectedSources() },
+    {
+      label: '测试所选',
+      action: () => testSources(),
+      disabled: testingSources.value,
+    },
+  ], null, { width: 240 })
+}
+
+/** 批量操作通用流程: 快照选中项 → 逐个变形 → 一次批量保存 → 刷新。 */
+async function applySelectedSources(
+  update: (source: BookSource) => BookSource,
+  successMessage: (count: number) => string,
+) {
+  // 与 removeSelectedSources 相同的快照原则: 异步等待期间筛选可能变化。
+  const targets = [...selectedFilteredSources.value]
+  if (!targets.length) {
+    appStore.showToast('请先选择要操作的书源', 'warning')
+    return
+  }
+  try {
+    await saveBookSources(targets.map(update))
+    appStore.showToast(successMessage(targets.length), 'success')
+    await loadSources()
+  } catch (e: unknown) {
+    appStore.showToast((e as Error).message || '批量操作失败', 'error')
+  }
+}
+
+function setSelectedEnabled(enabled: boolean) {
+  return applySelectedSources(
+    (source) => ({ ...source, enabled }),
+    (count) => (enabled ? `已启用 ${count} 个书源` : `已停用 ${count} 个书源`),
+  )
+}
+
+function setSelectedExploreEnabled(enabled: boolean) {
+  return applySelectedSources(
+    (source) => ({ ...source, enabledExplore: enabled }),
+    (count) => (enabled ? `已启用 ${count} 个书源的发现` : `已停用 ${count} 个书源的发现`),
+  )
+}
+
+async function moveSelectedSources(edge: 'top' | 'bottom') {
+  const targets = [...selectedFilteredSources.value]
+  if (!targets.length) {
+    appStore.showToast('请先选择要操作的书源', 'warning')
+    return
+  }
+  try {
+    const targetUrls = new Set(targets.map((source) => source.bookSourceUrl))
+    const updated = moveBookSourcesToEdge(sources.value, targetUrls, edge)
+    // 选中项的 customOrder 必被改写(top 恒为负/bottom 恒为正, 必异于任何原值),
+    // 因此按选中集合过滤出的就是需要写回的全部变更。
+    const changed = updated.filter((source) => targetUrls.has(source.bookSourceUrl))
+    await saveBookSources(changed)
+    appStore.showToast(
+      edge === 'top' ? `已置顶 ${targets.length} 个书源` : `已沉底 ${targets.length} 个书源`,
+      'success',
+    )
+    await loadSources()
+  } catch (e: unknown) {
+    appStore.showToast((e as Error).message || '批量操作失败', 'error')
+  }
+}
+
+function openGroupPrompt(mode: 'add' | 'remove') {
+  if (!selectedFilteredSources.value.length) {
+    appStore.showToast('请先选择要操作的书源', 'warning')
+    return
+  }
+  groupPromptMode.value = mode
+  groupPromptVisible.value = true
+}
+
+async function handleGroupPromptConfirm(groupsInput: string) {
+  const mode = groupPromptMode.value
+  groupPromptVisible.value = false
+  await applySelectedSources(
+    (source) => (mode === 'add' ? addBookSourceGroups(source, groupsInput) : removeBookSourceGroups(source, groupsInput)),
+    (count) => (mode === 'add' ? `已将 ${count} 个书源加入分组` : `已将 ${count} 个书源移出分组`),
+  )
 }
 
 async function testSources() {
@@ -658,11 +785,10 @@ function touchSubscription(url: string) {
   persistSubscriptions()
 }
 
-async function exportSources() {
-  const payload = JSON.stringify(sources.value, null, 2)
+async function exportSourcesList(list: BookSource[]) {
   if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
     try {
-      const result = await exportBookSources(sources.value)
+      const result = await exportBookSources(list)
       if (result.cancelled) return
       appStore.showToast('书源已导出', 'success')
       return
@@ -671,6 +797,7 @@ async function exportSources() {
       return
     }
   }
+  const payload = JSON.stringify(list, null, 2)
   const blob = new Blob([payload], { type: 'application/json;charset=utf-8' })
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
@@ -678,6 +805,19 @@ async function exportSources() {
   anchor.download = `reader-book-sources-${formatDateForFile()}.json`
   anchor.click()
   URL.revokeObjectURL(url)
+}
+
+function exportSources() {
+  return exportSourcesList(sources.value)
+}
+
+function exportSelectedSources() {
+  const targets = [...selectedFilteredSources.value]
+  if (!targets.length) {
+    appStore.showToast('请先选择要导出的书源', 'warning')
+    return
+  }
+  return exportSourcesList(targets)
 }
 
 function formatDateForFile() {
