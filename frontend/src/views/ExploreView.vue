@@ -163,7 +163,8 @@
             :shelf-book-urls="shelfBookUrls"
             :shelf-book-keys="shelfBookKeys"
             empty-text="暂无数据"
-            @click="handleBookClick"
+            @click="handleBookInfo"
+            @info="handleBookInfo"
             @addToShelf="handleAddToShelf"
             @contextmenu="handleBookContextMenu"
           />
@@ -183,7 +184,9 @@
       </main>
     </div>
 
-    <BookDetailModal v-model="showDetail" :book="selectedBook" />
+    <!-- 发现页的书只有聚合源认得，详情页不必去全网并发搜「可读书源」：
+         既慢（12 路并发）又几乎搜不到，只会让用户看到一个源。 -->
+    <BookDetailModal v-model="showDetail" :book="selectedBook" single-source-only />
 
     <!-- 登录面板：与书源管理里用的是同一个组件。
          它只暴露 v-model，关闭后重新求值一次分类 —— 登录态会决定有些分类

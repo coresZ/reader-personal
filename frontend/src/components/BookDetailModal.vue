@@ -118,7 +118,7 @@
 
           <!-- Available Sources -->
           <div v-if="!isLocal" class="source-section">
-            <h3>可读书源</h3>
+            <h3>{{ singleSourceOnly ? '书源' : '可读书源' }}</h3>
             <div v-if="sourcesLoading && !sourceCandidates.length" class="source-loading">
               <div class="loading-spinner"></div>
               正在查找其他书源...
@@ -146,7 +146,9 @@
               <div class="loading-spinner"></div>
               继续查找其他书源...
             </div>
-            <div v-if="sourcesIncomplete && !sourcesLoading" class="source-incomplete" role="status">
+            <!-- 单源模式下不提供「重试」：它的语义是"再并搜一遍其它源"，
+                 而这时我们刻意不搜。 -->
+            <div v-if="!singleSourceOnly && sourcesIncomplete && !sourcesLoading" class="source-incomplete" role="status">
               <span>部分书源访问失败，可重试。</span>
               <button type="button" @click="loadSourceCandidates(detailLoadId, detailKey, true)">重试</button>
             </div>
@@ -279,6 +281,14 @@ const props = defineProps<{
   book: Book | SearchBook | null
   /** 打开弹窗后直接进入编辑态(书架右键「编辑信息」用)。 */
   startInEdit?: boolean
+  /**
+   * 只显示本书自身的书源，不自动并发搜索其它源。
+   *
+   * 发现页的书来自聚合源的特定榜单（如光遇的「排行榜」），书名/作者往往只有
+   * 聚合源认得；默认行为会打开弹窗就并发搜 12 路书源，既慢又几乎搜不到东西，
+   * 用户看到的「可读书源」反而只有当前这一条。传 true 时直接跳过搜索。
+   */
+  singleSourceOnly?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -605,6 +615,20 @@ watch([() => props.modelValue, detailKey], async ([visible, bookKey]) => {
     await sourceStore.fetchSources().catch(() => undefined)
   }
   if (!isCurrentDetail(loadId, bookKey)) return
+
+  // 只认本书自身的书源：发现页的书只有聚合源认得，并发搜 12 路既慢又搜不到，
+  // 结果就是用户看到的「只有一个源」。这里直接跳过搜索，仍要加载目录。
+  if (props.singleSourceOnly) {
+    const name = (b as Book).originName
+      || sourceStore.sources.find((s) => sourceKey(s.bookSourceUrl) === sourceKey(b.origin))?.bookSourceName
+      || sourceStore.sources.find((s) => s.bookSourceName === b.origin)?.bookSourceName
+      || b.origin
+    sourceCatalog.value = new Map([[sourceKey(b.origin), name]])
+    setSourceCandidates([toSearchBook(b)])
+    sourcesLoading.value = false
+    await loadChaptersFor(b.bookUrl, b.origin, loadId, bookKey)
+    return
+  }
 
   sourceCatalog.value = new Map(
     sourceStore.sources
