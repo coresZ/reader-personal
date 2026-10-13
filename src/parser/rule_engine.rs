@@ -1630,7 +1630,7 @@ fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
         }
         // 元素快照兼容: `<js>` 规则返回 JSoup 元素后, 字段规则常写裸属性名
         // (`href` / `src`) 或 `text`。快照把属性放在 `attrs` 下、文本放在
-        // `text`, 直接按顶层键取会空 → bookUrl 退化成列表页地址(故事族症状)。
+        // `text`, 直接按顶层键取会空 → bookUrl 退化成列表页地址(列表页规则的常见症状)。
         //
         // 守卫要求 `attrs` + `tag` + `outerHtml` **三个键同时存在**: 只看
         // `attrs` 会误伤普通 JSON 源 —— `attrs` 是常见字段名, 一旦响应里有它

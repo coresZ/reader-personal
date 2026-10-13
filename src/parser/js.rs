@@ -437,7 +437,7 @@ pub fn eval_explore_action(
 /// - 形如 `'字面量'`（长度 3..=19 且首尾都是单引号）→ 取引号内的字面量；
 /// - 其余 → 当作 JS 求值（`evalUiJs`），失败或为空则回退 `title`。
 ///
-/// 必须放在后端：光遇聚合的筛选控件把 `viewName` 写成 `"'请选择类型'"`，
+/// 必须放在后端：某聚合源的筛选控件把 `viewName` 写成 `"'请选择类型'"`，
 /// 而七猫等源会写成一段读 `source.getVariable()` 的脚本 —— 两者都需要沙箱。
 pub fn eval_explore_view_name(
     view_name: &str,
@@ -843,7 +843,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
   };
   g.Packages = { java: J };
 
-  // Rhino 的 JavaImporter + with(importer) 语法（大灰狼聚合等 jsLib 顶层使用）。
+  // Rhino 的 JavaImporter + with(importer) 语法（部分书源 jsLib 顶层使用）。
   // 把传入的包/类展开为实例属性, with 语句按属性名解析裸类名。
   function JavaImporter() {
     var self = this;
@@ -864,7 +864,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
   }
   g.JavaImporter = JavaImporter;
 
-  // 发现页/登录面板动作：书山聚合的「🔍搜索」用 java.searchBook(...)、
+  // 发现页/登录面板动作：某聚合源的「🔍搜索」用 java.searchBook(...)、
   // 「⚙登录」用 java.open('login','http',null)。这些副作用无法在 WebView 侧
   // 产生，统一登记成意图由宿主回传前端执行（见 ExploreActionOutcome）。
   J.open = function (type, kind, data) {
@@ -882,7 +882,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
   };
 
   // ── Rhino 的 `org.jsoup.*` 桥 ──
-  // 部分书源直接在规则里写 Java 风格的 JSoup 调用（故事族:
+  // 部分书源直接在规则里写 Java 风格的 JSoup 调用（某些书源:
   // `var doc = org.jsoup.Jsoup.parse(result); doc.select('a.flex-wrp');`），
   // 社区版 legado 靠 Rhino 的 Java 互操作跑通。桌面端没有 JVM，这里用同一套
   // 宿主选择器引擎(`__rule_get`)造出等价的 Elements/Element 对象。
@@ -907,7 +907,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
     list.toString = function () { return list.map(function (el) { return el.outerHtml(); }).join(''); };
     // 关键: 规则以 `els` 结尾返回时, 宿主需要**元素快照数组**才能继续按
     // name/author/bookUrl 等字段规则取值。没有 toJSON 时会被序列化成
-    // "[object Object],[object Object]" 而解析出 0 本(故事族即此症状)。
+    // "[object Object],[object Object]" 而解析出 0 本(这是常见症状)。
     list.toJSON = function () {
       return list.map(function (el) { return el.__snapshot; });
     };
@@ -1021,7 +1021,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.upLoginData = function (data) { g.__login_update(JSON.stringify(data == null ? null : data)); };
   J.reLoginView = function () { g.__login_refresh(); };
   // legado: `java.refreshExplore()` 刷新发现页（只重算分类，不重跑登录）。
-  // 早先把它等同于 reLoginView 是错的：书山/七猫的「🔄刷新」按钮会因此弹出
+  // 早先把它等同于 reLoginView 是错的：某类书源的「🔄刷新」按钮会因此弹出
   // 登录面板，而不是刷新发现页。
   J.refreshExplore = function (flag) { g.__explore_refresh(flag === undefined ? '' : S(flag)); return true; };
   src.put = function (k, v) { g.__store_put('sp:' + si.url + ':' + S(k), S(v)); return v; };

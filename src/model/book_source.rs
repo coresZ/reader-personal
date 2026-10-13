@@ -84,8 +84,8 @@ pub const DEFAULT_CHECK_KEYWORD: &str = "我的";
 /// 发现页分类项，对应 legado `ExploreKind`。
 ///
 /// 它不只是"一个分类链接"：`type` 决定渲染成什么控件，`action` 是该控件的
-/// 点击脚本，`chars`/`default` 是 select 与 toggle 的选项与初值。聚合类书源
-/// （七猫/书山/墨阅/光遇）的发现页筛选栏、搜索框、刷新按钮全靠这几个字段 ——
+/// 点击脚本，`chars`/`default` 是 select 与 toggle 的选项与初值。聚合类书源的
+/// 发现页筛选栏、搜索框、刷新按钮全靠这几个字段 ——
 /// 早先只保留 `title/url/style` 时它们会在反序列化阶段被静默丢弃，前端因而
 /// 只能把每个控件都渲染成一个普通分类按钮。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

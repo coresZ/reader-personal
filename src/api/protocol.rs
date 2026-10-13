@@ -90,7 +90,7 @@ async fn source_panel_route(
         return text_response(404, "panel not found");
     };
     let target = params.get(if namespaced { "__readerPanelUrl" } else { "url" });
-    // 面板页 JS 改写自身 URL 的 query 后整页导航时(书山聚合登录页的
+    // 面板页 JS 改写自身 URL 的 query 后整页导航时(某聚合源的登录页的
     // `sw('register')`: `new URL(location.href)` + searchParams.set +
     // location.href), 改动只落在代理 URL 的外层 query 上 —— 桥脚本的
     // proxyUrl() 把上游 query 复制到外层, 且初始加载会按设计删掉
@@ -122,7 +122,7 @@ async fn source_panel_route(
 /// 把代理 URL 外层 query 合并进上游 URL。
 ///
 /// 面板内 JS 用 `new URL(location.href)` + `searchParams.set` + `location.href`
-/// 这类整页导航改写自身 query 时(书山聚合登录页的 `sw('register')`), 改动只会
+/// 这类整页导航改写自身 query 时(某聚合源的登录页的 `sw('register')`), 改动只会
 /// 落在代理 URL 的外层 query 上, 而 `__readerPanelUrl` 仍是改写前的地址。不透传
 /// 就会永远停在原状态(点注册始终回到登录页)。
 ///
@@ -176,7 +176,7 @@ fn merge_panel_outer_query(
         return None;
     }
 
-    // 纯追加(无同名冲突, 即书山聚合点注册这类场景)时直接在原 query 后拼接,
+    // 纯追加(无同名冲突, 即该页点注册这类场景)时直接在原 query 后拼接,
     // 保留既有片段原文 —— `query_pairs` 重建会把 `%20` 变 `+`、`%zz` 变
     // `%25zz`, 上游按 query 原文签名/比对时会失配。
     let overrides = pending
@@ -233,7 +233,7 @@ fn render_source_panel_page(panel_id: &str, entry: &crate::service::book_service
 }
 
 /// `jar_cookie`: 书源 cookie jar 中该页面域的 cookie 串 (`k=v; k2=v2`)。
-/// 面板页面 JS 常用 `document.cookie` 判断登录态（如光遇 `/user` 的
+/// 面板页面 JS 常用 `document.cookie` 判断登录态（如某书源 `/user` 的
 /// `getCookie('qttoken')`）。自定义协议 origin 下 `Set-Cookie` 响应头
 /// 未必被 WebView 落盘，这里直接在页面脚本之前注入并劫持
 /// `document.cookie` 的 getter（jar 优先合并），保证入口检查可读到。
@@ -245,7 +245,7 @@ fn render_source_panel_page_with_cookie(panel_id: &str, entry: &crate::service::
     // document.cookie **回写书源 jar**。登录脚本用 `document.cookie = 'user_token=…'`
     // 记录会话, 而上游后续页面(/user_center 等)由**服务端**读 Cookie 判断登录态 ——
     // 只写浏览器的话这份 cookie 留在面板 origin(reader.localhost)下, 转发请求带不上,
-    // 上游就会当作未登录并把页面踢回登录页(书山聚合表现为「登录过期」)。
+    // 上游就会当作未登录并把页面踢回登录页(表现为「登录过期」)。
     if page_url.starts_with("http://") || page_url.starts_with("https://") {
         bridge.push_str(&format!(
             r#"<script>
@@ -303,7 +303,7 @@ fn render_source_panel_page_with_cookie(panel_id: &str, entry: &crate::service::
         if (head && head.indexOf('=') > 0) {{
           var name = head.slice(0, head.indexOf('=')).trim();
           var val = head.slice(head.indexOf('=') + 1).trim();
-          // 页面用 `x=; expires=<过去时间>` 删除 cookie(书山聚合的 userLogout 即如此)。
+          // 页面用 `x=; expires=<过去时间>` 删除 cookie(该页的 userLogout 即如此)。
           // 空值/已过期应把条目从 jar 移除, 否则空值会被当成有效登录态回写上游。
           // 注意只取 `expires=` 之后到下一个 `;` 之前的部分交给 Date.parse ——
           // 整串(含其它属性)会解析成 NaN, 使过期判断永远不成立。
@@ -388,7 +388,7 @@ async fn fetch_source_panel_response(
     }
     // WebView2 交给宿主的自定义协议请求可能不带 Content-Type, 也可能带一个与实际
     // 请求体不符的头。后端(PHP 等)在缺该头、或头与体不匹配时都**完全不解析请求体**
-    // (`$_POST` 为空), 表现为「后端收不到任何字段」—— 书山聚合注册接口即回
+    // (`$_POST` 为空), 表现为「后端收不到任何字段」—— 某聚合源的注册接口即回
     // 「无效的操作」。因此以请求体的真实字节为准: 体是 multipart 就按体首行的
     // boundary 声明, 否则仅在缺头时按 urlencoded 兜底。
     if request.method() == http::Method::POST {
@@ -413,7 +413,7 @@ async fn fetch_source_panel_response(
         .header(http::header::CONTENT_TYPE, if is_html { "text/html; charset=utf-8" } else { &content_type })
         .header(http::header::CACHE_CONTROL, "no-store");
     // 面板页在 reader origin 里运行, 页面 JS 读 document.cookie 判断登录态
-    // (如光遇 /user 的 getCookie('qttoken'))。真实 cookie 在书源 jar 中,
+    // (如面板页的 getCookie('qttoken'))。真实 cookie 在书源 jar 中,
     // 以 Set-Cookie 透出给面板 origin, 让入口检查通过; 后续请求仍由代理
     // 携带 jar cookie, 浏览器侧的这份仅供 JS 读取。每个 cookie 对一个头。
     if is_html {
@@ -1176,7 +1176,7 @@ fn merge_proxy_headers(
 ///
 /// WebView2 把自定义协议请求交给宿主时可能不提供 `Content-Type`, 也可能给一个与
 /// 实际请求体不符的头。而后端(PHP 等)在缺该头、或头与体不匹配时都**完全不解析
-/// 请求体**: `$_POST` 为空, 表现为「后端收不到任何字段」(书山聚合注册接口即回
+/// 请求体**: `$_POST` 为空, 表现为「后端收不到任何字段」(某聚合源的注册接口即回
 /// 「无效的操作」)。此时也不能一律按 urlencoded 兜底 —— multipart 体被错标后同样
 /// 解析不出字段, 症状不变。因此以体为准:
 /// - 体的首行是 `--boundary` -> 声明为该 boundary 的 multipart 体;
@@ -1308,7 +1308,7 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
     }}
   }}
 
-  // 面板页 JS 用 `document.cookie = 'k=v'` 记录登录态(书山聚合登录页写
+  // 面板页 JS 用 `document.cookie = 'k=v'` 记录登录态(某聚合源的登录页写
   // `user_token`), 而上游后续页面由**服务端**读 Cookie 判断登录, 只留在浏览器里
   // 转发请求带不上, 上游会当作未登录并踢回登录页。这里把页面写入的 cookie 经
   // 同步桥落到书源 jar。注入顺序上 cookie 劫持脚本在本脚本之前, 它会把待发送的
@@ -1341,7 +1341,7 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
     var id = url.searchParams.get(url.searchParams.has("__readerPanelId") ? "__readerPanelId" : "panelId");
     return url.origin === panelOrigin && url.pathname === "/sourcePanel" && id === panelId;
   }}
-  // 面板页 JS 用 location.href 改写自身 query 做整页导航时(书山聚合登录页的
+  // 面板页 JS 用 location.href 改写自身 query 做整页导航时(某聚合源的登录页的
   // sw('register')), 改动落在代理 URL 的外层 query 上, 而初始加载会按设计删掉
   // __readerPanelUrl。不并回真实 URL, 导航就会退回改动前的地址 —— 点注册永远
   // 停在登录页。同名参数以**外层为准**且整体替换(与 searchParams.set 一致),
@@ -1545,7 +1545,7 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
       if (init && init.body != null) {{
         // 用原始 BodyInit 重建, 而不是把已构造的 Request 再包一层: 后者会让请求体
         // 变成 ReadableStream, 经自定义协议发送时可能送不出体(后端于是收不到任何
-        // 表单字段, 书山聚合注册接口回「无效的操作」)。原始 FormData/Blob 重建则由
+        // 表单字段, 某聚合源的注册接口回「无效的操作」)。原始 FormData/Blob 重建则由
         // 浏览器在发送时按真实字节生成 Content-Type 与 boundary。
         return nativeFetch(new Request(proxyUrl(url), init));
       }}
@@ -1988,7 +1988,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn panel_form_post_infers_missing_content_type() {
-        // 书山聚合注册页用 FormData 提交(send_code), WebView2 交给宿主的自定义
+        // 某聚合源的注册页用 FormData 提交(send_code), WebView2 交给宿主的自定义
         // 协议请求可能不带 Content-Type。后端(PHP)缺该头时完全不解析请求体,
         // 表现为注册接口回「无效的操作」。这里断言转发时按体的真实形态补齐,
         // 且 multipart 的 boundary 取自体本身(不能一律按 urlencoded 兜底, 那会
@@ -2092,7 +2092,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn panel_cookie_writes_reach_source_jar() {
-        // 书山聚合登录页用 `document.cookie = 'user_token=…'` 记录会话, 而 /user_center
+        // 某聚合源的登录页用 `document.cookie = 'user_token=…'` 记录会话, 而 /user_center
         // 由**服务端**读 Cookie 判断登录态。只写浏览器的话这份 cookie 留在面板
         // origin(reader.localhost)下, 转发请求带不上, 上游就把页面踢回登录页
         // (用户看到「登录过期」)。这里断言: 面板页写入的 cookie 能落到书源 jar,
@@ -2178,7 +2178,7 @@ mod tests {
             "https 源写入 https 目标应放行"
         );
 
-        // 空值代表页面删除 cookie(退出登录, 书山聚合的 userLogout 即写 `user_token=;`
+        // 空值代表页面删除 cookie(退出登录, 该页的 userLogout 即写 `user_token=;`
         // 配合过去时间)。必须从 jar 移除, 而不是留下空值发给上游。
         bridge_set(&entry.url, "user_token=").expect("删除应成功");
         fetch_source_panel_response(&source, &panel_id, &entry, &entry.url, &http::Request::new(Vec::new())).await.unwrap();
@@ -2189,7 +2189,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn panel_html_exposes_source_jar_cookies_to_page_scripts() {
-        // 光遇等站点的前端用 document.cookie 判断登录态(getCookie('qttoken')),
+        // 这类站点的前端用 document.cookie 判断登录态(getCookie('qttoken')),
         // 面板 HTML 响应需要把书源 jar 的 cookie 以 Set-Cookie 透出给面板 origin。
         use axum::{http::HeaderMap, routing::get, Router};
         use crate::crawler::http_client::HttpClient;
@@ -2340,7 +2340,7 @@ mod tests {
 
     #[test]
     fn panel_outer_query_overrides_upstream_query() {
-        // 书山聚合登录页 `sw('register')` 把 mode 写进代理 URL 外层 query,
+        // 某聚合源的登录页 `sw('register')` 把 mode 写进代理 URL 外层 query,
         // 初始加载已删掉 __readerPanelUrl(桥的 proxyUrl(url, storedHtml=true)),
         // 合并必须把 mode=register 送到上游, 否则页面永远是登录态。
         let params = parse_query("__readerPanelId=panel-1&mode=register");
@@ -2406,7 +2406,7 @@ mod tests {
 
     #[test]
     fn panel_outer_query_appends_without_rewriting_existing_query() {
-        // review P5: 纯追加场景(书山聚合点注册)不得重建整串 query, 否则
+        // review P5: 纯追加场景(该页点注册)不得重建整串 query, 否则
         // `%20` 会被重编码成 `+`, 上游按 query 原文签名时会失配。
         let params = parse_query("__readerPanelId=panel-1&mode=register");
         let merged = merge_panel_outer_query("https://example.com/x?q=a%20b&sig=%zz", &params, true).unwrap();
@@ -2425,7 +2425,7 @@ mod tests {
         assert_eq!(first, "https://example.com/x?aa=2&mm=3&zz=1");
     }
 
-    /// 书山聚合登录页的端到端链路: 初始加载(删掉 __readerPanelUrl)后页面 JS
+    /// 某聚合源的登录页的端到端链路: 初始加载(删掉 __readerPanelUrl)后页面 JS
     /// 改写外层 query 触发注册导航, 上游必须收到 mode=register 才能渲染注册态。
     #[test]
     fn panel_register_navigation_reaches_upstream_with_mode() {

@@ -15,7 +15,7 @@ fn java_aes_base64_decode_to_string_decrypts_legado_paths() {
 
 #[test]
 fn java_importer_supports_rhino_with_scope() {
-    // 大灰狼聚合等 jsLib 顶层使用 Rhino 的 JavaImporter + with 语法
+    // 部分书源 jsLib 顶层使用 Rhino 的 JavaImporter + with 语法
     let result = eval_js(
         r#"
         var importer = new JavaImporter(Packages.java.util, Packages.java.lang);

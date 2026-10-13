@@ -1,7 +1,7 @@
-// 本地下载的 yckceo id 7249「光遇聚合」兼容验证。
+// 本地下载的某个聚合书源兼容验证（样本不入库）。
 // 其设置按钮用 startBrowserAwait 等待用户确认内嵌 HTML，再读取 DOM 保存设置。
 //
-// 若 tmp_probe/yck7249-login.json 不存在则跳过（该文件由本地脚本生成，不入库）。
+// 若对应样本 JSON 不存在则跳过（该文件由本地脚本生成，不入库）。
 
 use reader_rust::model::book_source::BookSource;
 use reader_rust::parser::js::{eval_js, take_js_logs, with_source};
@@ -128,7 +128,7 @@ async fn actual_settings_buttons_save_the_confirmed_page() {
     remove_source_panel(id);
 }
 
-/// 「墨阅·极速」这类第三方平台源：登录拿 token 存**源变量**（不是 cookie），
+/// 某第三方平台源：登录拿 token 存**源变量**（不是 cookie），
 /// 请求靠 `header` 规则动态拼 `Authorization: Bearer <token>`，个人中心则是
 /// `java.startBrowser(host + '/user/token-login?token=' + token)` 用 URL 换会话。
 /// 验证这条链路不依赖 cookie jar 也能把登录态带进面板。
@@ -308,7 +308,7 @@ async fn login_check_js_sees_str_response_and_reauthenticates_on_401() {
             {"name": "密码", "type": "password", "default": ""},
             {"name": "登录", "type": "button", "action": "login(true)"}
         ]).to_string(),
-        // 墨阅真实写法: 401 时 source.login() + java.getStrResponse()
+        // 该类书源的真实写法: 401 时 source.login() + java.getStrResponse()
         "loginCheckJs": "if(result.code()==401||String(result.body()).indexOf('40101')>=0){source.login();java.getStrResponse();}else{result;}",
         "searchUrl": "<js>host + '/legado/search?key=' + encodeURIComponent(key) + '&page=' + page;</js>",
         "ruleSearch": {

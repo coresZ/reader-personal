@@ -1,7 +1,7 @@
 // 发现页重构的后端验证：
 //   1. ExploreKind 的 type/action/chars/default/viewName 不再被丢弃
 //   2. infoMap 能注入 JS（书源两种访问写法都要可用）
-//   3. org.jsoup 桥（故事族报错 org is not defined 的修复）
+//   3. org.jsoup 桥（某书源报错 org is not defined 的修复）
 //   4. java.refreshExplore() 语义（不再等同于重登录）
 //   5. java.open / java.searchBook 意图回传
 use reader_rust::crawler::http_client::HttpClient;
@@ -86,7 +86,7 @@ fn explore_kinds_evaluates_js_rule_with_info_map() {
     assert_eq!(kinds[0].title, "玄幻");
     assert_eq!(kinds[0].url.as_deref(), Some("https://plain.test/xh/{{page}}/"));
 
-    // JS 型：读 infoMap 决定输出，并回写默认值（书山/七猫的真实写法）
+    // JS 型：读 infoMap 决定输出，并回写默认值（该类书源的真实写法）
     let js_source = source(json!({
         "bookSourceName": "JS源",
         "bookSourceUrl": "https://js.test",
@@ -132,7 +132,7 @@ fn info_map_supports_both_access_styles() {
     });
 }
 
-/// 故事族报错 `org is not defined` 的修复：org.jsoup.Jsoup.parse(result).select(...)
+/// 某书源报错 `org is not defined` 的修复：org.jsoup.Jsoup.parse(result).select(...)
 #[test]
 fn jsoup_bridge_matches_story_source_usage() {
     let src = source(json!({
@@ -140,7 +140,7 @@ fn jsoup_bridge_matches_story_source_usage() {
         "bookSourceUrl": "https://www.gushizu.com"
     }));
 
-    // 取自故事族 ruleExplore.bookList 的真实写法
+    // 取自该书源 ruleExplore.bookList 的真实写法
     let script = r#"
 var doc = org.jsoup.Jsoup.parse(result);
 var els = doc.select('a.flex-wrp.border-b');
@@ -179,10 +179,10 @@ fn jsoup_bridge_supports_nested_select() {
     });
 }
 
-/// 端到端回归：故事族式的 `<js>` 列表规则返回 JSoup Elements 时，parse_search_list
+/// 端到端回归：该类书源式的 `<js>` 列表规则返回 JSoup Elements 时，parse_search_list
 /// 必须能把它当成书籍列表解析出来（书名 / 书址都要正确）。
 ///
-/// 这正是故事族"解析 0 本、且不报错"的根因：Elements 被序列化成
+/// 这正是"解析 0 本、且不报错"的根因：Elements 被序列化成
 /// `[object Object]` 后丢失了元素的 tag/attrs，字段规则再取 `href` 就一无所获。
 /// 修复分两处：Elements 的 `toJSON` 交出元素快照；`pick_json_field` 在快照上
 /// 回退查 `attrs`。
@@ -224,7 +224,7 @@ fn js_elements_rule_parses_into_books() {
 }
 
 /// viewName 的三种形态：`'字面量'` 取引号内文字、JS 表达式求值、缺省回退 title。
-/// 光遇聚合的筛选控件全都写作 `"'请选择类型'"`，不解析就会把 `title`（如"平台"）
+/// 某聚合源的筛选控件全都写作 `"'请选择类型'"`，不解析就会把 `title`（如"平台"）
 /// 当显示名，与手机端不一致。
 #[test]
 fn explore_view_name_resolves_literal_and_js() {
@@ -276,7 +276,7 @@ fn explore_view_name_failure_does_not_break_kinds() {
 fn explore_kinds_does_not_leak_effects_into_next_action() {
     let svc = service();
 
-    // 书山形态：exploreUrl 顶层就调用 java.refreshExplore() / java.open / java.searchBook
+    // 该类书源的形态：exploreUrl 顶层就调用 java.refreshExplore() / java.open / java.searchBook
     let noisy = source(json!({
         "bookSourceName": "脏源",
         "bookSourceUrl": "https://noisy.test",
@@ -426,7 +426,7 @@ fn refresh_explore_is_distinct_from_relogin() {    let svc = service();
     assert!(!relogin.explore_refresh);
 }
 
-/// 书山聚合的搜索/登录按钮：action 里的 java.searchBook / java.open 要回传意图。
+/// 某聚合源的搜索/登录按钮：action 里的 java.searchBook / java.open 要回传意图。
 #[test]
 fn explore_action_reports_search_and_open_intents() {
     let svc = service();

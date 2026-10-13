@@ -115,7 +115,7 @@ pub fn get_source_panel(panel_id: &str) -> Option<SourcePanelEntry> {
 
 /// 把面板页写入的 `document.cookie` 落到书源 cookie jar。
 ///
-/// 面板页(如书山聚合的登录页)用 `document.cookie = 'user_token=…'` 记录会话,
+/// 面板页(如某聚合源的登录页)用 `document.cookie = 'user_token=…'` 记录会话,
 /// 而上游后续页面由**服务端**读 Cookie 判断登录态。只写浏览器的话这份 cookie
 /// 留在面板 origin 下, 转发请求带不上, 上游就把页面踢回登录页(用户看到
 /// 「登录过期」)。这里按面板当前的上游地址写入 jar, 让后续转发带上它。
@@ -206,7 +206,7 @@ pub async fn handle_source_panel_bridge(
                 Ok(json!(http.session.get(&key)))
             }
         }
-        // 面板页 JS 用 `document.cookie = 'k=v'` 记录登录态(书山聚合登录页写
+        // 面板页 JS 用 `document.cookie = 'k=v'` 记录登录态(某聚合源的登录页写
         // `user_token`), 而上游后续页面由**服务端**读 Cookie 判断登录, 只留在浏览器里
         // 转发请求带不上, 上游会当作未登录并把页面踢回登录页(表现为「登录过期」)。
         // 这里把它落到书源 jar, 随后的转发请求就能带上。
@@ -1122,7 +1122,7 @@ impl BookService {
     /// - `java.startBrowser` / `java.showBrowser` → `show_browser` 面板请求
     /// - `java.toast` / `java.longToast` → `messages` 提示文案
     ///
-    /// `show_browser` 必须在这里登记成可渲染的面板：光遇的「更新书源」「书源设置」
+    /// `show_browser` 必须在这里登记成可渲染的面板：某书源的「更新书源」「书源设置」
     /// 都靠它弹出 HTML，早先只回传意图而丢掉面板，按钮点了毫无反应。
     pub fn explore_action(
         &self,

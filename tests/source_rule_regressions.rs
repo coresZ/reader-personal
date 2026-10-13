@@ -150,7 +150,7 @@ fn header_names_with_unicode_hyphens_are_normalized() {
     assert!(!names.iter().any(|n| n.contains(' ')), "含空格的非法头名应被跳过: {names:?}");
 }
 
-/// 正文规则抛出的**书源业务提示**（如墨阅的 VIP 限制）必须变成可读错误，
+/// 正文规则抛出的**书源业务提示**（如书源的 VIP 限制）必须变成可读错误，
 /// 而不是静默的空正文 —— 否则界面上"点了没反应"，用户不知道发生了什么。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn content_rule_business_error_is_reported_to_the_user() {
