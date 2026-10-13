@@ -236,6 +236,9 @@ body {
 }
 
 .app-shell.has-custom-background :is(
+  /* .explore-toolbar 是发现页现用类名; .explore-header 是旧名, 保留兼容
+     以免回滚或其它引用处漏掉玻璃效果。 */
+  .explore-toolbar,
   .explore-header,
   .categories-panel,
   .source-selector select,

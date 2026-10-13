@@ -26,6 +26,8 @@ const COMMAND_BY_PATH: Record<string, string> = {
   '/reader3/unpinBookSource': 'unpin_book_source',
   '/reader3/readRemoteSourceFile': 'read_remote_source_file',
   '/reader3/exploreBook': 'explore_book',
+  '/reader3/getExploreKinds': 'get_explore_kinds',
+  '/reader3/runExploreAction': 'run_explore_action',
   '/reader3/searchBookMulti': 'search_book_multi',
   '/reader3/getBookshelf': 'get_bookshelf',
   '/reader3/getShelfBookWithCacheInfo': 'get_shelf_book_with_cache_info',

@@ -3,6 +3,7 @@ import {
   getExploreCategoryKey,
   getInitialExploreCategoryUrl,
   isExploreCategorySection,
+  isJsExploreUrl,
   parseExploreCategories,
 } from './exploreCategories'
 
@@ -60,5 +61,22 @@ describe('exploreCategories', () => {
       { title: '>', url: '/ranking/hits/2.html' },
     ])
     expect(getInitialExploreCategoryUrl(categories)).toBe('/book/category/catalog.html')
+  })
+})
+
+describe('isJsExploreUrl', () => {
+  it('detects the js rule forms used by the failing aggregate sources', () => {
+    expect(isJsExploreUrl('@js:QMA_DISC.explore.call(this)')).toBe(true)
+    expect(isJsExploreUrl('@JS:  upper case')).toBe(true)
+    expect(isJsExploreUrl('<js>\nlet config = getConfig.call(this);\n</js>')).toBe(true)
+    expect(isJsExploreUrl('  <js>padded</js>')).toBe(true)
+  })
+
+  it('leaves plain text and json rules to the local parser', () => {
+    expect(isJsExploreUrl('玄幻::https://m.libahao2.com/xuanhuan/{{page}}/')).toBe(false)
+    expect(isJsExploreUrl('[{"title":"书 库","url":"/x"}]')).toBe(false)
+    expect(isJsExploreUrl('')).toBe(false)
+    expect(isJsExploreUrl(null)).toBe(false)
+    expect(isJsExploreUrl(undefined)).toBe(false)
   })
 })

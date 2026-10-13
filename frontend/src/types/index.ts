@@ -98,6 +98,7 @@ export interface BookSource {
   loginCheckJs?: string
   loadWithBaseUrl?: boolean
   singleUrl?: boolean
+  lastUpdateTime?: number
   ruleSearch?: Record<string, unknown>
   ruleExplore?: Record<string, unknown>
   ruleBookInfo?: Record<string, unknown>

@@ -36,6 +36,22 @@ pub struct ExploreKindsRequest {
     book_source_url: Option<String>,
     #[serde(rename = "bookSource")]
     book_source: Option<BookSource>,
+    /// 发现页控件当前取值（legado `InfoMap`）。JS 型 exploreUrl 会读它来决定
+    /// 生成哪些分类，并可能写回默认值。
+    #[serde(rename = "infoMap")]
+    info_map: Option<std::collections::HashMap<String, String>>,
+}
+
+/// 发现页控件 `action` 的求值请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExploreActionRequest {
+    pub book_source_url: Option<String>,
+    pub book_source: Option<BookSource>,
+    /// 要执行的 `action` 脚本。
+    pub action: String,
+    #[serde(default)]
+    pub info_map: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -342,9 +358,48 @@ pub async fn get_explore_kinds(
             .ok_or_else(|| AppError::NotFound("bookSource not found".to_string()))?
     };
 
-    let kinds = state.book_service.explore_kinds(&source)?;
+    let info_map = req.info_map.unwrap_or_default();
+    let kinds = state.book_service.explore_kinds_with_info(&source, &info_map)?;
     Ok(ApiResponse::ok(
         serde_json::to_value(kinds).unwrap_or_default(),
+    ))
+}
+
+/// 执行发现页控件的 `action`（按钮点击 / 下拉选择 / 输入框防抖回调）。
+///
+/// action 脚本里的 `java.refreshExplore()`、`java.open(...)`、`java.searchBook(...)`
+/// 会被捕获成意图标志返回，前端据此刷新分类、打开面板或发起搜索 —— 这些副作用
+/// 无法在 WebView 侧凭空产生，必须由宿主执行。
+#[tauri::command]
+pub async fn run_explore_action(
+    state: tauri::State<'_, AppState>,
+    req: ExploreActionRequest,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let user_ns = "default";
+
+    let source = if let Some(source) = req.book_source {
+        source
+    } else {
+        let url = req
+            .book_source_url
+            .ok_or_else(|| AppError::BadRequest("bookSourceUrl required".to_string()))?;
+        state
+            .book_source_service
+            .get(&user_ns, &url)
+            .await?
+            .ok_or_else(|| AppError::NotFound("bookSource not found".to_string()))?
+    };
+
+    let action = req.action.trim();
+    if action.is_empty() {
+        return Ok(ApiResponse::ok(serde_json::json!({ "executed": false })));
+    }
+
+    let outcome = state
+        .book_service
+        .explore_action(&source, action, &req.info_map)?;
+    Ok(ApiResponse::ok(
+        serde_json::to_value(outcome).unwrap_or_default(),
     ))
 }
 

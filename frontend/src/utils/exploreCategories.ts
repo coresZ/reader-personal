@@ -3,6 +3,20 @@ export interface ExploreCategory {
   url: string
 }
 
+/**
+ * exploreUrl 是否是「需要执行 JS 才能得到分类」的规则。
+ *
+ * 这类规则（七猫/书山/墨阅/光遇/故事族都用）在前端只做字符串启发式解析是
+ * 永远得不到分类的 —— `parseExploreCategories` 会返回空数组，于是发现页
+ * 分类栏与书列表一起空掉。它们必须交给后端 `get_explore_kinds` 在沙盒里
+ * 真正求值（对齐 legado `BookSourceExtensions.exploreKinds()`）。
+ */
+export function isJsExploreUrl(rule?: string | null): boolean {
+  const trimmed = rule?.trim().toLowerCase()
+  if (!trimmed) return false
+  return trimmed.startsWith('@js:') || trimmed.startsWith('<js>')
+}
+
 export function parseExploreCategories(rule?: string | null): ExploreCategory[] {
   const trimmedRule = rule?.trim()
   if (!trimmedRule) return []

@@ -81,12 +81,63 @@ impl BookSource {
 /// 检测书源可用性时的默认搜索关键词(与 Legado 官方一致)。
 pub const DEFAULT_CHECK_KEYWORD: &str = "我的";
 
+/// 发现页分类项，对应 legado `ExploreKind`。
+///
+/// 它不只是"一个分类链接"：`type` 决定渲染成什么控件，`action` 是该控件的
+/// 点击脚本，`chars`/`default` 是 select 与 toggle 的选项与初值。聚合类书源
+/// （七猫/书山/墨阅/光遇）的发现页筛选栏、搜索框、刷新按钮全靠这几个字段 ——
+/// 早先只保留 `title/url/style` 时它们会在反序列化阶段被静默丢弃，前端因而
+/// 只能把每个控件都渲染成一个普通分类按钮。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ExploreKind {
     pub title: String,
     pub url: Option<String>,
+    /// `url` | `text` | `button` | `toggle` | `select`，见 `ExploreKindType`。
+    /// 字段名 `kind_type` 是为了避开 Rust 关键字，线上 JSON 键仍是 `type`
+    /// （书源里就写作 `type`，前端也按 `type` 读）。
+    #[serde(rename = "type")]
+    pub kind_type: Option<String>,
+    pub action: Option<String>,
+    pub chars: Option<Vec<Option<String>>>,
+    pub default: Option<String>,
+    /// 控件显示名：`'字面量'` 直接取用，否则是段 JS（legado 语义）。
+    pub view_name: Option<String>,
     pub style: Option<Value>,
+}
+
+impl ExploreKind {
+    /// 归一化后的控件类型；legado 缺省值是 `url`。
+    pub fn kind_type(&self) -> ExploreKindType {
+        match self.kind_type.as_deref().map(str::trim) {
+            Some("text") => ExploreKindType::Text,
+            Some("button") => ExploreKindType::Button,
+            Some("toggle") => ExploreKindType::Toggle,
+            Some("select") => ExploreKindType::Select,
+            _ => ExploreKindType::Url,
+        }
+    }
+
+    /// 非空选项列表（legado 的 `chars` 允许含 null 元素，需过滤）。
+    pub fn chars_list(&self) -> Vec<String> {
+        self.chars
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .collect()
+    }
+}
+
+/// legado `ExploreKind.Type`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExploreKindType {
+    Url,
+    Text,
+    Button,
+    Toggle,
+    Select,
 }
 
 fn deserialize_rule_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>

@@ -11,7 +11,7 @@ use crate::model::{
     search::SearchBook,
 };
 use crate::parser::js::{
-    eval_js, eval_js_with_bindings, take_js_logs, with_book_context, with_source, with_source_key,
+    eval_js_with_bindings, take_js_logs, with_book_context, with_source, with_source_key,
     JsBookContext,
 };
 use crate::parser::rule_engine::RuleEngine;
@@ -384,6 +384,40 @@ struct RateState {
     in_flight: bool,
     last_start: Option<Instant>,
     window_starts: Vec<Instant>,
+}
+
+/// 发现页控件 `action` 的执行结果。
+///
+/// `action` 脚本通常只产生**副作用**（刷新发现页、打开登录面板、发起搜索），
+/// 返回值往往为空，所以真正要传回前端的是这里的一组意图标志。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExploreActionOutcome {
+    /// 脚本的返回值（多数 action 为空串）。
+    pub value: String,
+    /// `java.refreshExplore()` 被调用：前端应重新拉分类与列表。
+    pub explore_refresh: bool,
+    /// `java.reLoginView()` / `source.login()`：前端应重开登录面板。
+    pub login_refresh: bool,
+    pub login: bool,
+    /// `java.open(...)` 请求打开的面板，前端据此跳转。
+    pub open_urls: Option<String>,
+    /// `java.open` / `java.searchBook` / `java.openBook` 登记的待执行动作，
+    /// 形如 `{"kind":"search","payload":{...}}`。
+    pub intents: Vec<serde_json::Value>,
+    /// `java.startBrowser` / `java.showBrowser` 弹出的面板（legado 的
+    /// BottomWebViewDialog）。
+    ///
+    /// 缺了它，"更新书源""书源设置""刷新发现页设置"这类按钮点了毫无反应 ——
+    /// 脚本已经把面板 HTML 准备好了，只是没人把它交给前端渲染。
+    pub show_browser: Option<ShowBrowserRequest>,
+    /// 脚本写入的 UI 值（如 `java.upLoginData`），前端可回填到控件。
+    pub values: serde_json::Map<String, serde_json::Value>,
+    /// 脚本产生的提示（`java.toast` / `java.longToast`）。
+    ///
+    /// "更新配置""已是最新配置"这类反馈全靠它 —— 早先被丢掉，用户以为按钮坏了。
+    pub messages: Vec<String>,
+    pub logs: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1058,8 +1092,107 @@ impl BookService {
         self.parse_explore_books_blocking(user_ns, source, &res.body, &res.url, page).await
     }
 
+    /// 求值书源的发现页分类（exploreUrl）。
+    ///
+    /// `info_map` 是发现页控件的当前取值：JS 型 exploreUrl 会读它来决定生成哪些
+    /// 分类（如"发现页来源=番茄"），也会写回默认值。缺省用空 map。
+    pub fn explore_kinds_with_info(
+        &self,
+        source: &BookSource,
+        info_map: &HashMap<String, String>,
+    ) -> Result<Vec<ExploreKind>, AppError> {
+        self.source_scope("default", source, || {
+            // 与 explore_action 一样先清空线程局部的副作用槽位: exploreUrl 的
+            // JS 里也可能出现 java.refreshExplore() / java.open(...)，不清理会
+            // 让它们残留到下一次调用（例如被无辜的 action 当成自己的意图）。
+            crate::parser::js::take_login_effects();
+            crate::parser::js::take_explore_intents();
+            parse_explore_kinds(source, info_map)
+        })?
+    }
+
     pub fn explore_kinds(&self, source: &BookSource) -> Result<Vec<ExploreKind>, AppError> {
-        self.source_scope("default", source, || parse_explore_kinds(source))?
+        self.explore_kinds_with_info(source, &HashMap::new())
+    }
+
+    /// 求值发现页控件的 `action`（按钮/下拉/输入框回调）。
+    ///
+    /// 书源脚本里的副作用无法在 WebView 侧产生，统一随返回值交给调用方：
+    /// - `java.refreshExplore()` / `java.open` / `java.searchBook` → 意图标志
+    /// - `java.startBrowser` / `java.showBrowser` → `show_browser` 面板请求
+    /// - `java.toast` / `java.longToast` → `messages` 提示文案
+    ///
+    /// `show_browser` 必须在这里登记成可渲染的面板：光遇的「更新书源」「书源设置」
+    /// 都靠它弹出 HTML，早先只回传意图而丢掉面板，按钮点了毫无反应。
+    pub fn explore_action(
+        &self,
+        source: &BookSource,
+        action: &str,
+        info_map: &HashMap<String, String>,
+    ) -> Result<ExploreActionOutcome, AppError> {
+        let action = action.to_string();
+        let source_key = source.book_source_url.clone();
+        let info_map = info_map.clone();
+        let source_for_panel = source.clone();
+        self.source_scope("default", source, || {
+            take_js_logs();
+            crate::parser::js::take_login_effects();
+            crate::parser::js::take_explore_intents();
+            // 面板是"本次动作"的产物：先清掉上一轮残留，避免把旧面板当成本次结果。
+            clear_show_browser_request();
+            let value = crate::parser::js::eval_explore_action(&action, &source_key, &info_map);
+            let effects = crate::parser::js::take_login_effects();
+            let intents = crate::parser::js::take_explore_intents();
+            let browser = take_show_browser_request();
+            let logs = take_js_logs();
+
+            let messages = logs
+                .iter()
+                .filter_map(|line| line.strip_prefix("[toast] "))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+
+            let show_browser = match browser {
+                Some(request) => {
+                    let entry = crate::service::source_browser::source_panel_entry(
+                        &source_for_panel.book_source_url,
+                    )?;
+                    Some(crate::service::source_browser::register_browser_request(
+                        request, entry,
+                    )?)
+                }
+                None => None,
+            };
+
+            match value {
+                Ok(value) => Ok(ExploreActionOutcome {
+                    value,
+                    explore_refresh: effects.explore_refresh,
+                    login_refresh: effects.refresh,
+                    login: effects.login,
+                    open_urls: effects
+                        .values
+                        .get("__open")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    intents: intents
+                        .into_iter()
+                        .map(|(kind, payload)| {
+                            json!({
+                                "kind": kind,
+                                "payload": serde_json::from_str::<serde_json::Value>(&payload)
+                                    .unwrap_or(serde_json::Value::String(payload)),
+                            })
+                        })
+                        .collect(),
+                    show_browser,
+                    values: effects.values,
+                    messages,
+                    logs,
+                }),
+                Err(err) => Err(AppError::BadRequest(format!("书源动作执行失败: {err}"))),
+            }
+        })?
     }
 
     pub async fn test_book_source_availability(
@@ -2730,7 +2863,10 @@ fn parse_resp_envelope(output: &str) -> Option<StrResponse> {
     serde_json::from_value(value).ok()
 }
 
-fn parse_explore_kinds(source: &BookSource) -> Result<Vec<ExploreKind>, AppError> {
+fn parse_explore_kinds(
+    source: &BookSource,
+    info_map: &HashMap<String, String>,
+) -> Result<Vec<ExploreKind>, AppError> {
     let Some(raw) = source
         .explore_url
         .as_deref()
@@ -2740,25 +2876,27 @@ fn parse_explore_kinds(source: &BookSource) -> Result<Vec<ExploreKind>, AppError
         return Ok(Vec::new());
     };
 
-    let text = with_source(source,|| {
-        if let Some(script) = raw.strip_prefix("@js:") {
-            eval_js(script, "", &source.book_source_url).map_err(AppError::Internal)
-        } else if let Some(script) = raw
-            .strip_prefix("<js>")
-            .and_then(|value| value.strip_suffix("</js>"))
-        {
-            eval_js(script, "", &source.book_source_url).map_err(AppError::Internal)
-        } else {
-            Ok(raw.to_string())
-        }
-    })?;
+    let text = if let Some(script) = raw.strip_prefix("@js:") {
+        crate::parser::js::eval_explore_kinds(script, &source.book_source_url, info_map)
+            .map_err(|err| AppError::BadRequest(format!("发现规则执行失败: {err}")))?
+    } else if let Some(script) = raw
+        .strip_prefix("<js>")
+        .and_then(|value| value.strip_suffix("</js>"))
+    {
+        crate::parser::js::eval_explore_kinds(script, &source.book_source_url, info_map)
+            .map_err(|err| AppError::BadRequest(format!("发现规则执行失败: {err}")))?
+    } else {
+        raw.to_string()
+    };
 
     for json_text in [&text, &normalize_relaxed_explore_json(&text)] {
         if let Ok(kinds) = serde_json::from_str::<Vec<ExploreKind>>(json_text) {
-            return Ok(kinds
+            let mut kinds: Vec<ExploreKind> = kinds
                 .into_iter()
                 .filter(|kind| !kind.title.trim().is_empty())
-                .collect());
+                .collect();
+            resolve_explore_view_names(source, &mut kinds, info_map);
+            return Ok(kinds);
         }
     }
 
@@ -2783,14 +2921,38 @@ fn parse_explore_kinds(source: &BookSource) -> Result<Vec<ExploreKind>, AppError
             Some(ExploreKind {
                 title: title.to_string(),
                 url,
-                style: None,
+                ..ExploreKind::default()
             })
         })
         .collect())
 }
 
-fn normalize_relaxed_explore_json(text: &str) -> String {
-    let mut normalized = String::with_capacity(text.len());
+/// 填充交互控件的显示名（legado `ExploreKind.viewName`）。
+///
+/// 只处理非 url 型控件：url 型就是普通分类按钮，标题即文字。求值失败时
+/// 保持 `view_name` 为 None，前端回退用 `title` —— 显示名不该成为整页失败的
+/// 原因。
+fn resolve_explore_view_names(
+    source: &BookSource,
+    kinds: &mut [ExploreKind],
+    info_map: &HashMap<String, String>,
+) {
+    for kind in kinds.iter_mut() {
+        if kind.kind_type() == crate::model::book_source::ExploreKindType::Url {
+            continue;
+        }
+        let Some(raw) = kind.view_name.as_deref().filter(|v| !v.trim().is_empty()) else {
+            continue;
+        };
+        kind.view_name = crate::parser::js::eval_explore_view_name(
+            raw,
+            &source.book_source_url,
+            info_map,
+        );
+    }
+}
+
+fn normalize_relaxed_explore_json(text: &str) -> String {    let mut normalized = String::with_capacity(text.len());
     let mut in_string = false;
     let mut quote = '\0';
     let mut escaped = false;

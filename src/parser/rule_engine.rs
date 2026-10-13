@@ -1628,6 +1628,27 @@ fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
         if let Some(val) = obj.get(rule) {
             return jsonpath::value_to_string(val);
         }
+        // 元素快照兼容: `<js>` 规则返回 JSoup 元素后, 字段规则常写裸属性名
+        // (`href` / `src`) 或 `text`。快照把属性放在 `attrs` 下、文本放在
+        // `text`, 直接按顶层键取会空 → bookUrl 退化成列表页地址(故事族症状)。
+        //
+        // 守卫要求 `attrs` + `tag` + `outerHtml` **三个键同时存在**: 只看
+        // `attrs` 会误伤普通 JSON 源 —— `attrs` 是常见字段名, 一旦响应里有它
+        // 且规则名恰好是裸属性名, 就会取到错误的值。三者齐备是元素快照的
+        // 充分特征(见 element_snapshot / snapshot_from_fragment)。
+        let looks_like_snapshot = obj.contains_key("attrs")
+            && obj.contains_key("tag")
+            && obj.contains_key("outerHtml");
+        if looks_like_snapshot {
+            if let Some(attr) = obj.get("attrs").and_then(|a| a.get(rule)) {
+                return jsonpath::value_to_string(attr);
+            }
+            if rule.eq_ignore_ascii_case("text") || rule.eq_ignore_ascii_case("ownText") {
+                if let Some(text) = obj.get(rule) {
+                    return jsonpath::value_to_string(text);
+                }
+            }
+        }
     }
     None
 }

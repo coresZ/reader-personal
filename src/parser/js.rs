@@ -83,6 +83,9 @@ pub struct LoginEffects {
     pub reset: bool,
     /// `source.login()` 被脚本调用: 调用方应重跑 loginUrl 并重取响应。
     pub login: bool,
+    /// `java.refreshExplore()` 被脚本调用: 调用方应刷新发现页分类与列表。
+    /// 与 `refresh`(重登录视图) 是两件事 —— 早先两者被混为一谈。
+    pub explore_refresh: bool,
 }
 
 /// 正文/目录解析时的书籍与章节上下文, 对应 legado JS 里的 `book` / `chapter`。
@@ -103,6 +106,19 @@ thread_local! {
     static LOGIN_EFFECTS: RefCell<LoginEffects> = RefCell::new(LoginEffects::default());
     /// `java.getStrResponse()`: 最近一次 HTTP 请求的响应信封。
     static LAST_RESPONSE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// 发现页脚本通过 `java.open` / `java.searchBook` / `java.openBook` 登记的
+    /// 意图（`"kind\u{1}payloadJson"`），由宿主回传前端执行。
+    static EXPLORE_INTENTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 取出并清空当前线程登记的发现页意图。
+pub fn take_explore_intents() -> Vec<(String, String)> {
+    EXPLORE_INTENTS.with(|cell| {
+        std::mem::take(&mut *cell.borrow_mut())
+            .into_iter()
+            .filter_map(|raw| raw.split_once('\u{1}').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect()
+    })
 }
 
 const MAX_JS_LOGS: usize = 200;
@@ -360,6 +376,127 @@ pub fn eval_js_search_with_source(
         Some(source_key),
         None,
     )
+}
+
+/// 求值发现页分类里的 `exploreUrl`（`@js:` / `<js>` 规则）。
+///
+/// 与规则的其它 JS 不同，这里必须注入 `infoMap`：聚合类书源的 exploreUrl 会
+/// 读 `getVariable('更多设置')`、`infoMap['发现页来源']` 等来决定要生成哪些
+/// 分类，并顺手 `infoMap[...] = ...` 写回默认值。
+pub fn eval_explore_kinds(
+    script: &str,
+    source_key: &str,
+    info_map: &HashMap<String, String>,
+) -> anyhow::Result<String> {
+    let mut bindings = HashMap::new();
+    bindings.insert(
+        "infoMap".to_string(),
+        JsonValue::String(info_map_binding(info_map)),
+    );
+    eval_js_inner_with_source(
+        script,
+        None,
+        None,
+        None,
+        None,
+        Some(source_key),
+        Some(&bindings),
+    )
+}
+
+/// 求值发现页控件的 `action`（按钮点击 / 下拉选择 / 输入框防抖回调）。
+///
+/// 与 [`eval_explore_kinds`] 的区别是同时注入 `java`：`action` 里最常见的就是
+/// `java.refreshExplore()`、`java.open('login','http',null)`、`java.searchBook(...)`。
+/// 这些调用会写进 `LoginEffects`，由调用方（IPC 命令）回传给前端执行。
+pub fn eval_explore_action(
+    script: &str,
+    source_key: &str,
+    info_map: &HashMap<String, String>,
+) -> anyhow::Result<String> {
+    let mut bindings = HashMap::new();
+    bindings.insert(
+        "infoMap".to_string(),
+        JsonValue::String(info_map_binding(info_map)),
+    );
+    eval_js_inner_with_source(
+        script,
+        None,
+        None,
+        None,
+        None,
+        Some(source_key),
+        Some(&bindings),
+    )
+}
+
+/// 解析发现页控件的显示名（legado `ExploreKind.viewName`）。
+///
+/// legado `ExploreAdapter` 的规则：
+/// - 缺省 → 用 `title`；
+/// - 形如 `'字面量'`（长度 3..=19 且首尾都是单引号）→ 取引号内的字面量；
+/// - 其余 → 当作 JS 求值（`evalUiJs`），失败或为空则回退 `title`。
+///
+/// 必须放在后端：光遇聚合的筛选控件把 `viewName` 写成 `"'请选择类型'"`，
+/// 而七猫等源会写成一段读 `source.getVariable()` 的脚本 —— 两者都需要沙箱。
+pub fn eval_explore_view_name(
+    view_name: &str,
+    source_key: &str,
+    info_map: &HashMap<String, String>,
+) -> Option<String> {
+    let raw = view_name.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // `'字面量'` 形式：整串就是一对单引号包起来的纯文本。
+    //
+    // 只判断首尾引号是不够的：`'选'+'源'` 同样首尾是单引号且长度落在 legado
+    // 的 3..=19 区间内，但它其实是一段 JS 表达式。因此额外要求**内部不再出现
+    // 引号**，否则交给沙盒求值。
+    let len = raw.chars().count();
+    if (3..=19).contains(&len) && raw.starts_with('\'') && raw.ends_with('\'') {
+        let inner = &raw[1..raw.len() - 1];
+        if !inner.contains('\'') {
+            let inner = inner.trim();
+            if !inner.is_empty() {
+                return Some(inner.to_string());
+            }
+        }
+    }
+
+    let mut bindings = HashMap::new();
+    bindings.insert(
+        "infoMap".to_string(),
+        JsonValue::String(info_map_binding(info_map)),
+    );
+    match eval_js_inner_with_source(
+        raw,
+        None,
+        None,
+        None,
+        None,
+        Some(source_key),
+        Some(&bindings),
+    ) {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            (!value.is_empty() && !value.eq_ignore_ascii_case("null")).then_some(value)
+        }
+        Err(err) => {
+            push_js_log(format!("[explore viewName] {err}"));
+            None
+        }
+    }
+}
+
+/// 把发现页的 `infoMap` 编码成 JS 可用的绑定值。
+///
+/// 书源里两种访问方式都出现过：`infoMap['源站']`（下标）与
+/// `infoMap.get && infoMap.get('源站')`（Map 风格）。因此这里序列化成
+/// **JSON 对象**再在 prelude 里补 `get/put/containsKey` 等方法 —— 对象本来就
+/// 支持下标访问，补上方法后两种写法都能工作。
+fn info_map_binding(info_map: &HashMap<String, String>) -> String {
+    serde_json::to_string(&json!({ "__infoMap": info_map })).unwrap_or_else(|_| "{}".to_string())
 }
 
 pub fn eval_js_url(
@@ -628,7 +765,9 @@ const JS_PRELUDE: &str = r#"(function (g) {
         if (!inner) return [];
         return wrapElements(g.__rule_get(S(rule), inner, 'elements'));
       },
-      toString: function () { return S(s.outerHtml); }
+      toString: function () { return S(s.outerHtml); },
+      // 保留原始快照: JSoup 桥需要在元素间复制/合并时重建包装对象。
+      __snapshot: s
     };
   }
   function wrapElements(json) {
@@ -725,6 +864,115 @@ const JS_PRELUDE: &str = r#"(function (g) {
   }
   g.JavaImporter = JavaImporter;
 
+  // 发现页/登录面板动作：书山聚合的「🔍搜索」用 java.searchBook(...)、
+  // 「⚙登录」用 java.open('login','http',null)。这些副作用无法在 WebView 侧
+  // 产生，统一登记成意图由宿主回传前端执行（见 ExploreActionOutcome）。
+  J.open = function (type, kind, data) {
+    g.__explore_intent('open', JSON.stringify({ type: S(type), kind: S(kind), data: data == null ? null : data }));
+    return true;
+  };
+  J.searchBook = function (key, source) {
+    g.__explore_intent('search', JSON.stringify({ key: S(key), source: S(source) }));
+    return true;
+  };
+  // 书源常用的"打开书籍详情/阅读"入口（部分聚合源的发现页按钮会调用）。
+  J.openBook = function (url) {
+    g.__explore_intent('openBook', S(url));
+    return true;
+  };
+
+  // ── Rhino 的 `org.jsoup.*` 桥 ──
+  // 部分书源直接在规则里写 Java 风格的 JSoup 调用（故事族:
+  // `var doc = org.jsoup.Jsoup.parse(result); doc.select('a.flex-wrp');`），
+  // 社区版 legado 靠 Rhino 的 Java 互操作跑通。桌面端没有 JVM，这里用同一套
+  // 宿主选择器引擎(`__rule_get`)造出等价的 Elements/Element 对象。
+  //
+  // 只实现书源里真正会用到的子集: parse / select / text / ownText / html /
+  // outerHtml / attr / hasAttr / tagName / size / isEmpty / first / last / get /
+  // eachText / toString / absUrl / id / className / val。其余方法返回空值而不是
+  // 抛错 —— 让规则至少能跑出可用结果, 也不会因未知方法整条链路失败。
+  function jsoupElements(json) {
+    var list = wrapElements(json);
+    list.size = function () { return list.length; };
+    list.isEmpty = function () { return list.length === 0; };
+    list.first = function () { return list.length ? list[0] : null; };
+    list.last = function () { return list.length ? list[list.length - 1] : null; };
+    list.get = function (i) { return list[i] || null; };
+    list.text = function () { return list.map(function (el) { return el.text(); }).join(' ').trim(); };
+    list.eachText = function () { return list.map(function (el) { return el.text(); }); };
+    list.attr = function (name) { return list.length ? list[0].attr(name) : ''; };
+    list.html = function () { return list.length ? list[0].html() : ''; };
+    list.outerHtml = function () { return list.length ? list[0].outerHtml() : ''; };
+    list.select = function (rule) { return jsoupElementsFromElements(list, rule); };
+    list.toString = function () { return list.map(function (el) { return el.outerHtml(); }).join(''); };
+    // 关键: 规则以 `els` 结尾返回时, 宿主需要**元素快照数组**才能继续按
+    // name/author/bookUrl 等字段规则取值。没有 toJSON 时会被序列化成
+    // "[object Object],[object Object]" 而解析出 0 本(故事族即此症状)。
+    list.toJSON = function () {
+      return list.map(function (el) { return el.__snapshot; });
+    };
+    return list;
+  }
+
+  /** 对每个元素分别 select，合并结果（JSoup Elements.select 语义）。 */
+  function jsoupElementsFromElements(elements, rule) {
+    var out = [];
+    for (var i = 0; i < elements.length; i++) {
+      var sub = elements[i].select(rule);
+      for (var j = 0; j < sub.length; j++) out.push(sub[j]);
+    }
+    return jsoupElements(JSON.stringify(out.map(function (el) { return el.__snapshot; })));
+  }
+
+  /**
+   * 构造文档级的"可 select 根"。
+   *
+   * 真实 JSoup 的 `Document.select(rule)` 在整个文档上查一次。这里不能把
+   * 所有元素都塞进 Elements 再逐个 select —— `html` 与 `body` 都能选到同一批
+   * 后代，结果会成倍重复（书列表直接翻倍）。因此只保留**一个**根：以 `html`
+   * 元素的 outerHtml 为内容、对外表现为 Elements，`select` 在其内部查一次。
+   */
+  function jsoupDocument(html) {
+    var text = S(html);
+    var roots = wrapElements(g.__rule_get('html', text, 'elements'));
+    var rootHtml = roots.length ? roots[0].outerHtml() : text;
+    var list = wrapElements(g.__rule_get('html, html *', text, 'elements'));
+    // 文档根：select 以整份 HTML 为内容查一次, 覆盖 head/body 及其后代。
+    list.select = function (rule) { return jsoupElements(g.__rule_get(S(rule), rootHtml, 'elements')); };
+    list.title = function () {
+      var t = g.__rule_get('title', text, 'text');
+      return t === undefined || t === null ? '' : S(t);
+    };
+    return list;
+  }
+
+  var Jsoup = {
+    parse: function (html) {
+      // 真实 JSoup 的 `Document.select` 覆盖**整个文档**（含 head/title/meta）。
+      // 只取 `body, body *` 会让 `doc.select('title')` / `meta` 恒为空 ——
+      // 部分书源正是靠 meta 取书名或封面。
+      var doc = jsoupDocument(html);
+      // JSoup 的 Document 本身就是"可 select 的根"，并且能直接取 text()/html()。
+      doc.body = function () {
+        var b = jsoupElements(g.__rule_get('body', S(html), 'elements'));
+        return b.length ? b[0] : null;
+      };
+      doc.head = function () {
+        var h = jsoupElements(g.__rule_get('head', S(html), 'elements'));
+        return h.length ? h[0] : null;
+      };
+      doc.location = function () { return ''; };
+      doc.baseUri = function () { return ''; };
+      doc.charset = function (c) { return c === undefined ? 'UTF-8' : doc; };
+      doc.__html = S(html);
+      return doc;
+    },
+    parseBodyFragment: function (html) { return Jsoup.parse(html); },
+    clean: function (html) { return S(html); }
+  };
+
+  g.org = { jsoup: { Jsoup: Jsoup, Elements: function () { return jsoupElements('[]'); }, Element: function () { return null; }, Document: function () { return Jsoup.parse(''); } } };
+
   g.cache = {
     get: function (k) { return g.__store_get(S(k)); },
     put: function (k, v) { g.__store_put(S(k), S(v)); return v; },
@@ -772,7 +1020,10 @@ const JS_PRELUDE: &str = r#"(function (g) {
   };
   J.upLoginData = function (data) { g.__login_update(JSON.stringify(data == null ? null : data)); };
   J.reLoginView = function () { g.__login_refresh(); };
-  J.refreshExplore = J.reLoginView;
+  // legado: `java.refreshExplore()` 刷新发现页（只重算分类，不重跑登录）。
+  // 早先把它等同于 reLoginView 是错的：书山/七猫的「🔄刷新」按钮会因此弹出
+  // 登录面板，而不是刷新发现页。
+  J.refreshExplore = function (flag) { g.__explore_refresh(flag === undefined ? '' : S(flag)); return true; };
   src.put = function (k, v) { g.__store_put('sp:' + si.url + ':' + S(k), S(v)); return v; };
   src.get = function (k) { return g.__store_get('sp:' + si.url + ':' + S(k)) || ''; };
 
@@ -1000,6 +1251,12 @@ fn eval_js_inner_with_source(
             }
         }))?;
         globals.set("__login_refresh", Func::new(|| { LOGIN_EFFECTS.with(|cell| cell.borrow_mut().refresh = true); }))?;
+        globals.set("__explore_refresh", Func::new(|_flag: String| {
+            LOGIN_EFFECTS.with(|cell| cell.borrow_mut().explore_refresh = true);
+        }))?;
+        globals.set("__explore_intent", Func::new(|kind: String, payload: String| {
+            EXPLORE_INTENTS.with(|cell| cell.borrow_mut().push(format!("{kind}\u{1}{payload}")));
+        }))?;
         globals.set("__login_request", Func::new(|| { LOGIN_EFFECTS.with(|cell| cell.borrow_mut().login = true); }))?;
         globals.set("__last_response", Func::new(|| -> String {
             LAST_RESPONSE.with(|cell| cell.borrow().clone())
@@ -1429,6 +1686,36 @@ fn eval_js_inner_with_source(
                 }
                 let js_value = ctx.json_parse(value.to_string())?;
                 globals.set(key.as_str(), js_value)?;
+            }
+            // infoMap 走 `{"__infoMap": {...}}` 信封传入(见 info_map_binding),
+            // 这里解包成对象并补上 Map 风格方法: 书源里
+            // `infoMap['x']` 与 `infoMap.get('x')` 两种写法都有。
+            //
+            // 方法必须定义成**不可枚举**属性: 否则 `Object.keys(infoMap)` /
+            // `size()` 会把 get/put 这些函数也数成数据项, 书源若遍历 infoMap
+            // 就会拿到一堆函数值。
+            if let Some(raw) = bindings.get("infoMap").and_then(JsonValue::as_str) {
+                let unpacked = eval_script(
+                    ctx.clone(),
+                    &format!(
+                        "(function () {{\n\
+                         var env = {raw};\n\
+                         var m = env.__infoMap || {{}};\n\
+                         function def(name, fn) {{\n\
+                           Object.defineProperty(m, name, {{ value: fn, enumerable: false, writable: true, configurable: true }});\n\
+                         }}\n\
+                         def('get', function (k) {{ var v = m[k]; return v === undefined ? null : v; }});\n\
+                         def('put', function (k, v) {{ m[k] = v; return v; }});\n\
+                         def('containsKey', function (k) {{ return Object.prototype.hasOwnProperty.call(m, k); }});\n\
+                         def('size', function () {{ return Object.keys(m).length; }});\n\
+                         def('keySet', function () {{ return Object.keys(m); }});\n\
+                         def('isEmpty', function () {{ return Object.keys(m).length === 0; }});\n\
+                         def('toString', function () {{ return JSON.stringify(m); }});\n\
+                         return m;\n\
+                         }})()"
+                    ),
+                )?;
+                globals.set("infoMap", unpacked)?;
             }
         }
 

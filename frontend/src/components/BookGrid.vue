@@ -545,16 +545,17 @@ const ghostStyle = computed(() => {
 
 .book-grid-list {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 420px));
-  justify-content: start;
-  gap: var(--space-4);
-  padding: var(--space-4) 0;
+  /* 列宽自适应容器：窗口拉宽就多排一列，拉窄就少排一列，卡片本身不再被
+     拉伸到 420px 上限，也不会因为固定 minmax 而浪费右侧空白。 */
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  justify-content: stretch;
+  gap: var(--space-3);
+  padding: var(--space-1) 0;
 }
 
 .book-grid-item {
   min-width: 0;
   width: 100%;
-  max-width: 420px;
   height: 100%;
   transition:
     transform 820ms cubic-bezier(0.16, 0.84, 0.2, 1),
