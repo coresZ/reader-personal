@@ -41,6 +41,27 @@ impl SourceCookieJar {
         self.update(url, header, true)
     }
 
+    /// 按名字移除该 URL 生效的 cookie。
+    ///
+    /// 面板页用 `document.cookie = 'x=; expires=<过去时间>'` 删除 cookie(退出登录),
+    /// 这类写入必须把条目从 jar 去掉, 否则空值会被当成有效值发给上游。
+    pub fn remove(&self, url: &Url, name: &str) -> anyhow::Result<()> {
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = store.clone();
+        let keys = next.iter_any()
+            .filter(|cookie| cookie.domain.matches(url) && cookie.name() == name)
+            .filter_map(|cookie| Some((
+                cookie.domain.as_cow()?.into_owned(),
+                cookie.path.as_ref().to_string(),
+                cookie.name().to_string(),
+            )))
+            .collect::<Vec<_>>();
+        for (domain, path, name) in keys { next.remove(&domain, &path, &name); }
+        self.persist(&next)?;
+        *store = next;
+        Ok(())
+    }
+
     fn update(&self, url: &Url, header: &str, replace: bool) -> anyhow::Result<()> {
         HeaderValue::from_str(header).map_err(|_| anyhow::anyhow!("Cookie 格式无效"))?;
         let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());

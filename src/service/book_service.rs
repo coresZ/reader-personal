@@ -113,6 +113,52 @@ pub fn get_source_panel(panel_id: &str) -> Option<SourcePanelEntry> {
         .map(|(_, entry)| entry.clone())
 }
 
+/// 把面板页写入的 `document.cookie` 落到书源 cookie jar。
+///
+/// 面板页(如书山聚合的登录页)用 `document.cookie = 'user_token=…'` 记录会话,
+/// 而上游后续页面由**服务端**读 Cookie 判断登录态。只写浏览器的话这份 cookie
+/// 留在面板 origin 下, 转发请求带不上, 上游就把页面踢回登录页(用户看到
+/// 「登录过期」)。这里按面板当前的上游地址写入 jar, 让后续转发带上它。
+///
+/// 目标地址必须落在书源域内 —— 否则面板页脚本就能把会话写到任意域。
+pub(crate) fn set_panel_cookie(entry: &SourcePanelEntry, raw_url: &str, cookie: &str) -> Result<(), String> {
+    let head = cookie.split(';').next().unwrap_or("").trim();
+    let Some((name, value)) = head.split_once('=') else {
+        return Err("Cookie 格式无效".to_string());
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Cookie 格式无效".to_string());
+    }
+    // 控制字符在写入处就拒掉, 不依赖下层只做 header 值校验。
+    if name.chars().any(char::is_control) || value.chars().any(char::is_control) {
+        return Err("Cookie 含控制字符".to_string());
+    }
+    let http = entry.http.clone().map(Ok).unwrap_or_else(|| {
+        crate::parser::js::source_http_context(&entry.book_source_url)
+    }).map_err(|e| e.to_string())?;
+    // 以面板当前的上游地址为域写入; 页面可能在子路径下, 域名与端口仍取自它。
+    let target = if raw_url.is_empty() { entry.url.clone() } else { raw_url.to_string() };
+    let url = crate::api::protocol::resolve_panel_cookie_url(&target, &entry.url)
+        .map_err(|e| e.to_string())?;
+    if !crate::api::protocol::proxy_target_matches_source(url.as_str(), &entry.url) {
+        return Err("Cookie 目标地址不在书源域内".to_string());
+    }
+    // Cookie 不区分 scheme: 把 https 会话写进 http 目标会让后续明文请求带上它。
+    // 只在此处拦降级, 不改共享的域判定函数(那会影响既有代理行为)。
+    let source_is_https = crate::api::protocol::resolve_panel_cookie_url(&entry.url, &entry.url)
+        .map(|u| u.scheme() == "https").unwrap_or(false);
+    if source_is_https && url.scheme() == "http" {
+        return Err("不允许把 https 会话写入 http 目标".to_string());
+    }
+    // 空值代表页面删除了该 cookie(退出登录), 必须从 jar 移除, 否则空值会被当成
+    // 有效值发给上游。
+    if value.trim().is_empty() {
+        return http.session.cookies.remove(&url, name).map_err(|e| e.to_string());
+    }
+    http.session.cookies.set(&url, head).map_err(|e| e.to_string())
+}
+
 /// 处理面板内 `window.java` / `window.cache` / `window.run` 的同步桥请求。
 ///
 /// 与 legado `WebJsExtensions` 对齐: `ajax`/`get`/`post`/`connect` 走书源网络层,
@@ -160,6 +206,18 @@ pub async fn handle_source_panel_bridge(
                 Ok(json!(http.session.get(&key)))
             }
         }
+        // 面板页 JS 用 `document.cookie = 'k=v'` 记录登录态(书山聚合登录页写
+        // `user_token`), 而上游后续页面由**服务端**读 Cookie 判断登录, 只留在浏览器里
+        // 转发请求带不上, 上游会当作未登录并把页面踢回登录页(表现为「登录过期」)。
+        // 这里把它落到书源 jar, 随后的转发请求就能带上。
+        "cookieSet" => match set_panel_cookie(entry, &text_of("url"), &text_of("cookie")) {
+            Ok(()) => Ok(json!(true)),
+            Err(error) => {
+                // 域校验拒绝/格式错误等要留痕: 「登录过期」类问题的现场诊断依赖这条日志。
+                crate::parser::js::push_js_log(format!("[panel.cookieSet] {error}"));
+                Err(error)
+            }
+        },
         "cacheGet" => {
             let key = text_of("key");
             Ok(crate::parser::js::get_panel_cache(&entry.book_source_url, &key)

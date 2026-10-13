@@ -240,11 +240,18 @@ fn render_source_panel_page(panel_id: &str, entry: &crate::service::book_service
 fn render_source_panel_page_with_cookie(panel_id: &str, entry: &crate::service::book_service::SourcePanelEntry, page_url: &str, html: &str, jar_cookie: &str) -> String {
     let page_url = if page_url.starts_with("data:") { "" } else { page_url };
     let mut bridge = format!("<script>window.__readerPanelUrl={};window.__readerSourceKey={};</script>", script_string(page_url), script_string(&entry.book_source_url));
-    if !jar_cookie.trim().is_empty() {
+    let panel_url = script_string(page_url);
+    // 即使 jar 里还没有 cookie 也要注入: 劫持的 setter 负责把页面写入的
+    // document.cookie **回写书源 jar**。登录脚本用 `document.cookie = 'user_token=…'`
+    // 记录会话, 而上游后续页面(/user_center 等)由**服务端**读 Cookie 判断登录态 ——
+    // 只写浏览器的话这份 cookie 留在面板 origin(reader.localhost)下, 转发请求带不上,
+    // 上游就会当作未登录并把页面踢回登录页(书山聚合表现为「登录过期」)。
+    if page_url.starts_with("http://") || page_url.starts_with("https://") {
         bridge.push_str(&format!(
             r#"<script>
 (function () {{
   var jarCookie = {};
+  var pageUrl = {};
   var pairs = jarCookie.split(/;\s*/).filter(function (p) {{ return p.indexOf('=') > 0; }});
   var jar = {{}};
   pairs.forEach(function (p) {{
@@ -260,6 +267,19 @@ fn render_source_panel_page_with_cookie(panel_id: &str, entry: &crate::service::
     try {{ desc.set.call(document, p.trim() + '; path=/'); }} catch (e) {{}}
   }});
   var nativeGet = desc.get, nativeSet = desc.set;
+  // 页面写入的 cookie 回写书源 jar: 上游靠服务端读 Cookie 校验登录态, 只有落到
+  // jar 里才能随转发请求送达。异步桥不可用(setter 是同步属性), 因此等宿主桥
+  // 注入后用其中的同步桥提交; 桥尚未就绪时排队, 就绪后补发。
+  var pending = [];
+  function flush() {{
+    if (!window.__readerPanelBridgeReady || !pending.length) return;
+    var queued = pending; pending = [];
+    queued.forEach(function (pair) {{
+      try {{ window.__readerPanelCookieSet(pageUrl, pair); }} catch (e) {{}}
+    }});
+  }}
+  window.__readerPanelQueueCookie = function (pair) {{ pending.push(pair); flush(); }};
+  window.__readerPanelCookieFlush = flush;
   Object.defineProperty(document, 'cookie', {{
     configurable: true,
     get: function () {{
@@ -274,11 +294,42 @@ fn render_source_panel_page_with_cookie(panel_id: &str, entry: &crate::service::
       Object.keys(jar).forEach(function (k) {{ merged[k] = jar[k]; }});
       return Object.keys(merged).map(function (k) {{ return k + '=' + merged[k]; }}).join('; ');
     }},
-    set: function (value) {{ try {{ nativeSet.call(document, value); }} catch (e) {{}} }}
+    set: function (value) {{
+      try {{ nativeSet.call(document, value); }} catch (e) {{}}
+      // 只取 `名字=值` 部分, 属性(expires/path/domain)交给 jar 侧按域处理。
+      try {{
+        var raw = String(value);
+        var head = raw.split(';')[0].trim();
+        if (head && head.indexOf('=') > 0) {{
+          var name = head.slice(0, head.indexOf('=')).trim();
+          var val = head.slice(head.indexOf('=') + 1).trim();
+          // 页面用 `x=; expires=<过去时间>` 删除 cookie(书山聚合的 userLogout 即如此)。
+          // 空值/已过期应把条目从 jar 移除, 否则空值会被当成有效登录态回写上游。
+          // 注意只取 `expires=` 之后到下一个 `;` 之前的部分交给 Date.parse ——
+          // 整串(含其它属性)会解析成 NaN, 使过期判断永远不成立。
+          var expired = false;
+          var expires = /;\s*expires\s*=\s*([^;]+)/i.exec(raw);
+          if (expires) {{
+            var at = Date.parse(expires[1].trim());
+            expired = !isNaN(at) && at <= Date.now();
+          }}
+          if (expired || !val) {{
+            delete jar[name];
+            // 删除必须发**空值**(`name=`), 而不是原样发 `head`: 宿主侧按「值为空」
+            // 判定删除, 发非空值会被当成有效 cookie 写回 jar, 结果删不掉。
+            if (window.__readerPanelQueueCookie) window.__readerPanelQueueCookie(name + '=');
+            return;
+          }}
+          jar[name] = val;
+          if (window.__readerPanelQueueCookie) window.__readerPanelQueueCookie(head);
+        }}
+      }} catch (e) {{}}
+    }}
   }});
 }})();
 </script>"#,
-            script_string(jar_cookie)
+            script_string(jar_cookie),
+            panel_url
         ));
     }
     bridge.push_str(&build_source_panel_bridge_script(panel_id));
@@ -334,6 +385,14 @@ async fn fetch_source_panel_response(
     if !forwarded.contains_key(http::header::REFERER) {
         forwarded.insert(http::header::REFERER, http::HeaderValue::from_str(&entry.url)
             .map_err(|err| AppError::BadRequest(format!("网页来源地址无效: {err}")))?);
+    }
+    // WebView2 交给宿主的自定义协议请求可能不带 Content-Type, 也可能带一个与实际
+    // 请求体不符的头。后端(PHP 等)在缺该头、或头与体不匹配时都**完全不解析请求体**
+    // (`$_POST` 为空), 表现为「后端收不到任何字段」—— 书山聚合注册接口即回
+    // 「无效的操作」。因此以请求体的真实字节为准: 体是 multipart 就按体首行的
+    // boundary 声明, 否则仅在缺头时按 urlencoded 兜底。
+    if request.method() == http::Method::POST {
+        inherit_form_content_type(&mut forwarded, request.body());
     }
     let mut builder = client.request(request.method().clone(), target).headers(forwarded);
     if !request.body().is_empty() { builder = builder.body(request.body().clone()); }
@@ -787,10 +846,30 @@ fn resolve_proxy_target_url(
         .map_err(|e| AppError::BadRequest(format!("invalid proxy target url: {}", e)))
 }
 
+/// 面板页写入 cookie 时, 把目标地址解析成可写入 cookie jar 的绝对 URL。
+///
+/// 面板里的地址可能是相对的(上游页在子路径下), 也可能带 `__readerPanelUrl`
+/// 这类代理参数, 因此统一按代理目标地址的规则解析: 先尝试直接当作绝对 URL,
+/// 失败再以书源地址为基准拼接。
+pub(crate) fn resolve_panel_cookie_url(
+    raw_target_url: &str,
+    book_source_url: &str,
+) -> Result<Url, AppError> {
+    let repaired = repair_encoded_url(raw_target_url);
+    if let Ok(url) = Url::parse(&repaired) {
+        return Ok(url);
+    }
+    let base = normalize_source_url(book_source_url);
+    let base = Url::parse(&base)
+        .map_err(|e| AppError::BadRequest(format!("invalid bookSourceUrl: {}", e)))?;
+    base.join(&repaired)
+        .map_err(|e| AppError::BadRequest(format!("invalid cookie target url: {}", e)))
+}
+
 /// Login pages are rendered through the local URI scheme. Restrict every
 /// proxied target to the source's host family so a valid login session cannot
 /// be reused as a cross-domain request or SSRF primitive.
-fn proxy_target_matches_source(target_url: &str, source_url: &str) -> bool {
+pub(crate) fn proxy_target_matches_source(target_url: &str, source_url: &str) -> bool {
     let Ok(target) = Url::parse(target_url) else {
         return false;
     };
@@ -1093,6 +1172,62 @@ fn merge_proxy_headers(
     Ok(merged)
 }
 
+/// 按请求体的真实形态校正表单 `Content-Type`。
+///
+/// WebView2 把自定义协议请求交给宿主时可能不提供 `Content-Type`, 也可能给一个与
+/// 实际请求体不符的头。而后端(PHP 等)在缺该头、或头与体不匹配时都**完全不解析
+/// 请求体**: `$_POST` 为空, 表现为「后端收不到任何字段」(书山聚合注册接口即回
+/// 「无效的操作」)。此时也不能一律按 urlencoded 兜底 —— multipart 体被错标后同样
+/// 解析不出字段, 症状不变。因此以体为准:
+/// - 体的首行是 `--boundary` -> 声明为该 boundary 的 multipart 体;
+///   若已有头描述的就是这份体(boundary 一致), 原样保留浏览器给的头。
+/// - 否则仅在缺头时按 urlencoded 兜底, 不覆盖已有的非 multipart 头。
+fn inherit_form_content_type(headers: &mut http::HeaderMap, body: &[u8]) {
+    let declared = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if let Some(boundary) = multipart_boundary(body) {
+        let describes_body = declared.to_ascii_lowercase().starts_with("multipart/form-data")
+            && declared.contains(&boundary);
+        if describes_body {
+            return;
+        }
+        if let Ok(value) =
+            http::HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))
+        {
+            headers.insert(http::header::CONTENT_TYPE, value);
+        }
+        return;
+    }
+    if headers.contains_key(http::header::CONTENT_TYPE) {
+        return;
+    }
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/x-www-form-urlencoded; charset=UTF-8"),
+    );
+}
+
+/// 取 multipart 体的首行 boundary(不含前导 `--`)。非 multipart 返回 `None`。
+fn multipart_boundary(body: &[u8]) -> Option<String> {
+    let rest = body.strip_prefix(b"--")?;
+    let end = rest.iter().position(|&b| b == b'\r' || b == b'\n')?;
+    let boundary = &rest[..end];
+    // RFC 2046: boundary 为 1..=70 个 bchars, 不含空白与控制字符。
+    if boundary.is_empty() || boundary.len() > 70 || !boundary.is_ascii() {
+        return None;
+    }
+    if boundary
+        .iter()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return None;
+    }
+    String::from_utf8(boundary.to_vec()).ok()
+}
+
 fn should_forward_request_header(name: &str) -> bool {
     !matches!(
         name.to_ascii_lowercase().as_str(),
@@ -1138,7 +1273,7 @@ fn is_html_response(content_type: Option<&str>, body: &[u8]) -> bool {
 /// 是异步的, 因此这里把 bridge 请求发到同源的 `/sourcePanelBridge`, 用同步
 /// `XMLHttpRequest` 取回结果 —— 与 legado 的同步 Java 桥语义一致。
 fn build_source_panel_bridge_script(panel_id: &str) -> String {
-    let panel_id_json = serde_json::to_string(panel_id).unwrap_or_else(|_| "\"\"".to_string());
+    let panel_id_json = script_string(panel_id);
     format!(
         r#"<script>
 (function () {{
@@ -1172,6 +1307,17 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
       return {{ ok: false, error: "bridge bad response" }};
     }}
   }}
+
+  // 面板页 JS 用 `document.cookie = 'k=v'` 记录登录态(书山聚合登录页写
+  // `user_token`), 而上游后续页面由**服务端**读 Cookie 判断登录, 只留在浏览器里
+  // 转发请求带不上, 上游会当作未登录并踢回登录页。这里把页面写入的 cookie 经
+  // 同步桥落到书源 jar。注入顺序上 cookie 劫持脚本在本脚本之前, 它会把待发送的
+  // 条目排队, 由这里的 ready 标志触发补发。
+  window.__readerPanelCookieSet = function (url, pair) {{
+    bridgeSync("cookieSet", {{ url: String(url || pageUrl), cookie: String(pair) }});
+  }};
+  window.__readerPanelBridgeReady = true;
+  if (window.__readerPanelCookieFlush) {{ try {{ window.__readerPanelCookieFlush(); }} catch (e) {{}} }}
 
   // 通知宿主(父窗口): 面板要关闭 / 要换成另一个面板。
   // 面板 origin 为 reader.localhost, 父应用为 tauri.localhost, 用 postMessage 跨源通信。
@@ -1395,7 +1541,15 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
       // Preserve multipart boundaries and binary bodies through the raw proxy;
       // relative form submissions must resolve against the upstream page.
       var sameOrigin = pageUrl && url.origin === new URL(pageUrl).origin;
-      return nativeFetch(sameOrigin ? new Request(proxyUrl(url), request) : request);
+      if (!sameOrigin) return nativeFetch(request);
+      if (init && init.body != null) {{
+        // 用原始 BodyInit 重建, 而不是把已构造的 Request 再包一层: 后者会让请求体
+        // 变成 ReadableStream, 经自定义协议发送时可能送不出体(后端于是收不到任何
+        // 表单字段, 书山聚合注册接口回「无效的操作」)。原始 FormData/Blob 重建则由
+        // 浏览器在发送时按真实字节生成 Content-Type 与 boundary。
+        return nativeFetch(new Request(proxyUrl(url), init));
+      }}
+      return nativeFetch(new Request(proxyUrl(url), request));
     }}
     var headers = {{}};
     request.headers.forEach(function (value, name) {{ headers[name] = value; }});
@@ -1715,17 +1869,45 @@ fn extract_registrable_domain(source_url: &str) -> String {
     registrable_domain_from_host(host)
 }
 
+/// 从主机名取可注册域(registrable domain), 用于判断两个主机是否属同一站点。
+///
+/// 注意这是**近似实现**: 只覆盖常见的多标签公共后缀, 不读取完整的 Public
+/// Suffix List(`publicsuffix` crate 是动态列表, 需要额外的数据源, 与这里
+/// 「不引入运行时下载依赖」的前提冲突)。表外的多标签后缀会被当成普通域名,
+/// 例如 `www.abc.co.nz` 与 `evil.co.nz` 都会被折叠成 `co.nz` 而**误判为同站** ——
+/// 因此调用方不得把「同站」当作安全边界, 见 `set_panel_cookie` 的说明。
 fn registrable_domain_from_host(host: &str) -> String {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let parts: Vec<&str> = host.split('.').filter(|part| !part.is_empty()).collect();
     if parts.len() < 2 {
         return host;
     }
-    // Cover the common multi-label public suffixes without adding a runtime
-    // dependency on a downloaded public suffix list.
+    // 常见多标签公共后缀。表越长越准, 但**永远不可能完备**, 这是本函数近似的根源。
     const TWO_LABEL_SUFFIXES: &[&str] = &[
-        "co.uk", "org.uk", "com.cn", "net.cn", "org.cn", "com.au", "net.au",
-        "co.jp", "co.kr", "com.br", "com.hk", "com.tw", "co.in",
+        "co.uk", "org.uk", "me.uk", "ac.uk", "gov.uk", "net.uk", "sch.uk",
+        "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+        "com.au", "net.au", "org.au", "edu.au", "gov.au",
+        "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
+        "co.kr", "or.kr", "ne.kr", "go.kr", "re.kr",
+        "com.br", "net.br", "org.br", "gov.br",
+        "com.hk", "org.hk", "net.hk", "edu.hk", "gov.hk",
+        "com.tw", "org.tw", "net.tw", "edu.tw", "gov.tw",
+        "co.in", "net.in", "org.in", "gen.in", "firm.in",
+        "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
+        "com.sg", "net.sg", "org.sg", "edu.sg", "gov.sg",
+        "com.my", "net.my", "org.my", "edu.my", "gov.my",
+        "co.id", "or.id", "ac.id", "go.id", "web.id",
+        "co.th", "or.th", "ac.th", "go.th", "in.th",
+        "co.za", "net.za", "org.za", "gov.za", "ac.za",
+        "com.ar", "net.ar", "org.ar", "gov.ar", "edu.ar",
+        "com.mx", "net.mx", "org.mx", "gob.mx", "edu.mx",
+        "com.tr", "net.tr", "org.tr", "gov.tr", "edu.tr",
+        "co.il", "org.il", "net.il", "ac.il", "gov.il",
+        "com.ua", "net.ua", "org.ua", "gov.ua", "edu.ua",
+        "com.vn", "net.vn", "org.vn", "gov.vn", "edu.vn",
+        "co.jp", "com.ph", "com.pk", "com.eg", "com.sa",
+        "com.co", "com.pe", "com.ve", "com.uy", "com.ec",
+        "co.ke", "co.tz", "co.ug", "co.zw", "co.bw",
     ];
     let suffix = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
     if parts.len() >= 3 && TWO_LABEL_SUFFIXES.contains(&suffix.as_str()) {
@@ -1801,6 +1983,207 @@ mod tests {
         let response = fetch_source_panel_response(&source, "registration", &entry, &entry.url, &request).await.unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(response.body(), br#"{"code":200}"#);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panel_form_post_infers_missing_content_type() {
+        // 书山聚合注册页用 FormData 提交(send_code), WebView2 交给宿主的自定义
+        // 协议请求可能不带 Content-Type。后端(PHP)缺该头时完全不解析请求体,
+        // 表现为注册接口回「无效的操作」。这里断言转发时按体的真实形态补齐,
+        // 且 multipart 的 boundary 取自体本身(不能一律按 urlencoded 兜底, 那会
+        // 把 multipart 体错标, 照样解析不出字段)。
+        use axum::{body::Bytes, http::HeaderMap, routing::post, Router};
+        use crate::crawler::http_client::HttpClient;
+        use crate::service::book_service::SourcePanelEntry;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let app = Router::new().route("/register_api", post(move |headers: HeaderMap, body: Bytes| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(format!(
+                    "{}|{}",
+                    headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("<none>"),
+                    String::from_utf8_lossy(&body)
+                ));
+                ([("content-type", "application/json")], r#"{"success":false}"#)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let source = BookSource { book_source_url: base.clone(), ..Default::default() };
+        let http = HttpClient::new(3, None).unwrap();
+        let context = http.source_context("panel-ct", &source.book_source_url, None).unwrap();
+        let entry = SourcePanelEntry {
+            url: format!("{base}/register_api"),
+            book_source_url: source.book_source_url.clone(),
+            http: Some(context.clone()),
+            ..Default::default()
+        };
+        let target = format!("{base}/register_api");
+
+        // 1. multipart 体, 无 Content-Type -> 必须推断出体的 boundary
+        let multipart = b"--fixture\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\nsend_code\r\n--fixture--\r\n".to_vec();
+        let request = http::Request::builder().method("POST").body(multipart).unwrap();
+        let response = fetch_source_panel_response(&source, "ct", &entry, &target, &request).await.unwrap();
+        assert_eq!(response.status(), 200);
+
+        // 2. urlencoded 体, 无 Content-Type -> 兜底为 urlencoded
+        let urlencoded = b"action=send_code&email=reader%40example.test".to_vec();
+        let request = http::Request::builder().method("POST").body(urlencoded).unwrap();
+        fetch_source_panel_response(&source, "ct", &entry, &target, &request).await.unwrap();
+
+        // 3. 显式给定且与体一致(同 boundary)的 Content-Type 原样保留
+        let request = http::Request::builder().method("POST")
+            .header("content-type", "multipart/form-data; boundary=explicit")
+            .body(b"--explicit\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\nsend_code\r\n--explicit--\r\n".to_vec())
+            .unwrap();
+        fetch_source_panel_response(&source, "ct", &entry, &target, &request).await.unwrap();
+
+        // 4. 头与体不符(multipart 体却声明 urlencoded) -> 必须按体重写,
+        //    否则后端照样解析不出字段(实测即「无效的操作」)
+        let request = http::Request::builder().method("POST")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(b"--mismatch\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\nsend_code\r\n--mismatch--\r\n".to_vec())
+            .unwrap();
+        fetch_source_panel_response(&source, "ct", &entry, &target, &request).await.unwrap();
+
+        // 5. 非 multipart 体带显式头 -> 不覆盖调用方给的头
+        let request = http::Request::builder().method("POST")
+            .header("content-type", "application/json")
+            .body(br#"{"action":"send_code"}"#.to_vec())
+            .unwrap();
+        fetch_source_panel_response(&source, "ct", &entry, &target, &request).await.unwrap();
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 5);
+        assert!(recorded[0].starts_with("multipart/form-data; boundary=fixture|"), "缺头时必须从体推断 boundary: {}", recorded[0]);
+        assert!(recorded[0].contains("action"), "体必须完整转发: {}", recorded[0]);
+        assert!(recorded[1].starts_with("application/x-www-form-urlencoded"), "非 multipart 体按 urlencoded 兜底: {}", recorded[1]);
+        assert!(recorded[2].starts_with("multipart/form-data; boundary=explicit|"), "与体一致的头不得被改写: {}", recorded[2]);
+        assert!(recorded[3].starts_with("multipart/form-data; boundary=mismatch|"), "头与体不符时必须按体重写: {}", recorded[3]);
+        assert!(recorded[4].starts_with("application/json|"), "非 multipart 体的显式头不得被覆盖: {}", recorded[4]);
+        server.abort();
+    }
+
+    #[test]
+    fn multipart_boundary_is_taken_from_body() {
+        // 体的首行即 `--boundary`; 非 multipart 体不得被误判。
+        assert_eq!(
+            multipart_boundary(b"--fixture\r\nContent-Disposition: form-data\r\n").as_deref(),
+            Some("fixture")
+        );
+        assert_eq!(
+            multipart_boundary(b"--WebKitFormBoundaryABC123\n").as_deref(),
+            Some("WebKitFormBoundaryABC123")
+        );
+        assert_eq!(multipart_boundary(b"action=send_code&email=x"), None);
+        assert_eq!(multipart_boundary(b""), None);
+        // 只有 `--` 没有内容 / 含空白与控制字符 -> 不是合法 boundary
+        assert_eq!(multipart_boundary(b"--\r\n"), None);
+        assert_eq!(multipart_boundary(b"--bad boundary\r\n"), None);
+        assert_eq!(multipart_boundary(b"--bad\tboundary\r\n"), None);
+        // 超长(>70)不是合法 boundary
+        let long = format!("--{}\r\n", "a".repeat(71));
+        assert_eq!(multipart_boundary(long.as_bytes()), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panel_cookie_writes_reach_source_jar() {
+        // 书山聚合登录页用 `document.cookie = 'user_token=…'` 记录会话, 而 /user_center
+        // 由**服务端**读 Cookie 判断登录态。只写浏览器的话这份 cookie 留在面板
+        // origin(reader.localhost)下, 转发请求带不上, 上游就把页面踢回登录页
+        // (用户看到「登录过期」)。这里断言: 面板页写入的 cookie 能落到书源 jar,
+        // 从而让后续转发请求带上它。
+        use axum::{http::HeaderMap, routing::get, Router};
+        use crate::crawler::http_client::HttpClient;
+        use crate::service::book_service::SourcePanelEntry;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = seen.clone();
+        let app = Router::new().route("/user_login", get(move |headers: HeaderMap| async move {
+            *sink.lock().unwrap() = headers.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            ([("content-type", "text/html")], "<html><head></head><body>登录</body></html>")
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = BookSource { book_source_url: base.clone(), ..Default::default() };
+        let http = HttpClient::new(3, None).unwrap();
+        let context = http.source_context("panel-cookie-write", &source.book_source_url, None).unwrap();
+        let entry = SourcePanelEntry {
+            url: format!("{base}/user_login"),
+            book_source_url: source.book_source_url.clone(),
+            http: Some(context.clone()),
+            ..Default::default()
+        };
+        // 桥按 panelId 从全局注册表取面板, 因此必须登记。
+        let panel_id = crate::service::book_service::register_source_panel(entry.clone());
+
+        // jar 为空时也必须注入劫持脚本 —— 登录前 jar 正是空的, 而回写方向与
+        // jar 是否为空无关; 少了这一步页面写入的 cookie 就永远进不了 jar。
+        let response = fetch_source_panel_response(&source, &panel_id, &entry, &entry.url, &http::Request::new(Vec::new())).await.unwrap();
+        let html = String::from_utf8(response.into_body()).unwrap();
+        assert!(html.contains("Object.defineProperty(document, 'cookie'"), "jar 为空时也要注入劫持脚本");
+        assert!(html.contains("__readerPanelQueueCookie"), "setter 必须把写入排队回传: {}", html.chars().take(300).collect::<String>());
+        assert!(html.contains("__readerPanelBridgeReady"), "桥应置就绪标志以触发补发");
+        assert!(html.contains("__readerPanelCookieFlush"), "桥应触发排队项的补发");
+
+        // 首次请求 jar 里没有 cookie
+        assert!(!seen.lock().unwrap().contains("user_token"), "首次请求不应带 cookie");
+
+        // 走真实的桥动作提交 cookie(面板页写入 document.cookie 后桥走同步 XHR)。
+        // 这里直接调用 cookieSet 的实现函数 —— 该分支不使用 book_source_service,
+        // 因此可以只验证 cookie 落 jar 与越域拦截这两条逻辑。
+        let bridge_set = |url: &str, cookie: &str| {
+            crate::service::book_service::set_panel_cookie(&entry, url, cookie)
+        };
+        bridge_set(&entry.url, "user_token=token-abc123").expect("cookieSet 应成功写入 jar");
+
+        // 再次请求: 转发必须带上刚才写入的 cookie
+        fetch_source_panel_response(&source, &panel_id, &entry, &entry.url, &http::Request::new(Vec::new())).await.unwrap();
+        assert!(seen.lock().unwrap().contains("user_token=token-abc123"), "写入 jar 的 cookie 应随转发请求送达: {}", seen.lock().unwrap());
+
+        // 越域的 cookie 目标必须被拒绝(不能把会话写到书源域之外)
+        assert!(bridge_set("https://evil.example.com/", "user_token=leak").is_err(), "跨域 cookie 目标必须被拒绝");
+        assert!(!context.session.cookies.get(&url::Url::parse("https://evil.example.com/").unwrap()).contains("user_token"), "不得写入书源域之外的 jar");
+
+        // 非法 cookie 串(无 `=`)不得写入
+        assert!(bridge_set(&entry.url, "not-a-cookie").is_err(), "非法 cookie 应被拒绝");
+
+        // 含控制字符的 cookie 不得写入(header 注入边界收紧在写入处)
+        assert!(bridge_set(&entry.url, "evil=va\r\nlue").is_err(), "含 CRLF 的 cookie 应被拒绝");
+        assert!(bridge_set(&entry.url, "ev\ril=value").is_err(), "名字含控制字符应被拒绝");
+
+        // https 源不得把会话写进 http 目标(cookie 不区分 scheme, 明文请求会带上它)。
+        // 注意本测试的 entry 是 http(本地 axum), 因此这里用 https 源单独验。
+        let https_source = BookSource { book_source_url: "https://secure.example.test".to_string(), ..Default::default() };
+        let https_http = HttpClient::new(3, None).unwrap();
+        let https_context = https_http.source_context("panel-https", &https_source.book_source_url, None).unwrap();
+        let https_entry = SourcePanelEntry {
+            url: "https://secure.example.test/login".to_string(),
+            book_source_url: https_source.book_source_url.clone(),
+            http: Some(https_context.clone()),
+            ..Default::default()
+        };
+        assert!(
+            crate::service::book_service::set_panel_cookie(&https_entry, "http://secure.example.test/login", "user_token=x").is_err(),
+            "https 源写入 http 目标必须被拒绝"
+        );
+        assert!(
+            crate::service::book_service::set_panel_cookie(&https_entry, "https://secure.example.test/login", "user_token=x").is_ok(),
+            "https 源写入 https 目标应放行"
+        );
+
+        // 空值代表页面删除 cookie(退出登录, 书山聚合的 userLogout 即写 `user_token=;`
+        // 配合过去时间)。必须从 jar 移除, 而不是留下空值发给上游。
+        bridge_set(&entry.url, "user_token=").expect("删除应成功");
+        fetch_source_panel_response(&source, &panel_id, &entry, &entry.url, &http::Request::new(Vec::new())).await.unwrap();
+        assert!(!seen.lock().unwrap().contains("user_token"), "删除后的 cookie 不应再被转发: {}", seen.lock().unwrap());
+
         server.abort();
     }
 
@@ -1916,6 +2299,32 @@ mod tests {
         assert_eq!(extract_registrable_domain("http://localhost:8080"), "localhost");
         // 无法解析 → 空串
         assert_eq!(extract_registrable_domain("not a url"), "");
+    }
+
+    #[test]
+    fn registrable_domain_covers_common_multi_label_suffixes() {
+        // 多标签公共后缀必须整体保留, 否则不同注册域会被误判为同站
+        // (cookie 写入授权复用了这个判定, 误判即等于放开跨域写入)。
+        for (host, expected) in [
+            ("www.abc.co.nz", "abc.co.nz"),
+            ("evil.co.nz", "evil.co.nz"),
+            ("www.shop.com.sg", "shop.com.sg"),
+            ("a.b.com.my", "b.com.my"),
+            ("www.abc.gov.cn", "abc.gov.cn"),
+            ("x.ac.uk", "x.ac.uk"),
+            ("www.example.co.uk", "example.co.uk"),
+            ("www.example.com.cn", "example.com.cn"),
+            // 表外的普通域名仍折叠到末两段(近似行为, 已知不完备)
+            ("a.b.example.com", "example.com"),
+        ] {
+            assert_eq!(registrable_domain_from_host(host), expected, "host={host}");
+        }
+        // co.nz 已在表内: 两个不同的注册域必须被区分开, 否则跨域 cookie 写入会被放行。
+        assert_ne!(
+            registrable_domain_from_host("www.abc.co.nz"),
+            registrable_domain_from_host("evil.co.nz"),
+            "不同注册域不得折叠成同一个值(否则跨域写入会被放行)"
+        );
     }
 
     #[test]
