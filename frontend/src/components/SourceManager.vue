@@ -97,6 +97,8 @@
       v-model:remote-url="remoteUrl"
       :visible="subscriptionPanelVisible"
       :subscriptions="subscriptions"
+      :syncing="Boolean(syncingSubscriptionUrl)"
+      :syncing-url="syncingSubscriptionUrl"
       @sync="importRemoteSource"
       @save="saveSubscription"
       @sync-subscription="syncSubscription"
@@ -192,6 +194,8 @@ const selectedSourceUrls = ref(new Set<string>())
 const subscriptionPanelVisible = ref(false)
 const remoteUrl = ref('')
 const subscriptions = ref<SourceSubscription[]>(loadSubscriptions())
+/** 正在同步的订阅链接(空串表示没有进行中的同步); 表单同步与列表同步共用。 */
+const syncingSubscriptionUrl = ref('')
 
 const editingSource = ref<BookSource | null>(null)
 const editorText = ref(JSON.stringify(createEmptySource(), null, 2))
@@ -731,8 +735,12 @@ async function importRemoteSource() {
     appStore.showToast('请输入远程书源链接', 'warning')
     return
   }
+  // 同步期间锁定入口: 转圈只是反馈, 还得防住重复点击造成的并发拉取与重复入库。
+  if (syncingSubscriptionUrl.value) return
+  const targetUrl = remoteUrl.value
+  syncingSubscriptionUrl.value = targetUrl
   try {
-    const raw = await readRemoteSourceFile(remoteUrl.value)
+    const raw = await readRemoteSourceFile(targetUrl)
     const parsed = raw.flatMap((item) => {
       try {
         const value = JSON.parse(item)
@@ -745,11 +753,13 @@ async function importRemoteSource() {
       throw new Error('远程书源文件为空或格式错误')
     }
     await saveBookSources(parsed)
-    touchSubscription(remoteUrl.value)
+    touchSubscription(targetUrl)
     appStore.showToast(`成功同步 ${parsed.length} 个书源`, 'success')
     await loadSources()
   } catch (e: unknown) {
     appStore.showToast((e as Error).message || '远程同步失败', 'error')
+  } finally {
+    syncingSubscriptionUrl.value = ''
   }
 }
 

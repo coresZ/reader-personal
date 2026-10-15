@@ -21,7 +21,10 @@
             placeholder="输入远程书源合集链接"
             @input="$emit('update:remoteUrl', ($event.target as HTMLInputElement).value)"
           />
-          <button class="action-btn primary" type="button" @click="$emit('sync')">立即同步</button>
+          <button class="action-btn primary" type="button" :disabled="syncing" @click="$emit('sync')">
+            <span v-if="syncing" class="spinner" aria-hidden="true"></span>
+            {{ syncing ? '同步中…' : '立即同步' }}
+          </button>
           <button class="action-btn" type="button" @click="$emit('save')">保存订阅</button>
         </div>
 
@@ -32,8 +35,16 @@
               <span v-if="item.lastSyncedAt" class="subscription-time">上次同步 {{ formatTime(item.lastSyncedAt) }}</span>
             </div>
             <div class="subscription-actions">
-              <button class="mini-btn" type="button" @click="$emit('sync-subscription', item.url)">同步</button>
-              <button class="mini-btn danger" type="button" @click="$emit('remove-subscription', item.url)">删除</button>
+              <button
+                class="mini-btn"
+                type="button"
+                :disabled="syncing"
+                @click="$emit('sync-subscription', item.url)"
+              >
+                <span v-if="syncingUrl === item.url" class="spinner" aria-hidden="true"></span>
+                {{ syncingUrl === item.url ? '同步中' : '同步' }}
+              </button>
+              <button class="mini-btn danger" type="button" :disabled="syncing" @click="$emit('remove-subscription', item.url)">删除</button>
             </div>
           </article>
         </div>
@@ -53,6 +64,10 @@ defineProps<{
   visible: boolean
   remoteUrl: string
   subscriptions: SourceSubscription[]
+  /** 有任意同步在进行中(表单同步或某条订阅)。 */
+  syncing?: boolean
+  /** 正在同步的订阅链接, 用于只在那一条上转圈。 */
+  syncingUrl?: string
 }>()
 
 defineEmits<{
@@ -181,6 +196,10 @@ function formatTime(ts: number) {
 
 .action-btn {
   min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   padding: 0 12px;
   font-size: 13px;
   white-space: nowrap;
@@ -194,6 +213,10 @@ function formatTime(ts: number) {
 
 .mini-btn {
   min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
   padding: 0 10px;
   font-size: 12px;
 }
@@ -201,6 +224,28 @@ function formatTime(ts: number) {
 .mini-btn.danger {
   color: var(--color-danger);
   border-color: rgba(245, 34, 45, 0.2);
+}
+
+/* 同步中的转圈: 与 .spinning 图标同一手法(旋转 animation), 尺寸随按钮字号走。 */
+.spinner {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.action-btn:disabled,
+.mini-btn:disabled,
+.icon-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .icon-btn {
@@ -216,14 +261,16 @@ function formatTime(ts: number) {
   height: 16px;
 }
 
-.action-btn:hover:not(.primary),
-.mini-btn:hover,
-.icon-btn:hover {
+/* :not(:disabled) 让同步中的按钮不再有 hover 反馈; 逐条标注而非事后覆盖,
+ * 避免主按钮的淡橙底被同特异性的兜底规则抹掉。 */
+.action-btn:hover:not(.primary):not(:disabled),
+.mini-btn:hover:not(:disabled),
+.icon-btn:hover:not(:disabled) {
   background: var(--color-bg-hover);
 }
 
 /* 同 SourceManagerHeader: 不给主按钮单独兜底, 它的淡橙底会被上面那条抹掉。 */
-.action-btn.primary:hover {
+.action-btn.primary:hover:not(:disabled) {
   background: var(--color-primary-soft-bg-hover);
   border-color: var(--color-primary);
 }
