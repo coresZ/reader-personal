@@ -2381,10 +2381,15 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   /* ─── Replace Rules ─── */
-  async function fetchReplaceRules() {
+  /** 拉取替换规则。返回是否成功 —— 失败时调用方需要知道"本地状态不可信",
+   *  例如开关失败后要靠这次拉取恢复真实值, 静默吞错会让 UI 停在错误状态。 */
+  async function fetchReplaceRules(): Promise<boolean> {
     try {
       replaceRules.value = await getReplaceRules()
-    } catch { /* ignore */ }
+      return true
+    } catch {
+      return false
+    }
   }
 
   /* ─── Bookmarks ─── */
