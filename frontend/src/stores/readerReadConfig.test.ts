@@ -159,4 +159,16 @@ describe('per-book replace rules', () => {
     reader.book = { name: '另一本书', author: '作者', origin: 'fixture', bookUrl: 'fixture:other' }
     expect(reader.displayContent).toBe('正文汉字')
   })
+
+  it('preloads nearby chapters by default when no config has been saved', () => {
+    const reader = useReaderStore()
+    expect(reader.config.enablePreload).toBe(true)
+  })
+
+  it('still honours an explicitly saved preload switch', () => {
+    localStorage.setItem('readConfig', JSON.stringify({ enablePreload: false }))
+    const reader = useReaderStore()
+    // 默认值只影响没有存档的用户; 用户自己关过就必须保持关闭。
+    expect(reader.config.enablePreload).toBe(false)
+  })
 })

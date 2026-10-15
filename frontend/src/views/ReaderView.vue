@@ -1280,6 +1280,7 @@ function pageBackward() {
   if (container.scrollTop <= 10) {
     prevChapter()
     return
+  preloadContinuousAhead,
   }
   scrollPageBy(container, -step)
 }
@@ -2476,7 +2477,13 @@ function handleScroll() {
       if (previousAutoLoadArmed.value && container.scrollTop <= 12) {
         loadContinuousPrev()
       }
-      if (container.scrollHeight - (container.scrollTop + container.clientHeight) < 480) {
+      const continuousRemaining = container.scrollHeight - (container.scrollTop + container.clientHeight)
+      // 提前两屏就把下一章拉进缓存: 只按"距底不足 480px"触发时, 用户往往已经
+      // 滚到列表末尾, 那时再取正文就只能显示「正在加载下一章…」。
+      if (config.value.enablePreload && continuousRemaining < container.clientHeight * 2) {
+        preloadContinuousAhead()
+      }
+      if (continuousRemaining < 480) {
         loadContinuousNext()
       }
     }
@@ -3401,6 +3408,12 @@ watch(() => store.legadoPositionRestore, (restore) => {
       legadoPositionRestoreTimer = null
     }
     return
+  // 连续阅读(含隐藏已读)此前完全没接入预加载: 取正文走 buildContinuousChapter,
+  // 既不触发上面的分支, 也不经过 loadChapter, 「预加载」开关在这里等于无效。
+  // 按列表尾部预载下游, 让下一章在滚到之前就已经躺在缓存里。
+  if (isContinuousMode.value && config.value.enablePreload) {
+    preloadContinuousAhead()
+  }
   }
   pendingLegadoPageRestore.value = {
     index: restore.index,

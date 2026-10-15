@@ -71,6 +71,11 @@ describe('reader local txt chapters', () => {
     vi.mocked(saveBookProgress).mockResolvedValue('ok')
     vi.mocked(syncLegadoBookProgress).mockReset()
     vi.mocked(uploadLegadoBookProgress).mockReset()
+    // 加载动画的延迟兜底走 window.setTimeout(与 store 里其它定时器一致)
+    vi.stubGlobal('window', {
+      setTimeout: (handler: () => void, ms?: number) => setTimeout(handler, ms),
+      clearTimeout: (id: number) => clearTimeout(id),
+    })
   })
 
   it('fetches uploaded local txt content from backend when offline', async () => {
@@ -246,6 +251,206 @@ describe('reader local txt chapters', () => {
     const content = await readerStore.fetchChapterContent(0, false, true)
     expect(content).toBe('chapter-0-正文')
     expect(readerStore.loadStage).toBe('')
+  })
+
+  it('keeps the next chapter cached while reading forward', async () => {
+    const appStore = useAppStore()
+    const readerStore = useReaderStore()
+    appStore.setOnlineStatus(true)
+    readerStore.updateConfig('enablePreload', true)
+    readerStore.book = {
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'test-source',
+      bookUrl: 'https://example.test/evict',
+    }
+    readerStore.chapters = Array.from({ length: 12 }, (_, index) => ({
+      title: `第${index + 1}章`,
+      url: `chapter-${index}`,
+      index,
+    }))
+    vi.mocked(getBookContent).mockImplementation(async ({ chapterUrl }) => `${chapterUrl}-正文`)
+
+    const fetchCount = (index: number) => vi.mocked(getBookContent).mock.calls
+      .filter(([params]) => params.chapterUrl === `chapter-${index}`).length
+
+    await readerStore.loadChapter(0)
+    // 一路往下读 10 章。旧实现容量只有 3 且淘汰按插入序, 下一章经常在翻页那一刻
+    // 正好被挤掉, 于是每次翻章都要重新请求 —— 用户看到的就是加载动画。
+    for (let index = 1; index <= 10; index += 1) {
+      await readerStore.loadChapter(index)
+      expect(readerStore.content).toBe(`chapter-${index}-正文`)
+      // 每章只应真正请求一次: 此后都由预载缓存供正文
+      expect(fetchCount(index)).toBe(1)
+    }
+  })
+
+  it('keeps the chapter currently being read when preloading further ahead', async () => {
+    const appStore = useAppStore()
+    const readerStore = useReaderStore()
+    appStore.setOnlineStatus(true)
+    readerStore.updateConfig('enablePreload', true)
+    readerStore.book = {
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'test-source',
+      bookUrl: 'https://example.test/touch',
+    }
+    readerStore.chapters = Array.from({ length: 12 }, (_, index) => ({
+      title: `第${index + 1}章`,
+      url: `chapter-${index}`,
+      index,
+    }))
+    vi.mocked(getBookContent).mockImplementation(async ({ chapterUrl }) => `${chapterUrl}-正文`)
+
+    await readerStore.loadChapter(0)
+    await readerStore.loadChapter(1)
+    // 反复预载远端批次, 一路把缓存写满。当前章 1 被反复命中(每次读都被 touch),
+    // 不该被后来的远端预载挤出去 —— 否则重排/回看又要重新请求。
+    await readerStore.preloadAroundChapter(5)
+    await readerStore.preloadAroundChapter(7)
+    await readerStore.fetchChapterContent(1)
+
+    const chapterOneCalls = vi.mocked(getBookContent).mock.calls
+      .filter(([params]) => params.chapterUrl === 'chapter-1').length
+    expect(chapterOneCalls).toBe(1)
+  })
+
+  it('does not show the loading state while the next chapter is already preloading', async () => {
+    const appStore = useAppStore()
+    const readerStore = useReaderStore()
+    appStore.setOnlineStatus(true)
+    readerStore.updateConfig('enablePreload', true)
+    readerStore.book = {
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'test-source',
+      bookUrl: 'https://example.test/inflight',
+    }
+    readerStore.chapters = [
+      { title: '第一章', url: 'chapter-0', index: 0 },
+      { title: '第二章', url: 'chapter-1', index: 1 },
+    ]
+
+    let resolveContent: ((value: string) => void) | undefined
+    vi.mocked(getBookContent).mockImplementation(
+      async () =>
+        new Promise<string>((resolve) => {
+          resolveContent = resolve
+        }),
+    )
+
+    const preload = readerStore.preloadNextChapter(1)
+    await vi.waitFor(() => {
+      expect(getBookContent).toHaveBeenCalledTimes(1)
+    })
+
+    const loading = readerStore.loadChapter(1)
+    // 预载已经在路上, 只是还没返回: 这里亮全屏加载动画就会闪一下,
+    // 正是"开了预加载还是有加载动画"的观感来源。
+    expect(readerStore.loading).toBe(false)
+
+    resolveContent?.('chapter-1-正文')
+    await loading
+    await preload
+    expect(readerStore.content).toBe('chapter-1-正文')
+    // 复用在途预载: 第 1 章不能再发第二次请求(切章后预载上一章是另一回事)
+    const chapterOneCalls = vi.mocked(getBookContent).mock.calls
+      .filter(([params]) => params.chapterUrl === 'chapter-1')
+    expect(chapterOneCalls).toHaveLength(1)
+  })
+
+  it('falls back to a real request when the reused in-flight preload failed', async () => {
+    const appStore = useAppStore()
+    const readerStore = useReaderStore()
+    appStore.setOnlineStatus(true)
+    readerStore.updateConfig('enablePreload', true)
+    readerStore.book = {
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'test-source',
+      bookUrl: 'https://example.test/inflight-fail',
+    }
+    readerStore.chapters = [
+      { title: '第一章', url: 'chapter-0', index: 0 },
+      { title: '第二章', url: 'chapter-1', index: 1 },
+    ]
+
+    // 预载失败(preloadNextChapter 会把错误吞成 null), 随后的翻章必须自己重试,
+    // 否则用户只会看到"翻了下一章什么也没发生"。
+    vi.mocked(getBookContent).mockRejectedValueOnce(new Error('网络失败'))
+    vi.mocked(getBookContent).mockResolvedValue('chapter-1-正文')
+
+    await readerStore.preloadNextChapter(1)
+    await readerStore.loadChapter(1)
+
+    expect(readerStore.content).toBe('chapter-1-正文')
+  })
+
+  it('shows the loading state after the delay when the preload is slow', async () => {
+    const appStore = useAppStore()
+    const readerStore = useReaderStore()
+    appStore.setOnlineStatus(true)
+    readerStore.updateConfig('enablePreload', true)
+    readerStore.book = {
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'test-source',
+      bookUrl: 'https://example.test/inflight-slow',
+    }
+    readerStore.chapters = [
+      { title: '第一章', url: 'chapter-0', index: 0 },
+      { title: '第二章', url: 'chapter-1', index: 1 },
+    ]
+
+    let resolveContent: ((value: string) => void) | undefined
+    vi.mocked(getBookContent).mockImplementation(
+      async () =>
+        new Promise<string>((resolve) => {
+          resolveContent = resolve
+        }),
+    )
+
+    const preload = readerStore.preloadNextChapter(1)
+    await vi.waitFor(() => {
+      expect(getBookContent).toHaveBeenCalledTimes(1)
+    })
+
+    const loading = readerStore.loadChapter(1)
+    // 立刻不亮, 免得命中的预载闪一下
+    expect(readerStore.loading).toBe(false)
+    // 但书源确实慢: 延迟过后必须给反馈, 否则用户以为翻页没反应
+    await vi.waitFor(() => {
+      expect(readerStore.loading).toBe(true)
+    })
+
+    resolveContent?.('chapter-1-正文')
+    await loading
+    await preload
+    expect(readerStore.content).toBe('chapter-1-正文')
+    expect(readerStore.loading).toBe(false)
+  })
+
+  it('caches content fetched outside loadChapter so it is not requested twice', async () => {
+    const appStore = useAppStore()
+    const readerStore = useReaderStore()
+    appStore.setOnlineStatus(true)
+    readerStore.updateConfig('enablePreload', true)
+    readerStore.book = {
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'test-source',
+      bookUrl: 'https://example.test/cache-outside',
+    }
+    readerStore.chapters = [{ title: '第一章', url: 'chapter-0', index: 0 }]
+    vi.mocked(getBookContent).mockResolvedValue('chapter-0-正文')
+
+    // 连续阅读经 buildContinuousChapter 走这条路径取正文, 从不经过 loadChapter。
+    // 写缓存若不在这里发生, 同一章每次滚回视口都要重新请求一次。
+    await readerStore.fetchChapterContent(0)
+    await readerStore.fetchChapterContent(0)
+
+    expect(getBookContent).toHaveBeenCalledTimes(1)
   })
 
   it('clears a pending load stage when the reader is reset', async () => {

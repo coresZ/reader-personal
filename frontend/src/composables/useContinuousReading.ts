@@ -4,6 +4,10 @@ import type { useReaderStore } from '../stores/reader'
 
 type ReaderStore = ReturnType<typeof useReaderStore>
 
+/** 「正在加载下一章…」的延迟显示时长: 短到不显得迟钝, 长到足以让命中预载的
+ *  微任务路径在提示渲染出来之前就结束。 */
+const CONTINUOUS_LOADING_INDICATOR_DELAY_MS = 150
+
 export interface ContinuousChapterItem {
   index: number
   title: string
@@ -25,6 +29,29 @@ export function useContinuousReading(
   const previousAutoLoadArmed = ref(false)
   let continuousStateSyncTimer: number | null = null
   let continuousGeneration = 0
+  // 「正在加载下一章…」的延迟显示: 命中预载时取正文只是一个微任务, 提示却会被
+  // 渲染出来闪一下 —— 那正是用户眼里"预加载没生效"的观感。真正要等网络时,
+  // 延迟远小于一次请求的耗时, 不会让人觉得没反应。
+  let continuousNextIndicatorTimer: number | null = null
+  // 用独立的布尔量守重入, 而不是 continuousLoadingNext —— 后者现在带 150ms
+  // 延迟显示, 不能兼作"正在填充尾部"的同步标志(否则滚动事件会重复进入本函数)。
+  let continuousNextInFlight = false
+
+  function showContinuousNextIndicatorSoon() {
+    if (continuousLoadingNext.value || continuousNextIndicatorTimer !== null) return
+    continuousNextIndicatorTimer = window.setTimeout(() => {
+      continuousNextIndicatorTimer = null
+      continuousLoadingNext.value = true
+    }, CONTINUOUS_LOADING_INDICATOR_DELAY_MS)
+  }
+
+  function hideContinuousNextIndicator() {
+    if (continuousNextIndicatorTimer !== null) {
+      clearTimeout(continuousNextIndicatorTimer)
+      continuousNextIndicatorTimer = null
+    }
+    continuousLoadingNext.value = false
+  }
 
   async function pruneReadChapters(targetIndex = store.currentIndex) {
     if (!hideReadChaptersMode.value) return
@@ -143,6 +170,9 @@ export function useContinuousReading(
       if (!next || generation !== continuousGeneration || !isContinuousMode.value) return
       if (continuousChapters.value.some((chapter) => chapter.index === next.index)) return
       continuousChapters.value = [...continuousChapters.value, next]
+      // 列表一变长就接着预载下游 —— 打开书/跳章之后用户往往直接往下读,
+      // 等到滚动才预载就已经在等网络了。
+      preloadContinuousAhead()
     })()
   }
 
@@ -162,10 +192,31 @@ export function useContinuousReading(
     await initializeContinuousChapters(store.currentIndex, false)
   }
 
+  /** 预载「已渲染列表之后」的两章。
+   *
+   *  必须用**尾部**章节作基准而不是 store.currentIndex: 用户滚到某一章中段时,
+   *  列表尾部可能已领先当前章若干章, 按 currentIndex 预载只会重复拉取已经在
+   *  DOM 里的章节, 并把真正要用的下一章挤出缓存。
+   *
+   *  隐藏已读形态下身后章节会被立即裁掉, 因此不预载上一章(forwardOnly)。 */
+  function preloadContinuousAhead() {
+    if (!store.config.enablePreload) return
+    const tail = continuousChapters.value[continuousChapters.value.length - 1]
+    if (!tail) return
+    // 滚动是高频路径, 用"下游是否已就绪或已在路上"挡重复调用 —— 比记住上次的尾部
+    // 索引更准: 预载失败时下游仍未就绪, 下一次滚动就会自然重试, 不会永久卡住。
+    const downstream = [tail.index + 1, tail.index + 2]
+      .filter((index) => index < store.chapters.length)
+    // 已是最后几章: 没有下游可预载
+    if (!downstream.length) return
+    if (downstream.every((index) => store.isChapterReady(index))) return
+    void store.preloadAroundChapter(tail.index, { forwardOnly: hideReadChaptersMode.value })
+  }
+
   async function loadContinuousNext() {
-    if (continuousLoadingNext.value || !continuousChapters.value.length) return
+    if (continuousNextInFlight || !continuousChapters.value.length) return
     const generation = continuousGeneration
-    continuousLoadingNext.value = true
+    continuousNextInFlight = true
     try {
       // A fast scroll can reach the bottom while a chapter is being fetched.
       // Keep filling the tail until the viewport has enough content again;
@@ -175,9 +226,20 @@ export function useContinuousReading(
         const nextIndex = last.index + 1
         if (nextIndex >= store.chapters.length) break
 
+        // 命中预载(或预载在途)时取正文只是一个微任务, 不亮「正在加载下一章…」;
+        // 真要从书源拉取才提示。这样预加载生效时用户完全看不到等待。
+        if (store.isChapterReady(nextIndex)) {
+          hideContinuousNextIndicator()
+        } else {
+          showContinuousNextIndicatorSoon()
+        }
+
         const next = await buildContinuousChapter(nextIndex)
         if (generation !== continuousGeneration || !next || getContinuousChapter(next.index)) break
         continuousChapters.value = [...continuousChapters.value, next]
+        // 追加一章就顺势预载它后面的两章, 让预载链跟着阅读推进接力,
+        // 而不是等下一次滚动事件重新发起。
+        preloadContinuousAhead()
         await nextTick()
 
         const container = scrollContainerRef.value
@@ -187,7 +249,8 @@ export function useContinuousReading(
         if (remaining >= 480) break
       }
     } finally {
-      continuousLoadingNext.value = false
+      continuousNextInFlight = false
+      hideContinuousNextIndicator()
     }
   }
 
@@ -311,6 +374,10 @@ export function useContinuousReading(
       clearTimeout(continuousStateSyncTimer)
       continuousStateSyncTimer = null
     }
+    if (continuousNextIndicatorTimer) {
+      clearTimeout(continuousNextIndicatorTimer)
+      continuousNextIndicatorTimer = null
+    }
   }
 
   return {
@@ -326,6 +393,7 @@ export function useContinuousReading(
     syncContinuousToStoreState,
     loadContinuousNext,
     loadContinuousPrev,
+    preloadContinuousAhead,
     armPreviousAutoLoad,
     ensureContinuousChapterLoaded,
     getContinuousSections,

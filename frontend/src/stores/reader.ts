@@ -139,7 +139,7 @@ const defaultConfig: ReadConfig = {
   clickAction: 'auto',
   selectAction: 'ignore',
   chineseMode: 'simplified',
-  enablePreload: false,
+  enablePreload: true,
   // 默认关闭: 边缘热区会吃掉正文点击, 用户反馈"可点区域变少、还要小心别误点按钮"
   // (issue #7 问题 1)。想用悬停呼出的人可在设置「更多」里开启。
   hoverRevealControls: false,
@@ -248,6 +248,10 @@ interface PreloadedOpenAIAudio {
 }
 
 const OPENAI_AUDIO_PRELOAD_LIMIT = 8
+
+/** 复用在途预载时的加载动画延迟。命中预载本该是"瞬间换章", 200ms 内返回就完全
+ *  不显示动画; 超过则说明书源确实慢, 亮出动画免得用户以为翻页没反应。 */
+const CHAPTER_LOADING_INDICATOR_DELAY_MS = 200
 
 export type SpeechProvider = 'system' | 'openai'
 export type OpenAISpeechSource = 'browser' | 'server'
@@ -1985,13 +1989,53 @@ export const useReaderStore = defineStore('reader', () => {
     lastServerProgressKey.value = nextKey
   }
 
+  /**
+   * 预载缓存容量。
+   *
+   * 必须容纳「当前章 + 后两章 + 上一章」(预载一批最多 3 章, 加上 loadChapter 自己
+   * 要缓存的当前章共 4 个)再留一格余量。容量只有 3 时每写入一次就必然淘汰一个,
+   * 而淘汰按插入序进行 —— 最早插入的往往正是**下一章**, 于是用户翻页那一刻缓存
+   * 刚好被挤掉, 又得重新请求, 表现就是"开了预加载还是有加载动画"。
+   */
+  const PRELOAD_CACHE_LIMIT = 5
+
+  /**
+   * 写入缓存并按 LRU 淘汰。
+   *
+   * 用插入序而不是"离当前章的距离"来决定淘汰: 预载是**成批**写入的(一次 1~3 章),
+   * 按距离排序会把刚写进来的相邻章判成"远处"当场淘汰, 等于白写。插入序天然保护
+   * 了最近写入的整批。
+   *
+   * 当前章(`currentIndex`)永不淘汰。连续阅读/预载远端批次时, 用户正在读的那一章
+   * 可能长时间没有再次写入而沦为"最久未用", 被后续预载挤出去 —— 而字号调整、
+   * 窗口 resize、原地刷新都要重新取它, 一挤掉就又是一次网络请求。
+   */
   function cachePreloadedContent(index: number, chapterContent: string) {
     preloadedContent.value.set(index, chapterContent)
-    while (preloadedContent.value.size > 3) {
-      const oldestKey = Array.from(preloadedContent.value.keys()).find((key) => key !== index)
+    if (preloadedContent.value.size <= PRELOAD_CACHE_LIMIT) return
+
+    const reading = currentIndex.value
+    while (preloadedContent.value.size > PRELOAD_CACHE_LIMIT) {
+      // 本次刚写入的章节是这次访问的直接结果, 与当前章一并保留。
+      const oldestKey = Array.from(preloadedContent.value.keys())
+        .find((key) => key !== index && key !== reading)
       if (oldestKey === undefined) break
       preloadedContent.value.delete(oldestKey)
     }
+  }
+
+  /**
+   * 把已在缓存里的章节标记为"刚刚用过"。
+   *
+   * Map 的 set 对已存在的键不会改变插入序, 所以命中缓存必须显式 delete + set 才能
+   * 移到队尾。缺了这一步, 一路预载下游会把**用户正在读的这一章**当成最久未用淘汰掉,
+   * 回看或重排时又得重新请求。
+   */
+  function touchPreloadedContent(index: number) {
+    const cached = preloadedContent.value.get(index)
+    if (cached === undefined) return
+    preloadedContent.value.delete(index)
+    preloadedContent.value.set(index, cached)
   }
 
   async function fetchChapterContent(index: number, forceRefresh = false, reportStage = false) {
@@ -2001,6 +2045,7 @@ export const useReaderStore = defineStore('reader', () => {
     // 这两个提前返回必须发生在设置 stage **之前**：否则设了提示却走不到 finally，
     // 提示会永久卡在「正在获取章节…」。
     if (!forceRefresh && preloadedContent.value.has(index)) {
+      touchPreloadedContent(index)
       return preloadedContent.value.get(index) || null
     }
 
@@ -2010,6 +2055,8 @@ export const useReaderStore = defineStore('reader', () => {
     }
 
     const chapter = chapters.value[index]
+    // 本次请求发起时的代次。换书/关闭预载会递增它, 迟到的响应据此放弃写缓存。
+    const generation = chapterPreloadGeneration
 
     // 立即给出可见反馈，不等后端的阶段事件到达（否则跳章后会有一段"无响应"观感，
     // 用户会以为点了没反应）。后端事件随后把阶段细化成 parsing / caching。
@@ -2041,6 +2088,12 @@ export const useReaderStore = defineStore('reader', () => {
       if (!chapterContent.trim()) {
         throw new Error('书源正文解析为空，请检查正文规则')
       }
+      // 任何拿到正文的路径都入缓存, 而不是只由 loadChapter 回写。
+      // 连续阅读的正文是经 buildContinuousChapter 走这条路径取的, 只在 loadChapter
+      // 里写缓存会让连续模式每滚过一次都要重新请求同一个章节。
+      if (generation === chapterPreloadGeneration) {
+        cachePreloadedContent(index, chapterContent)
+      }
       return chapterContent
     } catch (error) {
       if (!appStore.isOnline) {
@@ -2066,11 +2119,38 @@ export const useReaderStore = defineStore('reader', () => {
     const bookUrl = book.value.bookUrl
 
     const cachedContent = !forceRefresh ? preloadedContent.value.get(index) : undefined
-    loading.value = cachedContent === undefined
+    // 在途的预载请求同样算命中。fetchChapterContent 本来就能复用它、不会重复发请求,
+    // 但那次复用发生在 loading 赋值**之后** —— 只看已完成缓存的话, 预载已发出而尚未
+    // 返回时翻章会先闪一次全屏加载动画, 再被同一份正文瞬间替换掉。
+    const pendingPreload = cachedContent === undefined && !forceRefresh
+      ? preloadingContent.get(index)
+      : undefined
+    loading.value = cachedContent === undefined && pendingPreload === undefined
+    // 复用在途预载时同样不亮动画(否则就是那次闪烁), 但书源很慢的话用户会以为
+    // 翻页没反应。改成延迟兜底: 200ms 内返回就完全不显示动画, 超过才亮出来。
+    // 这个定时器只在"等一份已经在路上的正文"时存在, 与 loading 互斥。
+    let pendingIndicatorTimer: number | null = null
+    if (cachedContent === undefined && pendingPreload !== undefined) {
+      pendingIndicatorTimer = window.setTimeout(() => {
+        pendingIndicatorTimer = null
+        if (requestId === chapterLoadRequestId) loading.value = true
+      }, CHAPTER_LOADING_INDICATOR_DELAY_MS)
+    }
     try {
-      const chapterContent = cachedContent !== undefined
+      let chapterContent = cachedContent !== undefined
         ? cachedContent
         : await fetchChapterContent(index, forceRefresh, true)
+      if (chapterContent == null && pendingPreload) {
+        // 复用的在途预载失败了(preloadNextChapter 把错误吞成 null)。这里必须补一次
+        // 真实请求: 否则用户只会看到"翻到下一章什么也没发生", 连错误提示都没有。
+        // 补请求期间必须亮出加载态 —— 这次是真的要等网络了。
+        if (pendingIndicatorTimer !== null) {
+          clearTimeout(pendingIndicatorTimer)
+          pendingIndicatorTimer = null
+        }
+        if (requestId === chapterLoadRequestId) loading.value = true
+        chapterContent = await fetchChapterContent(index, forceRefresh, true)
+      }
       if (chapterContent == null) return
       if (requestId !== chapterLoadRequestId || book.value?.bookUrl !== bookUrl) return
 
@@ -2132,13 +2212,31 @@ export const useReaderStore = defineStore('reader', () => {
     } finally {
       // 只收尾 loading：阶段提示由 fetchChapterContent 的持有者机制管理，
       // 这里再清一次会误清连续模式下并发加载刚设置的提示。
+      if (pendingIndicatorTimer !== null) clearTimeout(pendingIndicatorTimer)
       if (requestId === chapterLoadRequestId) loading.value = false
     }
   }
 
-  async function preloadAroundChapter(index: number) {
+  /**
+   * 同步探测某章是否已经"到手或马上到手"(已缓存或预载在途)。
+   *
+   * 给连续阅读判断要不要显示「正在加载下一章…」用: 命中预载时取正文只是一个
+   * 微任务, 提示却会被渲染出来闪一下 —— 那正是用户眼里"预加载没生效"的观感。
+   */
+  function isChapterReady(index: number) {
+    return preloadedContent.value.has(index) || preloadingContent.has(index)
+  }
+
+  /**
+   * 预载当前章周边。
+   *
+   * `options.forwardOnly` 用于「隐藏已读」形态: 身后章节会被立即裁掉, 预载它
+   * 既不会被读到、还要占一格缓存并把真正要用的下一章挤出去。
+   */
+  async function preloadAroundChapter(index: number, options: { forwardOnly?: boolean } = {}) {
     if (!book.value || !config.enablePreload) return
-    const targets = [index + 1, index + 2, index - 1]
+    const candidates = options.forwardOnly ? [index + 1, index + 2] : [index + 1, index + 2, index - 1]
+    const targets = candidates
       .filter((target, pos, list) => target >= 0 && target < chapters.value.length && list.indexOf(target) === pos)
     // 并发预载, 不等彼此
     await Promise.allSettled(targets.map((target) => preloadNextChapter(target)))
@@ -2511,7 +2609,7 @@ export const useReaderStore = defineStore('reader', () => {
     bookmarks, fetchBookmarks, addBookmark, removeBookmark, removeBookmarks,
     readChapterKeys, isChapterRead, markChapterAsRead,
     replaceRules, fetchReplaceRules,
-    switchSource, preloadNextChapter, preloadAroundChapter,
+    switchSource, preloadNextChapter, preloadAroundChapter, isChapterReady,
     refreshChapters, refreshTocFromSource,
     isSpeaking, isSpeechLoading, isPaused, speechProgress, startTTS, pauseTTS, stopTTS,
     voiceList, speechConfig, speechStopAt, speechProviderLabel, openAISpeechConfigured,
