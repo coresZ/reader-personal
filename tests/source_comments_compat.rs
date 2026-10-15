@@ -42,7 +42,7 @@ fn java_get_cookie_accepts_domain_tags_and_named_values() {
 }
 
 #[test]
-fn fanqie_catalog_generates_review_capable_chapter_urls() {
+fn aggregate_catalog_generates_review_capable_chapter_urls() {
     // Same rule as the supplied aggregate source; all identifiers and cookies
     // are local fixtures, and no upstream request is made.
     let chapter_url_rule = r#"<js>
@@ -59,11 +59,11 @@ let content_url;
 if (sources == '卷') {
     content_url = item_id;
 } else if (['源甲', '源乙', '源丁'].includes(sources) && tab == "小说") {
-    const fqssionid = java.getCookie('theta.example.com', 'sessionid');
+    const reviewSession = java.getCookie('theta.example.com', 'sessionid');
     const sourcess = sources.replace('svip_', '');
     content_url = `data:;base64,${encodedGycontent},${JSON.stringify({
         type: "gycontent",
-        js: `book ? result : '${base_url}/get_review?book_id=${book_id}&item_id=${item_id}&ssionid=${fqssionid}&source=${sourcess}'`
+        js: `book ? result : '${base_url}/get_review?book_id=${book_id}&item_id=${item_id}&ssionid=${reviewSession}&source=${sourcess}'`
     })}`;
 } else {
     content_url = `data:;base64,${encodedGycontent},${JSON.stringify({ type: "gycontent" })}`;

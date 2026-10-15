@@ -1920,8 +1920,8 @@ impl BookService {
         let body = res.body.clone();
         // legado 里 `baseUrl` 是**章节的绝对 URL**(含 `#item_id` 这类片段), 请求
         // 之后的真实地址是 `redirectUrl`。把 `res.url` 当 baseUrl 会丢掉片段,
-        // 纯 JS 正文规则(如番茄 APP 源用 `baseUrl.match(/#(\d+)$/)` 取 item_id)
-        // 因此拿不到章节标识。这里优先用调用方给的章节 URL。
+        // 纯 JS 正文规则(如用 `baseUrl.match(/#(\d+)$/)` 取章节标识)因此拿不到
+        // 章节标识。这里优先用调用方给的章节 URL。
         let url = if base_url.trim().is_empty() { res.url.clone() } else { base_url.to_string() };
         let source_key = source_key.to_string();
         tokio::task::spawn_blocking(move || {

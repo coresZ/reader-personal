@@ -35,7 +35,7 @@ fn evaluate(source: &BookSource, code: &str, values: &Map<String, Value>) -> any
 
 /// Gson LENIENT 风格的宽容 JSON 预处理：给不带引号的对象 key 补引号。
 /// legado 端用 Gson（默认 LENIENT）解析 loginUi，接受 `name: "xxx"` 这类
-/// 裸 key（晋江、四季书屋等源这么写）；serde_json 是严格 JSON，需要先修复。
+/// 裸 key（部分源这么写）；serde_json 是严格 JSON，需要先修复。
 /// 逐字符扫描并跟踪字符串/转义状态，只在「{ 或 , 之后、冒号之前」的位置补引号。
 fn quote_bare_keys(raw: &str) -> String {
     let chars: Vec<char> = raw.chars().collect();

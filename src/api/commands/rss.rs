@@ -76,7 +76,7 @@ pub async fn open_rss_source_panel(
         ));
     }
 
-    // 只代理 http(s); 自定义 scheme(如 `snssdk1128://`)交给前端另行处理。
+    // 只代理 http(s); 自定义 scheme(如 `app-scheme://`)交给前端另行处理。
     if !target.starts_with("http://") && !target.starts_with("https://") {
         return Ok(ApiResponse::ok(serde_json::json!({
             "url": target,
@@ -96,7 +96,7 @@ pub async fn open_rss_source_panel(
     let client = context.client.clone();
     let mut request = client.get(&target);
     if let Some(headers) = source.header.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        // 源 header 可能是 JS(如「源仓库」), 交给 JS 引擎求值成 JSON 头。
+        // 源 header 可能是 JS(如聚合类源), 交给 JS 引擎求值成 JSON 头。
         let raw = headers
             .strip_prefix("@js:")
             .map(str::trim)
@@ -294,9 +294,9 @@ pub async fn get_rss_articles(
         .find(|s| s.source_url == source_url)
         .ok_or_else(|| AppError::BadRequest("RSS源不存在".to_string()))?;
 
-    // 源地址本身是 JS 表达式时(如「源仓库」的
-    // `http@js:eval(String(cache.getFromMemory('yckdm')))`), 它不是 feed 地址,
-    // 拿去做 HTTP 请求没有意义 —— 直接走「网页入口」分支。
+    // 源地址本身是 JS 表达式时(如
+    // `http@js:eval(String(cache.getFromMemory('repo_cache')))`), 它不是 feed
+    // 地址, 拿去做 HTTP 请求没有意义 —— 直接走「网页入口」分支。
     if source_url_is_script(&rss_source.source_url) {
         return single_url_entry(&rss_source, &source_url, &sort_name).await;
     }
@@ -320,7 +320,7 @@ pub async fn get_rss_articles(
     let feed = match feed_rs::parser::parse(&bytes[..]) {
         Ok(feed) => feed,
         // 解析不出 feed: 对 `singleUrl` 源(legado 语义: 源地址即"一篇文章",
-        // 点开直接看网页, 如「喵公子书源管理」「Meow云」这类 HTML 入口页)
+        // 点开直接看网页, 如各类 HTML 入口页)
         // 退化成网页入口, 而不是报错让整个列表空掉。真 feed 源(如「版本」的
         // GitHub atom)解析成功, 不受影响。
         Err(err) => {
@@ -418,7 +418,7 @@ pub async fn get_rss_content(
 
 /// 源地址是否是 JS 表达式(`@js:` / `<js>` / `js:`)而非真实 URL。
 ///
-/// 「源仓库」的地址是 `http@js:eval(String(cache.getFromMemory('yckdm')))`——
+/// 某类源的地址是 `http@js:eval(String(cache.getFromMemory('repo_cache')))`——
 /// 前半截 `http` 只是残壳, 真域名由 `header` 脚本探测后写进内存缓存。
 ///
 /// **先做 URL 短路**: 能被 `Url::parse` 解析且 scheme 是 http(s) 的, 一定是普通
@@ -478,7 +478,7 @@ async fn single_url_entry(
 
 /// 源地址求值结果的进程内缓存: `源URL -> (解析出的地址, 是否由 JS 求值, 时间戳)`。
 ///
-/// 「源仓库」的求值要跑一遍镜像测速循环(实测 ~18s), 每次进 RSS 页都重跑会明显
+/// 脚本地址源的求值要跑一遍镜像测速循环(实测 ~18s), 每次进 RSS 页都重跑会明显
 /// 拖慢列表。缓存 10 分钟, 兼顾"域名会变"与"不反复测速"。
 static SINGLE_URL_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, (String, bool, std::time::Instant)>>,
@@ -519,8 +519,8 @@ fn split_sort_url_protocol(raw: &str) -> String {
 /// `singleUrl` 源要打开的落点。
 ///
 /// legado 语义是**用 `sortUrl`**(分类协议取 `::` 后半段)当文章地址, 而不是
-/// `sourceUrl`: 例如「喵公子书源管理」的 `sortUrl` 是
-/// `首页::http://yuedu.miaogongzi.net/gx.html`, 取出的地址才是要打开的那一页。
+/// `sourceUrl`: 例如某源的 `sortUrl` 是 `首页::http://example.test/list.html`,
+/// 取出的地址才是要打开的那一页。
 /// `sortUrl` 为空时退回 `sourceUrl`。
 fn single_url_target(source: &RssSource, raw: &str) -> String {
     source
@@ -535,7 +535,7 @@ fn single_url_target(source: &RssSource, raw: &str) -> String {
 /// 解析 `singleUrl` 源要打开的地址。
 ///
 /// 源地址是 JS 表达式时(`@js:`)在真实 JS 引擎里求值 —— 这是 legado 的语义,
-/// 例如「源仓库」靠它读出 `header` 脚本探测到的可用镜像域名。求值失败或结果
+/// 例如聚合类源靠它读出 `header` 脚本探测到的可用镜像域名。求值失败或结果
 /// 不像 URL 时退回 `sortUrl`, 再退回原串, 保证入口始终可点。
 ///
 /// 求值可能很慢(镜像测速), 因此丢到阻塞线程执行, 不占用异步调度线程。
@@ -598,8 +598,8 @@ async fn evaluate_single_url(
     fallback: &impl Fn() -> String,
     script: &str,
 ) -> (String, bool) {
-    // 源级 header 脚本可能是"把待执行脚本写进内存缓存"的形式(「源仓库」正是
-    // 如此: header 把一段 JS 源码 putMemory 成 yckdm, sourceUrl 再 eval 它)。
+    // 源级 header 脚本可能是"把待执行脚本写进内存缓存"的形式(某类源正是如此:
+    // header 把一段 JS 源码 putMemory 成一个键, sourceUrl 再 eval 它)。
     // 所以求值前必须先跑一次 header, 否则内存缓存是空的。
     let header = source.header.clone().unwrap_or_default();
     let base_url = raw.to_string();
@@ -628,7 +628,7 @@ async fn evaluate_single_url(
             if looks_like_url(&value) {
                 (value, true)
             } else {
-                // 求值成功但结果不是 URL(内存缓存里还没有 `yckdm` 时会是
+                // 求值成功但结果不是 URL(内存缓存里还没有对应键时会是
                 // `http` 这类残壳), 按求值失败处理。
                 (fallback(), false)
             }
@@ -695,7 +695,7 @@ fn looks_like_url(value: &str) -> bool {
     if value.starts_with("http://") || value.starts_with("https://") {
         return true;
     }
-    // 自定义 scheme(如 `snssdk1128://`)交给系统/WebView 处理。
+    // 自定义 scheme(如 `app-scheme://`)交给系统/WebView 处理。
     value
         .split_once("://")
         .map(|(scheme, rest)| !scheme.is_empty() && !rest.is_empty())
@@ -904,22 +904,18 @@ mod tests {
 
     #[test]
     fn source_url_is_script_detects_js_expressions() {
-        // 「源仓库」的真实形态: 前面 `http` 是残壳, 真地址靠 JS 求值。
+        // 某类源的真实形态: 前面 `http` 是残壳, 真地址靠 JS 求值。
         assert!(source_url_is_script(
-            "http@js:eval(String(cache.getFromMemory('yckdm')))"
+            "http@js:eval(String(cache.getFromMemory('repo_cache')))"
         ));
         assert!(source_url_is_script("@js:'https://a.example'"));
         assert!(source_url_is_script("<js>'https://a.example'</js>"));
         assert!(source_url_is_script("js:'https://a.example'"));
 
         // 真实 URL 不能被误判成脚本, 否则正常的 feed 源会被当成网页入口。
-        assert!(!source_url_is_script(
-            "https://github.com/hadc188/reader/releases.atom"
-        ));
-        assert!(!source_url_is_script("https://pan.miaogongzi.net"));
-        assert!(!source_url_is_script(
-            "http://yuedu.miaogongzi.net/gx.html"
-        ));
+        assert!(!source_url_is_script("https://feeds.example.com/releases.atom"));
+        assert!(!source_url_is_script("https://pan.example.net"));
+        assert!(!source_url_is_script("http://entry.example.net/list.html"));
     }
 
     /// `@js:` 子串出现在**真 URL 的参数或路径**里时, 不能被判成脚本地址。
@@ -932,12 +928,12 @@ mod tests {
         assert!(!source_url_is_script("https://example.com/path/<js>/feed.xml"));
         assert!(is_plain_http_url("https://example.com/feed?x=@js:1"));
 
-        // 「源仓库」的地址解析不出 http(s) scheme, 仍必须判为脚本。
+        // 该形态的地址解析不出 http(s) scheme, 仍必须判为脚本。
         assert!(source_url_is_script(
-            "http@js:eval(String(cache.getFromMemory('yckdm')))"
+            "http@js:eval(String(cache.getFromMemory('repo_cache')))"
         ));
         assert!(!is_plain_http_url(
-            "http@js:eval(String(cache.getFromMemory('yckdm')))"
+            "http@js:eval(String(cache.getFromMemory('repo_cache')))"
         ));
         // `js:xxx` 的 scheme 是 `js`, 不是 http(s), 也不能短路。
         assert!(source_url_is_script("js:'https://a.example'"));
@@ -947,8 +943,8 @@ mod tests {
     #[test]
     fn extract_js_script_drops_leading_shell() {
         assert_eq!(
-            extract_js_script("http@js:eval(String(cache.getFromMemory('yckdm')))"),
-            "eval(String(cache.getFromMemory('yckdm')))"
+            extract_js_script("http@js:eval(String(cache.getFromMemory('repo_cache')))"),
+            "eval(String(cache.getFromMemory('repo_cache')))"
         );
         assert_eq!(extract_js_script("@js:  'https://a.example'"), "'https://a.example'");
         assert_eq!(
@@ -959,20 +955,20 @@ mod tests {
 
     #[test]
     fn looks_like_url_rejects_bare_scheme_shell() {
-        // 内存缓存里没有 `yckdm` 时, 表达式会求值成裸 `http` —— 这不能当地址打开。
+        // 内存缓存里没有对应键时, 表达式会求值成裸 `http` —— 这不能当地址打开。
         assert!(!looks_like_url("http"));
         assert!(!looks_like_url("https"));
         assert!(!looks_like_url(""));
-        assert!(looks_like_url("https://yckceo.vip"));
-        assert!(looks_like_url("http://yuedu.miaogongzi.net/gx.html"));
-        // legado 自定义 scheme(小说拾遗源)也要放行。
-        assert!(looks_like_url("snssdk1128://user/profile/562564899806367"));
+        assert!(looks_like_url("https://mirror.example.vip"));
+        assert!(looks_like_url("http://entry.example.net/list.html"));
+        // legado 自定义 scheme 也要放行。
+        assert!(looks_like_url("app-scheme://user/profile/123456"));
     }
 
     #[test]
     fn resolve_single_url_keeps_plain_url_untouched() {
-        // 真 feed 源(如「版本」的 GitHub atom)不是脚本地址: 分流函数必须原样放行。
-        let source = rss_source("版本", "https://github.com/hadc188/reader/releases.atom");
+        // 真 feed 源(如 atom)不是脚本地址: 分流函数必须原样放行。
+        let source = rss_source("版本", "https://feeds.example.com/releases.atom");
         assert!(
             !source_url_is_script(&source.source_url),
             "真 feed 源不能被判成脚本地址, 否则会被当成网页入口、丢失文章列表"
@@ -985,27 +981,27 @@ mod tests {
     /// 真实求值链路由 `tests/rss_repo_source_live.rs` 端到端覆盖。
     #[test]
     fn single_url_fallback_rules() {
-        // 求值结果是裸 scheme 残壳(内存缓存还没有 yckdm 时的真实表现): 不能当地址。
+        // 求值结果是裸 scheme 残壳(内存缓存还没有对应键时的真实表现): 不能当地址。
         assert!(!looks_like_url("http"));
         // 正常镜像地址可用。
-        assert!(looks_like_url("https://www.yckceo.com"));
+        assert!(looks_like_url("https://mirror.example.com"));
 
         // 脚本提取: 前缀残壳 `http` 必须被丢掉, 否则整串交给 JS 是语法错误。
         assert_eq!(
-            extract_js_script("http@js:eval(String(cache.getFromMemory('yckdm')))"),
-            "eval(String(cache.getFromMemory('yckdm')))"
+            extract_js_script("http@js:eval(String(cache.getFromMemory('repo_cache')))"),
+            "eval(String(cache.getFromMemory('repo_cache')))"
         );
     }
 
     /// legado 的分类协议 `名称::地址`: 请求与打开网页前都必须剥掉 `名称::` 前缀。
     ///
-    /// 「喵公子书源管理」的真实 `sortUrl` 就是 `首页::http://yuedu.miaogongzi.net/gx.html`,
+    /// 某类源的 `sortUrl` 是 `首页::http://entry.example.net/list.html`,
     /// 带前缀直接发请求会在请求层失败, 导致连"退化成网页入口"都走不到。
     #[test]
     fn split_sort_url_protocol_strips_category_prefix() {
         assert_eq!(
-            split_sort_url_protocol("首页::http://yuedu.miaogongzi.net/gx.html"),
-            "http://yuedu.miaogongzi.net/gx.html"
+            split_sort_url_protocol("首页::http://entry.example.net/list.html"),
+            "http://entry.example.net/list.html"
         );
         // 无协议前缀时原样返回。
         assert_eq!(
@@ -1029,18 +1025,18 @@ mod tests {
     /// `singleUrl` 源的落点以 `sortUrl` 为准(legado 语义), 为空时才退回 `sourceUrl`。
     #[test]
     fn single_url_target_prefers_sort_url() {
-        let mut source = rss_source("喵公子书源管理", "http://yuedu.miaogongzi.net/gx.html");
-        source.sort_url = Some("首页::http://yuedu.miaogongzi.net/gx.html".to_string());
+        let mut source = rss_source("入口源", "http://entry.example.net/list.html");
+        source.sort_url = Some("首页::http://entry.example.net/list.html".to_string());
         assert_eq!(
             single_url_target(&source, &source.source_url),
-            "http://yuedu.miaogongzi.net/gx.html"
+            "http://entry.example.net/list.html"
         );
 
-        // 没有 sortUrl 的源(如「源仓库」)退回 sourceUrl。
-        let repo = rss_source("源仓库", "http@js:eval(String(cache.getFromMemory('yckdm')))");
+        // 没有 sortUrl 的源退回 sourceUrl。
+        let repo = rss_source("脚本源", "http@js:eval(String(cache.getFromMemory('repo_cache')))");
         assert_eq!(
             single_url_target(&repo, &repo.source_url),
-            "http@js:eval(String(cache.getFromMemory('yckdm')))"
+            "http@js:eval(String(cache.getFromMemory('repo_cache')))"
         );
 
         // sortUrl 是空串时同样退回。
@@ -1077,11 +1073,11 @@ mod tests {
             );
         }
 
-        // 必须放行: 公网地址(含本项目的真实源)。
+        // 必须放行: 公网地址。
         for allowed in [
-            "https://www.yckceo.com/",
-            "https://github.com/hadc188/reader/releases.atom",
-            "http://yuedu.miaogongzi.net/gx.html",
+            "https://mirror.example.com/",
+            "https://feeds.example.com/releases.atom",
+            "http://entry.example.net/list.html",
             "https://8.8.8.8/dns",
         ] {
             assert!(

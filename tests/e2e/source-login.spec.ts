@@ -132,14 +132,14 @@ test.describe('source browser panels', () => {
   })
 
   test('comment pages read their full query before startup and fetch the selected chapter', async ({ page }) => {
-    const target = 'https://fixture.test/review?book_id=book%2B1&item_id=chapter-2&source=%E7%95%AA%E8%8C%84&tag=one&tag=two&panelId=upstream-panel&url=upstream-url#paragraph-4'
+    const target = 'https://fixture.test/review?book_id=book%2B1&item_id=chapter-2&source=fixture-source&tag=one&tag=two&panelId=upstream-panel&url=upstream-url#paragraph-4'
     const requests: any[] = []
     const document = readFileSync(fixturePath, 'utf8')
       .replace(/window\.__readerPanelUrl=[^;]*;/, () => 'window.__readerPanelUrl=' + JSON.stringify(target) + ';')
       .replace('<body>', `<body><output id="comment-result"></output><script>
         window.commentStartup = Array.from(new URLSearchParams(window.location.search));
         var query = new URLSearchParams(window.location.search);
-        fetch('/api/fanqie/comment/chapter/list?book_id=' + encodeURIComponent(query.get('book_id')) + '&item_id=' + encodeURIComponent(query.get('item_id')))
+        fetch('/api/review/comment/chapter/list?book_id=' + encodeURIComponent(query.get('book_id')) + '&item_id=' + encodeURIComponent(query.get('item_id')))
           .then(function(response) { return response.json(); })
           .then(function(result) { document.getElementById('comment-result').textContent = result.comment; });
       </script>`)
@@ -162,7 +162,7 @@ test.describe('source browser panels', () => {
     for (const [key, value] of new URL(target).searchParams) expect(query.getAll(key)).toContain(value)
     expect(new URL(frame.url()).hash).toBe('#paragraph-4')
     expect(requests).toHaveLength(1)
-    expect(requests[0].url).toBe('https://fixture.test/api/fanqie/comment/chapter/list?book_id=book%2B1&item_id=chapter-2')
+    expect(requests[0].url).toBe('https://fixture.test/api/review/comment/chapter/list?book_id=book%2B1&item_id=chapter-2')
     await frame.evaluate(() => history.pushState({}, '', '?book_id=next-book&item_id=next-chapter'))
     expect(await frame.evaluate(() => new URLSearchParams(location.search).get('book_id'))).toBe('next-book')
     expect(await frame.evaluate(() => new URLSearchParams(location.search).has('tag'))).toBe(false)

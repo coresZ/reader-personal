@@ -2904,8 +2904,8 @@ mod tests {
     /// "点二级链接白屏" 的修复开关(上游页面的 X-Frame-Options 会让 iframe 拒绝渲染)。
     #[test]
     fn rss_static_panel_renders_bridge_and_base_for_non_book_source() {
-        let page_url = "https://yckceo.vip/";
-        let html = "<html><head><title>源仓库</title></head><body><a href=\"/a\">x</a></body></html>";
+        let page_url = "https://panel.example.vip/";
+        let html = "<html><head><title>面板页</title></head><body><a href=\"/a\">x</a></body></html>";
         // 关键: 面板归属留空 —— RSS 源没有书源记录, 走的正是静态渲染分支。
         // `external_links: true` 与 `open_rss_source_panel` 里的设置一致。
         let entry = crate::service::book_service::SourcePanelEntry {
@@ -2928,11 +2928,11 @@ mod tests {
             "必须注入 <base> 让相对资源指回上游站点"
         );
         assert!(
-            rendered.contains("yckceo.vip"),
+            rendered.contains("panel.example.vip"),
             "面板 URL 应出现在页面里(桥用它做同源校验与代理拼接)"
         );
         // 原页面内容保留(静态渲染不是重写页面, 只是插入桥)。
-        assert!(rendered.contains("源仓库"), "原页面内容应保留");
+        assert!(rendered.contains("面板页"), "原页面内容应保留");
         // 外链开关必须随条目进入渲染结果, 否则二级链接仍会在 iframe 内白屏。
         assert!(
             rendered.contains("var externalLinks = true"),

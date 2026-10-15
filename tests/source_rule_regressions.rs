@@ -105,7 +105,7 @@ fn book_info_initialization_runs_before_field_selection() {
     assert_eq!(book.author, "作者甲");
 }
 
-/// 该源的两个关键语法（yckceo id 7895 回归）:
+/// 该源的两个关键语法:
 /// 1. bookList 用省略 `$` 前缀的 JSON 点路径（`data.books`）
 /// 2. 字段尾部的 `@put:{"bid":"$.id"}`（legado putPattern 任意位置分离），
 ///    put 的值跨阶段对 `java.get()` 可见。

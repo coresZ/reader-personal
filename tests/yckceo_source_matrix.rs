@@ -1,4 +1,4 @@
-// yckceo 源仓库批量离线兼容性探测（tmp_probe/yck-*.json 由本地脚本下载，不入库）。
+// 源仓库批量离线兼容性探测（tmp_probe/yck-*.json 由本地脚本下载，不入库）。
 // 覆盖：反序列化、jsLib 在 rquickjs 沙盒加载、loginUi 解析、loginUrl 各形态识别、
 // 搜索/详情/目录/正文四段规则的字符串提取与 JS 规则语法编译。
 // 不发任何网络请求；jsLib 顶层加载不含 IO 副作用（已逐个人工核对顶层语句）。
@@ -39,7 +39,7 @@ fn load_sources() -> Vec<(String, BookSource)> {
                 continue;
             }
         };
-        // yckceo 的 json 接口可能返回单对象或单元素数组
+        // 该仓库的 json 接口可能返回单对象或单元素数组
         let value = value
             .as_array()
             .and_then(|items| items.first())
