@@ -1138,7 +1138,83 @@ const horizontalPageTransform = computed(() => {
   const offset = horizontalPageIndex.value * Math.max(1, horizontalPageStep.value)
   return `translate3d(${-offset}px, 0, 0)`
 })
+/** 一次跨过很多页时, 给新画面的淡入时长。跨章不做长距离滑动, 只留一个短促分界。 */
+const HORIZONTAL_JUMP_FADE_MS = 150
+
+/** 置位期间 transform 不吃过渡, 大跨度跳变靠它瞬时定位(见 beginHorizontalJump)。 */
+const horizontalJumpInProgress = ref(false)
+/** 连续跳变(如快速连翻两章)的令牌: 只有最后一次置位有权解除瞬时状态。 */
+let horizontalJumpToken = 0
+/** 进行中的淡入。连续跳变时先取消上一个: 两个 opacity 动画叠在同一元素上, 后者接管时
+ *  会从 0 重新开始, 画面先闪一下黑再淡入。 */
+let horizontalJumpFade: Animation | null = null
+
+/** 跨页跳变时给画面一个短促淡入。
+ *
+ *  用 Web Animations 而不是 class + CSS 动画: 每次调用都是独立动画, 连续跨章时天然
+ *  可重入, 不必管理"移除 class → 强制重排 → 加回 class"的重触发时序。
+ *  淡入**不长于**「动画时长」: 该设置是用户对动效快慢的整体意愿, 把它调到 60ms 的人
+ *  不该在这里又收到 150ms。设为关闭(0)时不做任何动效; 动效偏好为"减少动态效果"时
+ *  同样跳过(global.css 已把 CSS 过渡压到近 0, 这里保持一致)。 */
+function playPageJumpFade() {
+  const duration = Number(config.value.animateDuration) || 0
+  if (duration <= 0) return
+  const element = chapterTextRef.value
+  if (!element) return
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
+  horizontalJumpFade?.cancel()
+  horizontalJumpFade = element.animate(
+    [{ opacity: 0 }, { opacity: 1 }],
+    { duration: Math.min(HORIZONTAL_JUMP_FADE_MS, duration), easing: 'ease-out' },
+  )
+}
+
+/** 开始一次"一次性跨过很多页"的跳变: 瞬时定位, 跨章时再补一个短促淡入。
+ *
+ *  `fade` 只对**换章**为真。其它大跨度跳变(搜索跳转、位置恢复、改排版或窗口尺寸后按
+ *  进度重新映射、图片加载完成后的重分页)同样要瞬时定位 —— 滑过去只是同一片飞速闪动;
+ *  但它们不是"翻到了另一章", 不该有分界感。尤其图片加载完成与窗口 resize 这类用户
+ *  没有主动触发、甚至未必察觉的重建, 每次都淡入会变成莫名其妙的闪烁。 */
+function beginHorizontalJump(fade: boolean) {
+  const token = ++horizontalJumpToken
+  horizontalJumpInProgress.value = true
+  // 位移必须先用 0ms 真正绘制一次, 之后才能恢复时长: 若同帧就恢复, 浏览器会拿恢复后的
+  // 时长去补间这次尚未绘制的位移, 又滑成一片。两帧足以覆盖一次绘制。
+  window.requestAnimationFrame(() => {
+    // 先注册解除链再启动淡入: 淡入万一抛出, 置位也不会永久留在 true 上 —— 那会让
+    // 之后**所有**翻页都失去滑动过渡。
+    window.requestAnimationFrame(() => {
+      // 期间又发生一次跳变时, 由那次(更新的 token)负责解除, 这里让路。
+      if (token === horizontalJumpToken) horizontalJumpInProgress.value = false
+    })
+    // 淡入推迟到这一拍: 换章的分页是异步重建的, 若在索引变化的那一刻就开动画, 等浏览器
+    // 真正绘出首帧时它已经跑掉一段, 短促的淡入只剩一个看不见的尾巴。放在这里, 首帧
+    // 绘制时 opacity 恰好从 0 开始, 而新章的页数组也已就位(重建在微任务里完成)。
+    if (fade) playPageJumpFade()
+  })
+}
+
+/** 索引**一次跨过很多页**时不做长距离滑动。
+ *
+ *  滑动过渡的时长取自「动画时长」, 与这次跨了多少页无关: 步长 ±1 是正常翻页, 而一次
+ *  跨过很多页时, 同一个时长里就会**飞速滑过一整章** —— 用户看到的正是"快速翻过了很多页"。
+ *  这类跳变一律瞬时定位, 逐页翻(±1)不受影响。
+ *
+ *  注意**换章不能只靠这里的差值判断**: 本章只有 2 页时末页索引是 1, 清 0 的差值恰好
+ *  为 1 会落进下面的 `<= 1` 盲区, 所以换章由 store.currentIndex 的 watcher 显式置位,
+ *  淡入也只在那边给。 */
+watch(horizontalPageIndex, (next, previous) => {
+  if (!isHorizontalPageMode.value) return
+  if (Math.abs(next - previous) <= 1) return
+  beginHorizontalJump(false)
+  // flush 必须是 sync: 置位要早于任何一次渲染读取 horizontalPageTransitionDuration,
+  // 否则这次跳变已经按旧时长(«动画时长», 默认 300ms)绘制出去, 大跨度滑动照样发生。
+  // pre(默认) 与渲染 effect 的执行先后取决于两边 id, 不足以依赖。
+}, { flush: 'sync' })
+
 const horizontalPageTransitionDuration = computed(() => {
+  // 大跨度跳变(跨章等)瞬时到位, 不做滑动 —— 见上方 watch。
+  if (horizontalJumpInProgress.value) return '0ms'
   const duration = Number(config.value.animateDuration) || 0
   if (duration <= 0) return '0ms'
   return `${duration}ms`
@@ -1204,6 +1280,7 @@ const {
   syncContinuousToStoreState,
   loadContinuousNext,
   loadContinuousPrev,
+  preloadContinuousAhead,
   armPreviousAutoLoad,
   getContinuousSections,
   scrollToContinuousChapter,
@@ -1280,7 +1357,6 @@ function pageBackward() {
   if (container.scrollTop <= 10) {
     prevChapter()
     return
-  preloadContinuousAhead,
   }
   scrollPageBy(container, -step)
 }
@@ -1330,6 +1406,11 @@ function applyPendingPrevChapterLanding(): boolean {
   // 还不能兑现(正文没到/页数还是旧章的): 保留意图, 让调用方继续走默认逻辑。
   if (landing === null) return false
   clearPendingPrevChapterLanding()
+  // 落位也是换章, 而且页数少的章节会落进按差值判断的盲区(上一章只有 2 页时索引 0→1,
+  // 差值恰好为 1)。这里显式置位, 保证这次跳变同样瞬时到位。
+  // 不重复淡入: 本次换章已经在 currentIndex 的 watcher 里起过一次淡入, 再起一次会让
+  // 画面淡两次。
+  beginHorizontalJump(false)
   horizontalPageIndex.value = landing
   syncHorizontalPageState()
   return true
@@ -3264,6 +3345,11 @@ watch(() => config.value.readMethod, async () => {
 watch(() => store.currentIndex, () => {
   loadedReaderImageSizes.clear()
   if (!isHorizontalPageMode.value) return
+  // 换章必须先置位, **不能**只靠上面那个按差值判断的 watch: 这里是"换章"这个事实的
+  // 唯一权威信号, 而差值不可靠 —— 本章只有 2 页时末页索引是 1, 清 0 的差值恰好为 1,
+  // 会被它的 `<= 1` 判成普通翻页, 于是画面仍用「动画时长」从第 2 页滑回第 1 页
+  // (方向与用户按的"下一页"相反), 再硬切到新章首页 —— 不连贯只是换了形态。
+  beginHorizontalJump(true)
   resetHorizontalPagePosition()
   void rebuildHorizontalPages().then(applyPendingPrevChapterLanding)
   updateHorizontalEndState()
@@ -3321,6 +3407,12 @@ watch(() => store.currentIndex, async () => {
   }
   if (!isContinuousMode.value && config.value.enablePreload) {
     store.preloadAroundChapter(store.currentIndex)
+  }
+  // 连续阅读(含隐藏已读)此前完全没接入预加载: 取正文走 buildContinuousChapter,
+  // 既不触发上面的分支, 也不经过 loadChapter, 「预加载」开关在这里等于无效。
+  // 按列表尾部预载下游, 让下一章在滚到之前就已经躺在缓存里。
+  if (isContinuousMode.value && config.value.enablePreload) {
+    preloadContinuousAhead()
   }
   if (isContinuousMode.value && !suppressContinuousSync.value) {
     await syncContinuousToStoreState()
@@ -3408,12 +3500,6 @@ watch(() => store.legadoPositionRestore, (restore) => {
       legadoPositionRestoreTimer = null
     }
     return
-  // 连续阅读(含隐藏已读)此前完全没接入预加载: 取正文走 buildContinuousChapter,
-  // 既不触发上面的分支, 也不经过 loadChapter, 「预加载」开关在这里等于无效。
-  // 按列表尾部预载下游, 让下一章在滚到之前就已经躺在缓存里。
-  if (isContinuousMode.value && config.value.enablePreload) {
-    preloadContinuousAhead()
-  }
   }
   pendingLegadoPageRestore.value = {
     index: restore.index,
