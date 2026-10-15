@@ -3,9 +3,16 @@ import type { ComputedRef, Ref } from 'vue'
 import type { useReaderStore } from '../stores/reader'
 import type { useAppStore } from '../stores/app'
 import { saveReplaceRule } from '../api/replaceRule'
+import { saveBook } from '../api/bookshelf'
 
 type ReaderStore = ReturnType<typeof useReaderStore>
 type AppStore = ReturnType<typeof useAppStore>
+type ReplaceRuleScope = 'book' | 'source' | 'global'
+
+interface SelectionReplaceOptions {
+  replacement?: string
+  isRegex?: boolean
+}
 
 export function useReaderSelection(
   store: ReaderStore,
@@ -110,32 +117,76 @@ export function useReaderSelection(
     }
   }
 
-  async function addSelectionReplaceRule(mode: 'book' | 'source', explicitText = '') {
+  async function addSelectionReplaceRule(
+    mode: ReplaceRuleScope,
+    explicitText = '',
+    options: SelectionReplaceOptions = {},
+  ) {
     const selection = window.getSelection?.()
     const text = explicitText || activeSelectionText.value || selection?.toString().trim() || ''
-    if (!text || !store.book) return
+    if (!text || !store.book) return false
 
     try {
       const scope = mode === 'source'
         ? `source:${store.book.origin}`
-        : `book:${store.book.bookUrl}`
+        : mode === 'global'
+          ? '*'
+          : `book:${store.book.bookUrl}`
+      const scopeLabel = mode === 'source'
+        ? '书源替换'
+        : mode === 'global'
+          ? '全部替换'
+          : '本书替换'
+      const baseName = `${scopeLabel} ${text.slice(0, 20)}`
+      const samePatternRule = store.replaceRules.find(rule => (
+        rule.pattern === text && (rule.scope || '') === scope
+      ))
+      const ruleName = samePatternRule?.name || baseName
+      const nextOrder = samePatternRule?.order
+        ?? Math.max(0, ...store.replaceRules.map(rule => rule.order)) + 1
       await saveReplaceRule({
-        id: 0,
-        name: `${mode === 'source' ? '书源替换' : '本书替换'} ${store.replaceRules.length + 1}`,
+        id: samePatternRule?.id ?? 0,
+        name: ruleName,
         pattern: text,
-        replacement: '',
+        replacement: options.replacement ?? '',
         scope,
         isEnabled: true,
-        isRegex: false,
-        order: store.replaceRules.length + 1,
+        isRegex: options.isRegex ?? false,
+        order: nextOrder,
       })
+      const book = store.book
+      if (book.readConfig?.useReplaceRule === false) {
+        // 必须提交**整本** book: 后端对同一本书是整条覆盖(`list[i] = book.clone()`),
+        // 只传 5 个字段会把用户自定义封面(`customCoverUrl`)等未兜底的字段清空。
+        // 详见 `BookService::save_book` 的合并列表。
+        await saveBook({
+          ...book,
+          readConfig: {
+            ...book.readConfig,
+            useReplaceRule: true,
+          },
+        })
+        book.readConfig = {
+          ...book.readConfig,
+          useReplaceRule: true,
+        }
+      }
       await store.fetchReplaceRules()
       selection?.removeAllRanges()
       activeSelectionText.value = ''
       hideSelectionMenu()
-      appStore.showToast(mode === 'source' ? '已加入书源替换规则' : '已加入本书替换规则', 'success')
+      appStore.showToast(
+        mode === 'source'
+          ? '已加入书源替换规则'
+          : mode === 'global'
+            ? '已加入全局替换规则'
+            : '已加入本书替换规则',
+        'success',
+      )
+      return true
     } catch {
       appStore.showToast('加入替换规则失败', 'error')
+      return false
     }
   }
 

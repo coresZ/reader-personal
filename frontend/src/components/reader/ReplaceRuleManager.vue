@@ -175,9 +175,15 @@ async function handleSave() {
 async function toggleRule(rule: ReplaceRule) {
   try {
     await saveReplaceRule(rule)
+    await store.fetchReplaceRules()
   } catch (e: any) {
     alert(e.message)
-    rule.isEnabled = !rule.isEnabled
+    // saveReplaceRule 可能已在请求发出前就改了本地对象; 用服务端数据恢复真实状态,
+    // 不能简单取反(旧实现失败时反而把用户刚点的开关翻回去)。
+    const restored = await store.fetchReplaceRules()
+    // 恢复也失败时本地开关已不可信, 必须明确告知 —— 否则界面停在一个
+    // 既非"用户点的值"也非"服务端值"的状态上而无人察觉。
+    if (!restored) alert('替换规则状态同步失败，请重新打开本面板确认')
   }
 }
 

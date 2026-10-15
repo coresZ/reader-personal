@@ -35,6 +35,255 @@ const SPLIT_BACKTRACK_BREAKERS = new Set(['，', '。', '；', '！', '？', ','
 const PUNCTUATION_ONLY_CHARS = new Set([...NON_STARTING_PUNCTUATION, '“', '‘', '（', '【', '《', '「', '『', '…', '—'])
 const MAX_PUNCTUATION_BACKTRACK = 12
 
+/** 块容器里可以独占一块的原子媒体。 */
+const MEDIA_ELEMENT_SELECTOR = 'img, svg, math, video, audio, iframe, canvas, object, embed'
+/** `MEDIA_ELEMENT_SELECTOR` 的廉价字符串预检: 命中才值得做一次 DOM 解析。 */
+const MEDIA_HINT_PATTERN = /<(?:img|svg|math|video|audio|iframe|canvas|object|embed)[\s/>]/i
+/** 容器里出现这些结构时整块保留: 拦腰拆开会破坏表格/列表/代码块的完整语义。 */
+const MEDIA_SPLIT_BLOCKER_SELECTOR = 'table, thead, tbody, tr, td, th, pre, ul, ol, li, dl, dt, dd, p, div, section, article, blockquote, h1, h2, h3, h4, h5, h6'
+/** 书源常常把插图的高度写死(如 `height="932"`、`style="height:100%"`)。
+ *  横向分页里页高固定, 这类声明会让图片纵向拉伸并把图后文字挤出可视区。
+ *  这里只清掉**决定高度与定位/缩放的声明**, 书源自己的宽度设置(如 `,{width}` 选项)
+ *  保持原样 —— 宽度超限由 max-width 兜住, 不影响画面比例。 */
+const IMAGE_HEIGHT_STYLE_PROPERTIES = [
+  'height',
+  'min-height',
+  'max-height',
+  'aspect-ratio',
+  'min-width',
+  'position',
+  'top',
+  'right',
+  'bottom',
+  'left',
+  'inset',
+  'float',
+  'object-fit',
+  'transform',
+  'zoom',
+] as const
+/** 段评气泡等行内小图标: 靠 zoom/em 尺寸维持小图, 不能按插图规则缩放。 */
+const INLINE_ICON_IMAGE_SELECTOR = 'img.source-inline-bubble'
+/** 拆块时**不能**复制到新段落的声明。
+ *  尺寸/定位类属性原本作用于整个容器, 复制到分段后每个段落都会撑成一整页,
+ *  页数会成倍膨胀且每页只剩一行字 —— 探针实测这种写法会把 14 页涨到 20 页。 */
+const SPLIT_COPY_BLOCKED_STYLE_PROPERTIES = new Set([
+  'width',
+  'height',
+  'min-width',
+  'min-height',
+  'max-width',
+  'max-height',
+  'aspect-ratio',
+  'position',
+  'top',
+  'right',
+  'bottom',
+  'left',
+  'inset',
+  'float',
+  'display',
+  'flex',
+  'flex-basis',
+  'flex-grow',
+  'flex-shrink',
+  'align-self',
+  'justify-self',
+  'grid-column',
+  'grid-row',
+  'overflow',
+  'overflow-x',
+  'overflow-y',
+  'box-sizing',
+  'object-fit',
+  'transform',
+  'zoom',
+])
+
+/** 按顶层 `;` 切分 CSS 声明串。
+ *
+ *  不能直接 `split(';')`：`url(data:image/svg+xml;base64,…)` 这类值本身含分号，
+ *  切开会产出 `background: url(data:image/svg+xml` 这种残缺声明 —— 结果是拆出的
+ *  段落丢掉整条背景（浏览器忽略非法声明），甚至把 base64 尾巴当成新属性名。
+ *  这里跟踪括号与引号深度，只在深度为 0 处切分。 */
+function splitStyleDeclarations(styleText: string): string[] {
+  const parts: string[] = []
+  let current = ''
+  let depth = 0
+  let quote: string | null = null
+  for (let i = 0; i < styleText.length; i++) {
+    const ch = styleText[i]
+    if (quote) {
+      current += ch
+      if (ch === quote && styleText[i - 1] !== '\\') quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      current += ch
+      continue
+    }
+    if (ch === '(') depth++
+    else if (ch === ')') depth = Math.max(0, depth - 1)
+    else if (ch === ';' && depth === 0) {
+      parts.push(current)
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  parts.push(current)
+  return parts
+}
+
+/** 过滤容器样式: 只保留段落级排版声明(边距/缩进/对齐等)。 */
+function filterBlockStyle(styleText: string): string {
+  return splitStyleDeclarations(styleText)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .filter((item) => {
+      const idx = item.indexOf(':')
+      if (idx <= 0) return false
+      const property = item.slice(0, idx).trim().toLowerCase()
+      return property.length > 0 && !SPLIT_COPY_BLOCKED_STYLE_PROPERTIES.has(property)
+    })
+    .join('; ')
+}
+
+/** 清掉一个元素上会把图片拉高/移出正常流的写法, 让页面高度只由内容决定。
+ *  `width`/`height` **属性**是书源随手写的绝对像素, 一律清掉; CSS 里的 `width`
+ *  (书源 `,{width}` 选项的落地形态) 保留 —— 只给宽度时高度按比例走, 不会变形。 */
+function stripImageLayout(element: Element) {
+  element.removeAttribute('width')
+  element.removeAttribute('height')
+  if (!(element instanceof HTMLElement) && !(element instanceof SVGElement)) return
+  for (const property of IMAGE_HEIGHT_STYLE_PROPERTIES) {
+    element.style.removeProperty(property)
+  }
+}
+
+/** 该元素是否只承载一个媒体(可能带空白文本), 用于判断它是不是纯媒体包裹层。 */
+function hasOnlyImageContent(element: Element) {
+  const elements = Array.from(element.children)
+  if (elements.length !== 1 || !elements[0].matches(MEDIA_ELEMENT_SELECTOR)) return false
+  return !Array.from(element.childNodes).some(
+    (node) => node.nodeType === Node.TEXT_NODE && (node.textContent || '').trim(),
+  )
+}
+
+/** 去掉段落首尾的空 <br>: 媒体边界切出来的碎段若带着分隔用的 <br>, 会多出一行空行。 */
+function trimEdgeBreaks(paragraph: HTMLElement) {
+  let first = paragraph.firstChild
+  while (first instanceof HTMLBRElement) {
+    const next = first.nextSibling
+    first.remove()
+    first = next
+  }
+  let last = paragraph.lastChild
+  while (last instanceof HTMLBRElement) {
+    const previous = last.previousSibling
+    last.remove()
+    last = previous
+  }
+}
+
+/** 把「块容器 + 行内文字 + 媒体」拆成若干段落级块: 媒体独占一块, 前后文字各自成段。
+ *
+ *  横向分页只能按段落内的 token 切分, 撞上块级容器里的媒体时只能整块塞进一页 ——
+ *  图片过高时, 图后的文字就被 `.horizontal-page-content { overflow: hidden }` 裁掉,
+ *  这正是 issue #10。先按媒体边界把容器拆开, 媒体和前后文字就能各自参与分页。
+ *
+ *  只在容器内容是纯行内流时拆分; 结构化内容(表格/列表/嵌套块)保持原样。
+ *  返回 null 表示无需或不适合拆分。 */
+function splitBlockAtMedia(block: Element): string[] | null {
+  if (!block.querySelector(MEDIA_ELEMENT_SELECTOR)) return null
+  if (block.querySelector(MEDIA_SPLIT_BLOCKER_SELECTOR)) return null
+
+  // 容器样式只在能被段落安全继承时带过去, 否则拆出来的每个段落都会撑满整页。
+  const style = filterBlockStyle(block.getAttribute('style') || '')
+  const blocks: string[] = []
+  const flush = (nodes: Node[]) => {
+    if (!nodes.some((node) => node instanceof Element || (node.textContent || '').trim())) return
+    const paragraph = document.createElement('p')
+    nodes.forEach((node) => paragraph.appendChild(node.cloneNode(true)))
+    trimEdgeBreaks(paragraph)
+    if (!paragraph.childNodes.length) return
+    if (style) paragraph.setAttribute('style', style)
+    blocks.push(paragraph.outerHTML)
+  }
+
+  let inline: Node[] = []
+  block.childNodes.forEach((node) => {
+    if (node instanceof Element && node.matches(MEDIA_ELEMENT_SELECTOR)) {
+      flush(inline)
+      inline = []
+      flush([node])
+      return
+    }
+    inline.push(node)
+  })
+  flush(inline)
+
+  return blocks.length > 1 ? blocks : null
+}
+
+/** 给横向分页的媒体元素设一页之内的最大高度。
+ *
+ *  竖长图原本按原始比例铺满行宽, 高度可以远超一屏; 页容器 `overflow: hidden` 会把
+ *  超出部分连同图片下方的文字一起裁掉, 这正是 issue #10 的现象。压上高度上限后,
+ *  浏览器按比例缩小图片, 图后文字也会被切到后续页而不是被裁。
+ *
+ *  高度要**留出余量**(两行), 不能顶满整页: 块自身还有段落外边距, 而分页器按字符
+ *  token 二分切片时, 只要图片能和至少一个字符同页, 剩下的文字才会流到下一页。
+ *  图片顶满一页则一个字符都放不下, 整块会被判成不可切分而塞进同一页, 图后文字
+ *  又被裁掉 —— 修了缩放却留下同一个症状。
+ *
+ *  约束对象与拆块用的媒体集合一致（不止 `img`）: 过高的 `svg`/`video`/`iframe` 等
+ *  会撑满整页并把后续文字裁掉, 与竖长图是同一个症状。
+ *
+ *  测量与渲染必须用同一份结果: 分页器把这里的输出同时喂给测量器和 v-html,
+ *  否则测量高度与实际排版不符, 页边界会再次错位。 */
+function constrainBlockMedia(blockHtml: string, pageHeightPx: number, lineHeightPx: number): string {
+  // 绝大多数块不含媒体: 先用字符串挡掉, 避免每个块都做一次 DOM 解析。
+  if (!MEDIA_HINT_PATTERN.test(blockHtml)) return blockHtml
+  const wrapper = document.createElement('div')
+  wrapper.innerHTML = blockHtml
+  // 显式给出返回类型: `querySelectorAll` 默认返回 `Element`, 而 `style` 由 lib.dom
+  // 的 `ElementCSSInlineStyle` 混入提供, `Element` 上没有声明 —— 下面三行会报
+  // TS2339。选择器只命中可替换元素, 它们恰好分属这三个接口, 都实现了该混入。
+  // 这里只是补类型, 运行时对象与改动前完全一致(不做 instanceof 过滤, 免得顺带
+  // 把 `math` 排除在约束之外)。
+  const media = Array.from(
+    wrapper.querySelectorAll<HTMLElement | SVGElement | MathMLElement>(MEDIA_ELEMENT_SELECTOR),
+  )
+  if (!media.length) return blockHtml
+  // 下限兜底: 页面很矮时也别把媒体压得只剩一条缝。
+  const maxHeight = Math.max(pageHeightPx * 0.5, pageHeightPx - lineHeightPx * 2)
+  for (const element of media) {
+    // 段评气泡等行内小图标靠 em 尺寸维持在行内, 不参与插图缩放。
+    if (element.matches(INLINE_ICON_IMAGE_SELECTOR)) continue
+    // 书源常给插图写死布局(如 `style="width:100%;height:100%"`)。页容器高度固定,
+    // 那个 height 会把画面撑满整页并纵向拉伸, 图后文字随即被挤出可视区 —— 而 EPUB
+    // 路径进过清洗器, 这些属性早被剥掉, 所以同样的插图在 EPUB 里是正常的。
+    // 这里先清掉书源的布局声明, 只留下按比例缩放用的两条约束。
+    stripImageLayout(element)
+    element.style.maxWidth = '100%'
+    element.style.maxHeight = `${maxHeight}px`
+    // 兜底: 万一还有别的来源给死了宽高, contain 至少不会把画面压扁。
+    // 只对可替换元素设置: `svg`/`iframe` 用不上该属性, 设了也无害。
+    element.style.objectFit = 'contain'
+
+    // 书源也常把布局写在图片的包裹层上(如 `<div style="height:100%"><img/></div>`)。
+    // 包裹层若只剩图片, 它的 height 同样会把这一格撑满整页, 把图后文字挤出可视区。
+    let ancestor = element.parentElement
+    while (ancestor && ancestor !== wrapper && hasOnlyImageContent(ancestor)) {
+      stripImageLayout(ancestor)
+      ancestor = ancestor.parentElement
+    }
+  }
+  return wrapper.innerHTML
+}
+
 export function useHorizontalPaging(
   store: ReaderStore,
   config: ComputedRef<{ fontSize: number; fontWeight: number; lineHeight: number; pageWidth: number }>,
@@ -52,6 +301,10 @@ export function useHorizontalPaging(
   const horizontalPageStepStyle = computed(() => `${Math.max(1, horizontalPageStep.value)}px`)
   const horizontalPages = ref<string[]>([])
   const isHorizontalAtEnd = ref(false)
+  /** 最近一次分页实际用到的正文快照。换章后 `horizontalPages` 还是**上一章**的
+   *  分页结果, 而 `formattedContent` 已经是新章的 —— 两者不等就说明分页过期。
+   *  搜索跳转要靠它决定"能否直接按现有页定位", 否则会落到上一章的页上。 */
+  let pagedContentSnapshot: string | null = null
 
   /** 最后一页的索引。一屏一页, 所以末页索引就是页数 - 1。 */
   const horizontalLastPageStart = computed(() =>
@@ -208,7 +461,13 @@ export function useHorizontalPaging(
         flushInline()
       } else if (blockTags.has(node.tagName)) {
         flushInline()
-        blocks.push(node.outerHTML)
+        // 块级容器里可能混着行内文字和图片: 先按媒体边界拆开, 图与文字才能分别分页。
+        const split = splitBlockAtMedia(node)
+        if (split) {
+          blocks.push(...split)
+        } else {
+          blocks.push(node.outerHTML)
+        }
       } else {
         inline.push(node)
       }
@@ -268,6 +527,7 @@ export function useHorizontalPaging(
   async function rebuildHorizontalPages() {
     if (!isHorizontalPageMode.value) {
       horizontalPages.value = []
+      pagedContentSnapshot = null
       return
     }
     await nextTick()
@@ -276,10 +536,16 @@ export function useHorizontalPaging(
 
     updateHorizontalMetrics()
 
+    const contentSnapshot = formattedContent.value
     const { innerWidth, pageHeight } = getHorizontalPageMeasure(container)
     const title = (store.currentChapter?.title || '加载中...').trim()
     const titleHtml = `<h1 class="horizontal-flow-title">${escapeHtml(title)}</h1>`
-    const paragraphs = buildHorizontalBlocks()
+    // 媒体高度上限 = 一页可用高度。分页与渲染共用同一份 HTML, 保证测量与实际排版
+    // 一致(见 constrainBlockMedia)。
+    const lineHeightPx = config.value.fontSize * config.value.lineHeight
+    const paragraphs = buildHorizontalBlocks().map((block) =>
+      constrainBlockMedia(block, pageHeight, lineHeightPx),
+    )
 
     const measurer = document.createElement('div')
     measurer.className = 'chapter-text horizontal-page-content'
@@ -457,6 +723,7 @@ export function useHorizontalPaging(
 
     document.body.removeChild(measurer)
     horizontalPages.value = mergedPages
+    pagedContentSnapshot = contentSnapshot
     // 重建后页数可能变少: 夹进有效范围, 否则索引会指向不存在的页(画面停在空白处)。
     horizontalPageIndex.value = Math.max(
       0,
@@ -488,6 +755,11 @@ export function useHorizontalPaging(
     container.scrollTo({ left: 0, behavior: 'auto' })
   }
 
+  /** 当前 `horizontalPages` 是否还是别的内容分出来的页(换章/改排版后重建之前)。 */
+  function isHorizontalPagesStale() {
+    return pagedContentSnapshot !== formattedContent.value
+  }
+
   return {
     horizontalPageIndex,
     horizontalPageStep,
@@ -496,6 +768,7 @@ export function useHorizontalPaging(
     horizontalPages,
     isHorizontalAtEnd,
     horizontalLastPageStart,
+    isHorizontalPagesStale,
     rebuildHorizontalPages,
     updateHorizontalMetrics,
     updateHorizontalEndState,

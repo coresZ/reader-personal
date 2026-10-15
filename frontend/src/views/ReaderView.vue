@@ -314,7 +314,8 @@
         :style="{ top: `${readerContextMenu.top}px`, left: `${readerContextMenu.left}px`, background: chromeTheme.popup, color: chromeTheme.fontColor }"
         @click.stop
       >
-        <button :disabled="!readerContextMenu.text" @click="searchContextSelection">搜索选中内容</button>
+        <button v-if="readerContextMenu.text" @click="searchContextSelection">搜索选中内容</button>
+        <button v-if="readerContextMenu.text" @click="replaceContextSelection">替换</button>
         <button @click="bookmarkContextSelection">加入书签</button>
         <button :disabled="store.currentIndex <= 0 || store.loading" @click="prevChapterFromContextMenu">上一章</button>
         <button :disabled="!store.hasNext || store.loading" @click="nextChapterFromContextMenu">下一章</button>
@@ -324,6 +325,52 @@
         <button @click="refreshFromContextMenu">刷新</button>
       </div>
     </Transition>
+
+    <Teleport to="body">
+      <Transition name="fade">
+        <div
+          v-if="replaceDialog.visible"
+          class="reader-replace-overlay"
+          @click.self="closeReplaceDialog"
+        >
+          <div
+            class="reader-replace-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reader-replace-title"
+            :style="{ background: chromeTheme.popup, color: chromeTheme.fontColor }"
+          >
+            <h3 id="reader-replace-title">替换选中内容</h3>
+            <label class="reader-replace-field">
+              <span>匹配内容</span>
+              <textarea v-model="replaceDialog.pattern" rows="3"></textarea>
+            </label>
+            <label class="reader-replace-field">
+              <span>替换为</span>
+              <textarea v-model="replaceDialog.replacement" rows="3" placeholder="留空则删除"></textarea>
+            </label>
+            <label class="reader-replace-check">
+              <input v-model="replaceDialog.isRegex" type="checkbox">
+              <span>使用正则表达式</span>
+            </label>
+            <div class="reader-replace-field">
+              <span>生效范围</span>
+              <div class="reader-replace-scopes">
+                <button type="button" :class="{ active: replaceDialog.scope === 'book' }" @click="replaceDialog.scope = 'book'">本书</button>
+                <button type="button" :class="{ active: replaceDialog.scope === 'source' }" @click="replaceDialog.scope = 'source'">当前书源</button>
+                <button type="button" :class="{ active: replaceDialog.scope === 'global' }" @click="replaceDialog.scope = 'global'">全部书籍</button>
+              </div>
+            </div>
+            <div class="reader-replace-actions">
+              <button type="button" @click="closeReplaceDialog">取消</button>
+              <button type="button" class="primary" :disabled="replaceDialog.saving || !replaceDialog.pattern.trim()" @click="saveReplaceDialog">
+                {{ replaceDialog.saving ? '保存中...' : '保存' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
 
     <BookDetailModal
       v-model="showBookInfo"
@@ -385,7 +432,7 @@ import type { Book } from '../types'
 
 import ReaderMobileControls from '../components/reader/ReaderMobileControls.vue'
 import SourceBrowserPanel from '../components/SourceBrowserPanel.vue'
-import { useReaderSearch } from '../composables/useReaderSearch'
+import { useReaderSearch, type SearchLocateOptions } from '../composables/useReaderSearch'
 import { useReaderSelection } from '../composables/useReaderSelection'
 import { useHorizontalPaging } from '../composables/useHorizontalPaging'
 import { useContinuousReading } from '../composables/useContinuousReading'
@@ -623,6 +670,14 @@ let readerViewUnmounted = false
 let mounted = false
 let suppressNextTapUntil = 0
 const readerContextMenu = ref({ visible: false, top: 0, left: 0, text: '' })
+const replaceDialog = ref({
+  visible: false,
+  pattern: '',
+  replacement: '',
+  scope: 'book' as 'book' | 'source' | 'global',
+  isRegex: false,
+  saving: false,
+})
 const sourceBrowser = ref<ShowBrowserRequest | null>(null)
 
 function openSourceBrowserPanel(request: ShowBrowserRequest) {
@@ -744,7 +799,7 @@ const {
   jumpToSearchResult,
   handleContentUpdated,
   handlePresentationUpdated,
-} = useReaderSearch(store)
+} = useReaderSearch(store, locateSearchMatch)
 const {
   selectionMenu,
   suppressSelectionCloseUntil,
@@ -1057,6 +1112,7 @@ const {
   horizontalPages,
   isHorizontalAtEnd,
   horizontalLastPageStart,
+  isHorizontalPagesStale,
   rebuildHorizontalPages,
   updateHorizontalMetrics,
   updateHorizontalEndState,
@@ -1087,6 +1143,54 @@ const horizontalPageTransitionDuration = computed(() => {
   if (duration <= 0) return '0ms'
   return `${duration}ms`
 })
+
+/** 把某个搜索命中的高亮定位到视野内 —— 左右分页下就是"换到它所在的那一页"。
+ *
+ *  为什么不能沿用 scrollIntoView: 分页画面由 `.horizontal-pages` 的 transform 加
+ *  页索引驱动, 滚动容器是 overflow: hidden、没有可滚动空间, scrollIntoView 在这里
+ *  是空操作 —— 这就是"左右分页下搜索结果点了不动"的根因。定位必须落到页索引上,
+ *  与位置恢复(Legado 进度)走同一条路径。
+ *
+ *  只有**用户明确跳转**(点结果项/上一条/下一条/回车)才允许改页索引: 换章、改排版
+ *  与逐字输入也会重算匹配, 那些场景改索引会把读者从正在读的位置拽走(关键词在章首
+ *  出现时就是"跳回本章第一页")。见 SearchLocateOptions。
+ *
+ *  换章跳转时 `horizontalPages` 还是上一章的切片, 直接按它定位会把读者送到别章的
+ *  某一页; 所以分页过期就先重建, 再在正确的分页上找页。`target` 为 null 是常规
+ *  情况之一(刚输入关键词时 DOM 里还没有高亮, 高亮要等重建后才出现), 此时只按
+ *  序号定位。 */
+async function locateSearchMatch(
+  target: HTMLElement | null,
+  matchIndex: number,
+  options: SearchLocateOptions,
+) {
+  if (!isHorizontalPageMode.value) {
+    if (options.explicit) target?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    return
+  }
+  // 分页渲染的是快照, 高亮变了就得重建, 否则新关键词在正文里根本没有标记。这一步
+  // 与是否显式跳转无关; 但它只替换页内容, 不改页索引。
+  if (isHorizontalPagesStale()) {
+    await rebuildHorizontalPages()
+    // 重建只换了 horizontalPages 数据, v-for 渲染要等这一拍。
+    await nextTick()
+  }
+  if (!options.explicit) return
+  const container = scrollContainerRef.value
+  if (!container) return
+  // 分页重建会把正文节点整个换掉, 传进来的元素可能已脱离文档; 那种情况下按序号
+  // 取当前 DOM 里同一次命中。分页只做切片, 高亮的先后顺序与搜索结果一致。
+  const marks = container.querySelectorAll<HTMLElement>('.search-highlight')
+  const anchor = target?.isConnected ? target : marks[matchIndex]
+  const page = anchor?.closest('.horizontal-page') as HTMLElement | null
+  if (!page) return
+  const pages = Array.from(container.querySelectorAll('.horizontal-page')) as HTMLElement[]
+  const pageIndex = pages.indexOf(page)
+  if (pageIndex < 0) return
+  horizontalPageIndex.value = clampReaderPageIndex(pageIndex, pages.length)
+  container.scrollTo({ left: 0, behavior: 'auto' })
+  syncHorizontalPageState()
+}
 const {
   continuousChapters,
   continuousLoadingNext,
@@ -2137,6 +2241,47 @@ function searchContextSelection() {
   }
 }
 
+function replaceContextSelection() {
+  const text = readerContextMenu.value.text
+  closeReaderContextMenu()
+  if (text) {
+    replaceDialog.value = {
+      visible: true,
+      pattern: text,
+      replacement: '',
+      scope: 'book',
+      isRegex: false,
+      saving: false,
+    }
+  }
+}
+
+function closeReplaceDialog() {
+  if (replaceDialog.value.saving) return
+  replaceDialog.value.visible = false
+}
+
+async function saveReplaceDialog() {
+  const pattern = replaceDialog.value.pattern.trim()
+  if (!pattern || replaceDialog.value.saving) return
+  replaceDialog.value.saving = true
+  const saved = await addSelectionReplaceRule(replaceDialog.value.scope, pattern, {
+    replacement: replaceDialog.value.replacement,
+    isRegex: replaceDialog.value.isRegex,
+  })
+  replaceDialog.value.saving = false
+  if (saved) {
+    replaceDialog.value.visible = false
+    if (isContinuousMode.value) {
+      syncContinuousChapterHtml()
+    } else if (isHorizontalPageMode.value) {
+      await rebuildHorizontalPages()
+    } else {
+      await nextTick()
+    }
+  }
+}
+
 async function bookmarkContextSelection() {
   const text = readerContextMenu.value.text
   closeReaderContextMenu()
@@ -3145,18 +3290,19 @@ watch(
   },
 )
 
-// 正文或页内搜索变化: 内容换了, 从第一页重新开始。
-watch(
-  [() => store.content, showSearch, searchQuery],
-  () => {
-    loadedReaderImageSizes.clear()
-    if (!isHorizontalPageMode.value) return
-    if (!pendingLegadoPageRestore.value) horizontalPageIndex.value = 0
-    // 跨章回退时正文到达触发的这次重建, 才是"新章分页就绪"的主路径(见
-    // applyPendingPrevChapterLanding); 上面刚把索引清 0, 这里紧接着兑现落位。
-    void rebuildHorizontalPages().then(applyPendingPrevChapterLanding)
-  },
-)
+// 正文换了(换章/原地刷新): 内容不同了, 从第一页重新开始。
+//
+// 页内搜索的高亮虽然也改正文 HTML, 但**不能**跟着一起清索引 —— 打开面板或每敲
+// 一个字都把读者送回本章第一页是 bug。搜索引起的重分页由监听 [showSearch,
+// searchQuery, ...] 的 watch 负责(见下方), 它不动位置; 跳转落位交给 locateSearchMatch。
+watch(() => store.content, () => {
+  loadedReaderImageSizes.clear()
+  if (!isHorizontalPageMode.value) return
+  if (!pendingLegadoPageRestore.value) horizontalPageIndex.value = 0
+  // 跨章回退时正文到达触发的这次重建, 才是"新章分页就绪"的主路径(见
+  // applyPendingPrevChapterLanding); 上面刚把索引清 0, 这里紧接着兑现落位。
+  void rebuildHorizontalPages().then(applyPendingPrevChapterLanding)
+})
 
 watch(() => store.currentIndex, async () => {
   loadSavedReadingPosition()
@@ -3273,6 +3419,11 @@ watch(() => store.legadoPositionRestore, (restore) => {
 watch([showSearch, searchQuery, () => config.value.paragraphSpacing, () => config.value.firstLineIndent, () => config.value.chineseMode, () => store.replaceRules], () => {
   if (isContinuousMode.value) {
     syncContinuousChapterHtml()
+  }
+  // 左右分页渲染的是 horizontalPages 快照, 不像纵向/连续模式那样直接跟随
+  // formattedContent。简繁或净化规则变化后必须重新分页, 否则页面一直显示旧正文。
+  if (isHorizontalPageMode.value) {
+    void rebuildHorizontalPages()
   }
   handlePresentationUpdated()
 })
@@ -3824,6 +3975,111 @@ watch(
 
 .reader-context-menu button:disabled {
   opacity: 0.38;
+}
+
+.reader-replace-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(4px);
+}
+
+.reader-replace-dialog {
+  width: min(420px, 100%);
+  box-sizing: border-box;
+  display: grid;
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+  border-radius: 14px;
+  background: inherit;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+
+.reader-replace-dialog h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.reader-replace-field {
+  display: grid;
+  gap: 7px;
+}
+
+.reader-replace-field > span,
+.reader-replace-check {
+  font-size: 13px;
+}
+
+.reader-replace-field textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  color: inherit;
+  font: inherit;
+  line-height: 1.6;
+}
+
+.reader-replace-field textarea:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.reader-replace-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.reader-replace-scopes,
+.reader-replace-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.reader-replace-scopes button,
+.reader-replace-actions button {
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.reader-replace-scopes button {
+  flex: 1;
+}
+
+.reader-replace-scopes button.active {
+  border-color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 16%, transparent);
+}
+
+.reader-replace-actions {
+  justify-content: flex-end;
+  margin-top: 2px;
+}
+
+.reader-replace-actions .primary {
+  border-color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 18%, transparent);
+}
+
+.reader-replace-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 :deep(.search-highlight) {
