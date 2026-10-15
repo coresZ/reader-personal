@@ -38,8 +38,38 @@ fn find_next_delimiter<'a>(
     let mut brace_depth = 0i32;
     let mut quote: Option<char> = None;
     let mut escaped = false;
+    // `<js>…</js>` 是**不可分割的脚本段**：段内的 `||` / `&&` 是 JS 运算符，段外的
+    // 才是字段组合符。legado `AnalyzeRule.splitSourceRule` 用 `JS_PATTERN` 先把
+    // `<js>` 段整体切成一个 `Mode.Js` 的 `SourceRule`，剩余文本才按 `&&`/`||`/`%%`
+    // 处理。
+    //
+    // 少了这层隔离，该源的 `bookList`
+    // （`<js>…</js>\n.item||$.data.worksList[*]||$.[?(@.alias_id)]`）会因为 JS 段里
+    // 没有 `||`（或者有，被当成普通代码）而把整条规则算作一段，`</js>` 之后的 `||`
+    // 链整个被吞进脚本，「今日限免」分类于是永远 0 本。
+    let mut in_js = false;
 
     for (idx, ch) in rule.char_indices().filter(|(idx, _)| *idx >= from) {
+        // 脚本段内只看结束标签：脚本内容不参与组合符判定。
+        //
+        // 关键是**不要**在段内跟踪引号/括号 —— 书源脚本里常出现模板字符串
+        //（`` `...` ``）和正则（`/a|b/`），它们会让引号状态错位；一旦引号状态在
+        // `</js>` 之后仍是「未闭合」，`||` 的检测就永远走不到，
+        // `.item||$.data.worksList[*]` 这类尾链会被整条吞掉。
+        if in_js {
+            if rule[idx..].starts_with("</js>") {
+                in_js = false;
+            }
+            continue;
+        }
+        if rule[idx..].starts_with("<js>") {
+            in_js = true;
+            // 进入脚本段：外部残留的引号/转义状态作废
+            quote = None;
+            escaped = false;
+            continue;
+        }
+
         if let Some(active_quote) = quote {
             if escaped {
                 escaped = false;

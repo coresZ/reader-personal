@@ -19,8 +19,8 @@ import { getInitialExploreCategoryUrl, isJsExploreUrl, parseExploreCategories } 
  *
  * 与旧实现的根本差异：`exploreUrl` 求值出的不只是一串"分类链接"，还包含
  * **交互控件**（搜索框 / 下拉筛选 / 按钮 / 开关）。这些控件的取值构成
- * `infoMap`，会被送回书源脚本参与求值 —— 少了这一环，聚合类书源（七猫/书山/
- * 墨阅/光遇）的筛选栏与刷新按钮在桌面端根本无法工作。
+ * `infoMap`，会被送回书源脚本参与求值 —— 少了这一环，聚合类书源的筛选栏
+ * 与刷新按钮在桌面端根本无法工作。
  *
  * 所有 JS 都在后端沙盒执行：WebView 里没有 `java` 对象。
  */
@@ -178,7 +178,7 @@ export const useExploreStore = defineStore('explore', () => {
   /**
    * 分类栏的完整渲染序列：**按后端给出的原顺序**保留分组标题与可点分类。
    *
-   * 七猫 7 项里 6 个是「🏆 排行榜」「📚 分类」这样的分组标题、书山 229 项里
+   * 有的源几十项里绝大多数是「🏆 排行榜」「📚 分类」这样的分组标题，
    * 14 个是分组。只渲染可点分类会把它们压成一排，用户看不出分类属于哪一组。
    */
   const categoryItems = computed(() => {
@@ -203,14 +203,27 @@ export const useExploreStore = defineStore('explore', () => {
   /**
    * 拉取分类与控件。
    *
-   * JS 型 exploreUrl 必须在后端求值；纯文本/JSON 型没有控件概念，本地解析即可。
+   * 优先本地解析纯文本/JSON 型（没有 action/chars 概念，省一次 IPC）。但**本地
+   * 解析不出任何分类时必须回退后端** —— 有一类规则没有 `@js:` 前缀却同样不是
+   * 合法 JSON：
+   *
+   *   `[{'title':'我的书架','url':'..','style':{layout_flexGrow: 1}}, ...]`
+   *
+   * 单引号 + 无引号键名（这一类字符串）。`JSON.parse` 抛错后本地只会退回 `::`
+   * 文本切分，结果 0 个分类，界面显示「该源暂无可用的分类」。legado 用 GSON 的
+   * 宽松模式能读，所以手机端正常。后端会把它交给 rquickjs 求值成 JSON。
+   *
+   * 用「解析结果为空」而不是「像不像 JS 字面量」做判据：书源写法千奇百怪，
+   * 启发式规则总会漏；结果为空才回退，既覆盖全部情况，也不给正常书源加 IPC。
    */
   async function loadKinds(source: BookSource): Promise<ExploreKind[]> {
     if (!isJsExploreUrl(source.exploreUrl)) {
-      // 纯文本 / JSON 型：没有 action/chars 概念，本地解析即可，省一次 IPC。
-      return parseExploreCategories(source.exploreUrl).map(
-        (category) => ({ title: category.title, url: category.url, type: 'url' }) satisfies ExploreKind,
-      )
+      const local = parseExploreCategories(source.exploreUrl)
+      if (local.length > 0) {
+        return local.map(
+          (category) => ({ title: category.title, url: category.url, type: 'url' }) satisfies ExploreKind,
+        )
+      }
     }
 
     // 只提交有值的项，避免把空串当作用户选择覆盖书源默认值。
@@ -225,7 +238,7 @@ export const useExploreStore = defineStore('explore', () => {
   /**
    * 用后端回传的默认值补齐 infoMap。
    *
-   * 书源的 exploreUrl 常把"发现页来源=番茄"这类默认值写进 infoMap，后续 action
+   * 书源的 exploreUrl 常把"发现页来源=源甲"这类默认值写进 infoMap，后续 action
    * 依赖这些值；只在本地为空时填，避免覆盖用户已做的选择。
    */
   function applyDefaults(next: ExploreKind[]) {
@@ -279,6 +292,9 @@ export const useExploreStore = defineStore('explore', () => {
         .map((kind) => ({ title: kind.title, url: kind.url ?? '' })),
     )
     if (!firstCategoryUrl) {
+      // 没有可点分类：失效在途的列表请求，否则它回来时会把书推进空列表。
+      booksToken += 1
+      loading.value = false
       activeCategoryUrl.value = ''
       books.value = []
       hasMore.value = false
@@ -355,7 +371,7 @@ export const useExploreStore = defineStore('explore', () => {
    *
    * `java.searchBook(...)` / `java.open('login',...)` / `java.openBook(...)` 是
    * 书源给宿主的**指令** —— 它们本身不产生任何可见效果，必须由 UI 响应。
-   * 少了这一步，书山的「🔍搜索」与「⚙登录」按钮点了会静默无反应。
+   * 少了这一步，书源三的「🔍搜索」与「⚙登录」按钮点了会静默无反应。
    *
    * 有意不做的事：搜索/登录面板由上层（HomeView 等）挂载，这里只把请求写进
    * `pendingIntent` 并返回，避免在 store 里耦合路由与 UI 状态。
@@ -475,7 +491,10 @@ export const useExploreStore = defineStore('explore', () => {
     const sourceChanged = activeSourceUrl.value !== url
     if (sourceChanged) {
       activeSourceUrl.value = url
-      // 切源清空上一个源的控件取值与列表，避免把 A 源的筛选条件带到 B 源。
+      // 切源：先失效在途的列表请求，再清空上一个源的控件取值与列表。
+      // 顺序很重要 —— 令牌自增必须发生在清空之前，否则旧响应可能在两步之间落地。
+      booksToken += 1
+      loading.value = false
       infoMap.value = {}
       books.value = []
       kinds.value = []
@@ -493,7 +512,22 @@ export const useExploreStore = defineStore('explore', () => {
     }
   }
 
+  /**
+   * 书籍列表请求令牌。
+   *
+   * 切源/切分类时自增，在途的响应回来发现令牌不匹配就丢弃。没有这层保护会出现
+   * 「第二个源的发现页显示第一个源的书」：
+   *   A 源列表在途（`loading = true`）→ 用户切到 B 源 → `resetAndFetch` 里的
+   *   `fetchMore` 被 `loading` 挡掉直接返回 → A 源的响应后到，`books.push(...)`
+   *   把 A 的书塞进了 B 源的列表。
+   */
+  let booksToken = 0
+
   async function resetAndFetch() {
+    // 让在途请求失效；同时清掉 loading，否则新源的首次加载会被旧请求的
+    // `loading = true` 挡住（这正是竞态的直接成因）。
+    booksToken += 1
+    loading.value = false
     books.value = []
     page.value = 1
     hasMore.value = true
@@ -504,14 +538,23 @@ export const useExploreStore = defineStore('explore', () => {
   async function fetchMore() {
     if (loading.value || !hasMore.value || !activeSourceUrl.value || !activeCategoryUrl.value) return
 
+    // 快照本次请求的源与分类：响应回来时若已切走，一律丢弃。
+    const token = booksToken
+    const sourceUrl = activeSourceUrl.value
+    const categoryUrl = activeCategoryUrl.value
+    const requestPage = page.value
+
     loading.value = true
     error.value = null
     try {
       const result = await exploreBook({
-        bookSourceUrl: activeSourceUrl.value,
-        ruleFindUrl: activeCategoryUrl.value,
-        page: page.value,
+        bookSourceUrl: sourceUrl,
+        ruleFindUrl: categoryUrl,
+        page: requestPage,
       })
+
+      // 期间用户切了源/分类：本轮结果作废，且不能碰任何共享状态。
+      if (token !== booksToken) return
 
       if (result && result.length > 0) {
         books.value.push(...result)
@@ -520,10 +563,12 @@ export const useExploreStore = defineStore('explore', () => {
         hasMore.value = false
       }
     } catch (err: any) {
+      if (token !== booksToken) return
       error.value = err.message || '加载失败'
       hasMore.value = false
     } finally {
-      loading.value = false
+      // 同理：过期请求不能把 loading 关掉，那会让新源的加载状态错乱。
+      if (token === booksToken) loading.value = false
     }
   }
 

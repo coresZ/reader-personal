@@ -403,13 +403,42 @@ pub fn select_list<'a>(doc: &'a Html, selector: &str) -> Vec<ElementRef<'a>> {
     }
     let parts = split_top_level(selector, &["@"]).parts;
     let Some(first) = parts.first() else { return vec![] };
-    let mut matches = collect_matches(doc, &parse_selector_with_index(first));
+    // 空选择器 = "当前元素自身"（legado `element.select("")` 返回元素自身）。
+    //
+    // 调用方**只在规则里还有提取器时**才该走到这里（`select_text_list` 把
+    // `@href` 拆成 selector="" + extractor="href" 后传空串进来）。完全空的规则
+    // 由调用方提前拦掉 —— 否则 `nextTocUrl` 未配置时传空串会凭空产出元素内容。
+    let mut matches = if first.trim().is_empty() {
+        fragment_root(doc).into_iter().collect()
+    } else {
+        collect_matches(doc, &parse_selector_with_index(first))
+    };
     for part in parts.iter().skip(1) {
         let parsed = parse_selector_with_index(part);
         matches = matches.into_iter()
             .flat_map(|el| collect_matches_from_element(el, &parsed)).collect();
     }
     matches
+}
+
+/// 片段文档的"根元素"：`body` 恰好只有一个元素子节点时返回它。
+///
+/// `parse_document` 会把任意 HTML 片段包成 `html > body > 片段`。当调用方交进来
+/// 的是**单个元素**的 outerHtml（字段级规则就是这么做的），body 的唯一元素子节点
+/// 就是"当前元素"。文档级规则的原点因此不是 `html`，而是这个元素 —— 对齐 legado
+/// `element.select("")` 返回元素自身的语义。
+///
+/// 完整页面（body 有多个子节点）返回 `None`：那种情况下不存在"当前元素"，
+/// 与 legado 里根 document 没有 `href` 一致，避免凭空返回第一个 div。
+fn fragment_root(doc: &Html) -> Option<ElementRef<'_>> {
+    let body_sel = Selector::parse("body").ok()?;
+    let body = doc.select(&body_sel).next()?;
+    let mut children = body.children().filter_map(ElementRef::wrap);
+    let first = children.next()?;
+    if children.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 /// Handle list combination operators
@@ -612,7 +641,13 @@ pub fn select_all_text(doc: &Html, rule: &str) -> Option<String> {
     }
 
     let first_part = parts[0].trim();
-    let roots = collect_matches(doc, &parse_selector_with_index(first_part));
+    // 空选择器 = 当前元素自身，但仅当后面跟着提取器时（`@href` / `@text`）。
+    // 理由同 `select_list`：完全空的规则不该凭空产出元素内容。
+    let roots: Vec<ElementRef<'_>> = if first_part.is_empty() && parts.len() > 1 {
+        fragment_root(doc).into_iter().collect()
+    } else {
+        collect_matches(doc, &parse_selector_with_index(first_part))
+    };
     if roots.is_empty() {
         return None;
     }
@@ -733,6 +768,11 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
     } else {
         (parts[0].clone(), "text")
     };
+    // 完全空的规则直接返回空：不能交给 `select_list`，那里空选择器表示"当前元素
+    // 自身"（`@href` 的形态），会让空规则凭空产出元素内容。
+    if selector.trim().is_empty() && parts.len() == 1 {
+        return vec![];
+    }
     select_list(doc, &selector).into_iter()
         .filter_map(|el| extract_text(&el, extractor)).collect()
 }

@@ -78,6 +78,15 @@ pub struct SourcePanelEntry {
     /// `book` / `chapter` 绑定(JSON), 面板脚本 `writeConfig(chapter, ...)` 需要。
     pub book_json: String,
     pub chapter_json: String,
+    /// 面板内的**二级链接**是否交给系统浏览器打开。
+    ///
+    /// RSS 单 URL 源的面板只托管首屏 HTML(在 `reader` origin 下渲染, 所以能正常
+    /// 显示); 页面里的链接指向上游站点, 若在 iframe 内直接导航, 上游的
+    /// `X-Frame-Options` / CSP `frame-ancestors` 会让 WebView 拒绝渲染 —— 表现为
+    /// **白屏**。
+    ///
+    /// 书源登录面板必须保持 `false`: 登录/注册流程依赖 iframe 内导航。
+    pub external_links: bool,
 }
 
 static SOURCE_PANELS: std::sync::LazyLock<std::sync::Mutex<Vec<(String, SourcePanelEntry)>>> =
@@ -618,6 +627,8 @@ impl BookService {
         let book_ctx = self.js_book_context(user_ns, book_url, "").await.unwrap_or_default();
         let read_config = book_ctx.book.get("readConfig").cloned()
             .and_then(|value| serde_json::from_value(value).ok());
+        // 书架里已有的书名：详情规则取不到名字时用它兜底（见下方说明）。
+        let shelf_name = book_ctx.book.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let (body, url, book_url) = (res.body.clone(), res.url.clone(), book_url.to_string());
         self.run_source_task(user_ns, source, move |source| {
             take_js_logs();
@@ -627,8 +638,39 @@ impl BookService {
             book.read_config = read_config;
             apply_book_read_config_override(&mut book);
             let logs = take_js_logs();
-            if book.name.is_empty() {
-                if let Some(error) = first_js_error(&logs) { return Err(AppError::BadRequest(format!("书籍详情解析失败: {error}"))); }
+
+            // 书名取不到时的兜底与报错策略。
+            //
+            // legado 的 `BookInfo.analyzeBookInfo`（BookInfo.kt:68-73）在详情规则
+            // 拿不到名字时**保留书籍原有名字**，不把整次解析判为失败：
+            //   `if (it.isNotEmpty() && (mCanReName || book.name.isEmpty())) book.name = it`
+            //
+            // 书源的详情规则常在开头做登录态假设，例如该源 `ruleBookInfo.name` 的
+            // 第一行 `result.match(/Ark.CSRF_TOKEN = '([^']+)'/)[1]` —— 未登录时
+            // 抛 `cannot read property of null`，脚本中断、名字为空。此时若直接报
+            // 「详情解析失败」，用户就会「打开详细页就报错」；而目录、正文其实都能
+            // 正常取到（`tocUrl` 是独立字段）。
+            //
+            // 所以：能从书架拿到名字就用它，否则退回 URL 尾段；真的什么都拿不到
+            //（且脚本报错）才提示失败。
+            if book.name.trim().is_empty() {
+                if !shelf_name.trim().is_empty() {
+                    book.name = shelf_name;
+                } else {
+                    // 退回 URL 的**路径末段**（先剥掉 query/fragment 再取最后一段）。
+                    // 顺序反了会拿到 `?dcs=…` 这种查询串、剥完变空串，兜底就失效了。
+                    let without_query = book_url
+                        .split(['?', '#'])
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches('/');
+                    let fallback = without_query.rsplit('/').next().unwrap_or("").to_string();
+                    if !fallback.is_empty() {
+                        book.name = fallback;
+                    } else if let Some(error) = first_js_error(&logs) {
+                        return Err(AppError::BadRequest(format!("书籍详情解析失败: {error}")));
+                    }
+                }
             }
             Ok(book)
         }).await?
@@ -1095,7 +1137,7 @@ impl BookService {
     /// 求值书源的发现页分类（exploreUrl）。
     ///
     /// `info_map` 是发现页控件的当前取值：JS 型 exploreUrl 会读它来决定生成哪些
-    /// 分类（如"发现页来源=番茄"），也会写回默认值。缺省用空 map。
+    /// 分类（如"发现页来源=源甲"），也会写回默认值。缺省用空 map。
     pub fn explore_kinds_with_info(
         &self,
         source: &BookSource,
@@ -1383,7 +1425,7 @@ impl BookService {
                     .fetch_source_url(user_ns, source, url, &source.book_source_url, "")
                     .await?;
                 let (content, js_logs) =
-                    self.parse_content_blocking(user_ns, source, &res, url, None).await?;
+                    self.parse_content_blocking(user_ns, source, &res, url, url, None).await?;
                 let next = self.source_scope(user_ns, source, || self.parser.next_content_url(source, &res.body, &res.url))?;
                 Ok(debug_trace_from(
                     &res,
@@ -1868,6 +1910,7 @@ impl BookService {
         user_ns: &str,
         source: &BookSource,
         res: &FetchResponse,
+        base_url: &str,
         source_key: &str,
         book_ctx: Option<JsBookContext>,
     ) -> Result<(String, Vec<String>), AppError> {
@@ -1875,7 +1918,11 @@ impl BookService {
         let parser = self.parser.clone();
         let source = source.clone();
         let body = res.body.clone();
-        let url = res.url.clone();
+        // legado 里 `baseUrl` 是**章节的绝对 URL**(含 `#item_id` 这类片段), 请求
+        // 之后的真实地址是 `redirectUrl`。把 `res.url` 当 baseUrl 会丢掉片段,
+        // 纯 JS 正文规则(如番茄 APP 源用 `baseUrl.match(/#(\d+)$/)` 取 item_id)
+        // 因此拿不到章节标识。这里优先用调用方给的章节 URL。
+        let url = if base_url.trim().is_empty() { res.url.clone() } else { base_url.to_string() };
         let source_key = source_key.to_string();
         tokio::task::spawn_blocking(move || {
             take_js_logs();
@@ -1994,7 +2041,7 @@ impl BookService {
             // 正文规则里往往会触发书源脚本与段评请求, 这是最耗时的一步
             notify(ContentLoadStage::Parsing);
             let (content, _logs) = match self
-                .parse_content_blocking(user_ns, parse_source, &res, book_url, book_ctx.clone())
+                .parse_content_blocking(user_ns, parse_source, &res, &current_url, book_url, book_ctx.clone())
                 .await
             {
                 Ok(parsed) => parsed,
@@ -2900,6 +2947,35 @@ fn parse_explore_kinds(
         }
     }
 
+    // 无前缀的裸 JS 对象字面量（这一类写法）：
+    //   `[{'title':'我的书架','url':'...','style':{layout_flexGrow: 1}}, ...]`
+    // 单引号 + 无引号键名，不是合法 JSON，`serde_json` 直接拒收。
+    //
+    // legado 用 GSON 解析，而 GSON 的 JsonReader 默认宽松（接受单引号与无引号
+    // 键名），所以手机端能显示。这里改为交给 rquickjs 求值 —— JS 引擎天生就懂
+    // JS 字面量，比拼字符串规则稳。
+    //
+    // 只在严格解析失败后尝试：正常书源走不到这里。求值失败也不报错，继续往下
+    // 走纯文本切分，保持原有兜底行为。
+    if looks_like_js_array_literal(&text) {
+        if let Ok(escaped) = crate::parser::js::eval_explore_kinds(
+            &text,
+            &source.book_source_url,
+            info_map,
+        ) {
+            if let Ok(kinds) = serde_json::from_str::<Vec<ExploreKind>>(escaped.trim()) {
+                let mut kinds: Vec<ExploreKind> = kinds
+                    .into_iter()
+                    .filter(|kind| !kind.title.trim().is_empty())
+                    .collect();
+                if !kinds.is_empty() {
+                    resolve_explore_view_names(source, &mut kinds, info_map);
+                    return Ok(kinds);
+                }
+            }
+        }
+    }
+
     let splitter = regex::Regex::new(r"(&&|\n)+").unwrap();
     Ok(splitter
         .split(&text)
@@ -2983,6 +3059,34 @@ fn normalize_relaxed_explore_json(text: &str) -> String {    let mut normalized 
     }
 
     normalized
+}
+
+/// 判断文本是否"看起来像 JS 数组里的对象字面量"。
+///
+/// 用来决定要不要动用 JS 引擎去宽松解析。判据刻意保守，只认这一种形态：
+/// 整体是 `[...]`，且开头就出现 `{` 与一个带引号的键 —— 即
+/// `[{'title':...}]`。普通文本分类规则（`标题::url&&标题2::url2`）不会命中。
+///
+/// 不命中时保持原有行为（严格 JSON → 宽松 JSON → 纯文本切分），所以这里漏判
+/// 只是少了个优化，不会引入回归。
+fn looks_like_js_array_literal(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return false;
+    }
+    let head = &trimmed[1..trimmed.len().min(64)];
+    let Some(open) = head.find('{') else {
+        return false;
+    };
+    // `{` 之后应当紧跟（可有空白）一个被引号包起来的键名。
+    let after = head[open + 1..].trim_start();
+    let Some(quote) = after.chars().next() else {
+        return false;
+    };
+    if quote != '\'' && quote != '"' {
+        return false;
+    }
+    after[quote.len_utf8()..].contains(quote)
 }
 
 fn parse_window_rate(rate: &str) -> Option<(usize, u64)> {

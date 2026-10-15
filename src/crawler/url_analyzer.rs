@@ -113,6 +113,7 @@ pub fn analyze_url(
             method,
             headers: header_spec.headers,
             body,
+            body_bytes: None,
             retry,
             response_type,
             charset,
@@ -125,11 +126,45 @@ pub fn analyze_url(
     })
 }
 
+/// 解析 URL 的请求选项（legado 的 `url,{...}` 语法）。
+///
+/// 三段式，逐级放宽：
+/// 1. 严格 JSON —— 规范书源走这里。
+/// 2. 转义控制字符后重试 —— 选项里含裸换行/Tab 的。
+/// 3. **交给 JS 引擎求值** —— 选项写成 JS 对象字面量时（单引号键名/值、无引号
+///    键名、尾逗号）。该源的选项就是这一形态：
+///    `{'headers':'{"User-Agent": "..."}'}`，`serde_json` 直接拒收
+///    （`key must be a string`），于是整个分类加载失败、界面只剩 internal error。
+///    legado 用 GSON 的宽松模式能读，所以手机端正常。
+///
+/// 只在两条 JSON 路径都失败后尝试求值，正常书源不受影响；求值失败仍按原样报错。
 fn parse_url_options(options: &str) -> Result<Value, AppError> {
     let trimmed = options.trim();
+    let parsed = serde_json::from_str::<Value>(trimmed)
+        .or_else(|_| serde_json::from_str::<Value>(&escape_control_chars_in_json_strings(trimmed)));
+    if let Ok(value) = parsed {
+        return Ok(value);
+    }
+    if let Some(value) = eval_options_as_js_literal(trimmed) {
+        return Ok(value);
+    }
+    // 三条路都走不通：用严格 JSON 的报错信息，便于定位格式问题。
     serde_json::from_str::<Value>(trimmed)
-        .or_else(|_| serde_json::from_str::<Value>(&escape_control_chars_in_json_strings(trimmed)))
         .map_err(|e| AppError::BadRequest(format!("invalid url options: {}", e)))
+}
+
+/// 把 `{...}` 形式的 JS 对象字面量求值成 JSON。
+///
+/// 判据保守：整体是大括号包裹才尝试，避免把普通字符串丢进 JS 引擎。
+/// 返回值必须是 JSON **对象**，否则视为解析失败（例如字面量求值出个数组）。
+fn eval_options_as_js_literal(trimmed: &str) -> Option<Value> {
+    if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+        return None;
+    }
+    // 括号包裹后求值，避免 `{}` 被当作代码块（那是语句，不产生值）。
+    let escaped = crate::parser::js::eval_js(&format!("({trimmed})"), "", "").ok()?;
+    let value: Value = serde_json::from_str(escaped.trim()).ok()?;
+    value.is_object().then_some(value)
 }
 
 fn escape_control_chars_in_json_strings(input: &str) -> String {
@@ -716,4 +751,71 @@ fn parse_header_token(chars: &[char], index: &mut usize, stop_at_colon: bool) ->
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 规范 JSON 选项走严格解析（最常走的路径）。
+    #[test]
+    fn parses_standard_json_options() {
+        let options = parse_url_options(r#"{"method":"POST","headers":{"A":"B"}}"#).unwrap();
+        assert_eq!(options.get("method").and_then(Value::as_str), Some("POST"));
+        assert_eq!(
+            options.get("headers").and_then(|h| h.get("A")).and_then(Value::as_str),
+            Some("B")
+        );
+    }
+
+    /// 单引号 + 单引号值的 JS 对象字面量（该源的分类 URL 选项）。
+    ///
+    /// `serde_json` 对这种形态报 `key must be a string`。旧实现只有「严格 JSON →
+    /// 转义控制字符」两条路，于是整个分类加载失败，界面只剩 `internal error`。
+    /// legado 用 GSON 宽松模式能读，所以手机端正常。
+    #[test]
+    fn parses_single_quoted_js_object_options() {
+        let options = parse_url_options(
+            r#"{'headers':'{"User-Agent": "Mozilla/5.0"}'}"#,
+        )
+        .expect("单引号 JS 字面量应当可解析");
+
+        // 内层 headers 是「JSON 文本」而非对象 —— 与 legado 行为一致，
+        // 由 headers_from_value 再做一次解析。
+        let raw = options.get("headers").and_then(Value::as_str).unwrap_or_default();
+        let inner: Value = serde_json::from_str(raw).expect("内层应为 JSON 文本");
+        assert_eq!(inner.get("User-Agent").and_then(Value::as_str), Some("Mozilla/5.0"));
+    }
+
+    /// 无引号键名（JS 对象字面量的另一种常见写法）。
+    #[test]
+    fn parses_unquoted_key_js_object_options() {
+        let options = parse_url_options("{method:'POST', retry:3}").expect("无引号键名应当可解析");
+        assert_eq!(options.get("method").and_then(Value::as_str), Some("POST"));
+        assert_eq!(options.get("retry").and_then(Value::as_i64), Some(3));
+    }
+
+    /// 非对象、且非法的输入仍要报错，不能被静默吞掉。
+    #[test]
+    fn rejects_unparsable_options() {
+        let err = parse_url_options("not json at all").unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid url options"),
+            "错误信息应保留原始原因: {err}"
+        );
+    }
+
+    /// 数组字面量不该被当成合法选项对象。
+    #[test]
+    fn rejects_js_array_literal_as_options() {
+        assert!(eval_options_as_js_literal("[1,2,3]").is_none());
+    }
+
+    /// 尾逗号（宽松 JSON 允许、严格 JSON 拒绝）也要能用。
+    #[test]
+    fn parses_trailing_comma_options() {
+        let options = parse_url_options(r#"{"method":"GET","retry":2,}"#);
+        // 严格 JSON 拒绝尾逗号，JS 引擎接受 —— 两者之一成功即可。
+        assert!(options.is_ok(), "尾逗号选项应当可解析");
+    }
 }
