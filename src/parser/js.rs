@@ -17,7 +17,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use reqwest::blocking::Client;
 use rquickjs::context::EvalOptions;
-use rquickjs::function::Func;
+use rquickjs::function::{Func, Opt};
 use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::{json, Value as JsonValue};
 use std::cell::RefCell;
@@ -438,7 +438,7 @@ pub fn eval_explore_action(
 /// - 其余 → 当作 JS 求值（`evalUiJs`），失败或为空则回退 `title`。
 ///
 /// 必须放在后端：某聚合源的筛选控件把 `viewName` 写成 `"'请选择类型'"`，
-/// 而七猫等源会写成一段读 `source.getVariable()` 的脚本 —— 两者都需要沙箱。
+/// 而部分书源会写成一段读 `source.getVariable()` 的脚本 —— 两者都需要沙箱。
 pub fn eval_explore_view_name(
     view_name: &str,
     source_key: &str,
@@ -549,6 +549,32 @@ const JS_PRELUDE: &str = r#"(function (g) {
    'htmlFormat', 'toNumChapter', 'getCache'].forEach(function (n) { wrap(n, 1); });
   ['digestHex', 'digestBase64Str', 'ensureGlobalVariable', 'putCache'].forEach(function (n) { wrap(n, 2); });
   ['HMacHex', 'HMacBase64'].forEach(function (n) { wrap(n, 3); });
+  // `java.hexDecodeToByteArray` / `java.base64DecodeToByteArray`：legado 返回 Rhino
+  // 的 `ByteArray`，脚本按数组用（`.length` / `.slice(start,end)` / 索引），并把它
+  // 当 key/iv 喂给 `createSymmetricCrypto`。宿主以 JSON 数组字符串返回，这里还原成
+  // 真正的数组 —— 该源正文规则正是靠这条链做 AES 解密。
+  ['hexDecodeToByteArray', 'base64DecodeToByteArray'].forEach(function (n) {
+    var f = J[n];
+    if (typeof f !== 'function') return;
+    J[n] = function (v) {
+      try { return JSON.parse(S(f.call(J, S(v)))); } catch (e) { return []; }
+    };
+  });
+  // `createSymmetricCrypto` 的 key/iv 允许是字节数组：转成宿主认识的形式。
+  // (宿主侧 `__sym` 收字符串；数组按 latin1 逐字节还原，保证字节值不被 UTF-8 改写。)
+  function bytesArg(v) {
+    if (v === undefined || v === null) return '';
+    if (typeof v === 'string') return v;
+    var out = '';
+    for (var i = 0; i < v.length; i++) out += String.fromCharCode(v[i] & 0xff);
+    return out;
+  }
+  // 是否为"字节序列"入参: 字符串按原样交给宿主, 数组/TypedArray 才算字节。
+  function isByteSequence(v) {
+    return v !== null && v !== undefined && typeof v !== 'string';
+  }
+  J.__bytesArg = bytesArg;
+  J.__isByteSequence = isByteSequence;
   var timeFormat = J.timeFormat, timeFormatUTC = J.timeFormatUTC, randomInt = J.randomInt, randomString = J.randomString;
   J.timeFormat = function (t) { return timeFormat(Number(t) || 0); };
   J.timeFormatUTC = function (t, f, sh) { return timeFormatUTC(Number(t) || 0, S(f), sh === undefined ? 8 : Number(sh) || 0); };
@@ -688,8 +714,22 @@ const JS_PRELUDE: &str = r#"(function (g) {
   };
 
   function symmetric(t, k, iv) {
-    t = S(t); k = S(k); iv = S(iv);
-    var run = function (op, d, fmt) { return g.__sym(op, t, k, iv, S(d), fmt); };
+    // key/iv/待解密数据都可能是**字节数组**（`hexDecodeToByteArray` /
+    // `base64DecodeToByteArray` / `.slice()` 的结果），也可能是普通字符串。
+    //
+    // 两者在宿主侧都表现为 JS 字符串，必须用额外的标记位把「字节序列」与
+    // 「普通文本」区分开：前者按 latin1 逐字节还原（≥0x80 的字节不能被 UTF-8
+    // 重新编码），后者保持 UTF-8 语义（`café` 这类文本 key 不受影响）。
+    t = S(t);
+    var keyIsBytes = J.__isByteSequence(k), ivIsBytes = J.__isByteSequence(iv);
+    k = J.__bytesArg(k); iv = J.__bytesArg(iv);
+    var run = function (op, d, fmt) {
+      var isBytes = J.__isByteSequence(d) && typeof d.length === 'number';
+      var payload = isBytes ? J.__bytesArg(d) : S(d);
+      // flags: 1=key 是字节序列, 2=iv 是字节序列, 4=载荷是字节序列。
+      var flags = (keyIsBytes ? 1 : 0) | (ivIsBytes ? 2 : 0) | (isBytes ? 4 : 0);
+      return g.__sym(op, t, k, iv, payload, isBytes ? 'raw' : fmt, flags);
+    };
     return {
       encrypt: function (d) { return run('enc', d, 'base64'); },
       encryptBase64: function (d) { return run('enc', d, 'base64'); },
@@ -749,6 +789,39 @@ const JS_PRELUDE: &str = r#"(function (g) {
   // 注意: legado 的 `isUrl` 参数(把结果转成绝对地址)暂未实现, 结果原样返回。
   function wrapElement(snapshot) {
     var s = snapshot || {};
+    // JSONPath 结果(`java.getElements("$.list[*]")`)是**原始 JSON 对象**，不是元素
+    // 快照。legado 的 `getElements` 在 `Mode.Json` 下走
+    // `getAnalyzeByJSonPath(result).getList(rule)`，直接返回 JSON 节点，脚本可以
+    // 直接 `item.title` 取值。
+    //
+    // 这里必须把 JSON 对象的字段原样透传：只返回下面那组方法的话，宿主序列化时
+    // JSON 字段全丢，`build_chapter_from_json` 取 `title` 必然为空 —— 该源目录
+    // 解析出 0 章就是这个原因。
+    //
+    // 判定依据是元素快照的必需字段(`outerHtml`/`innerHtml`)，两个都没有就当成
+    // 原始 JSON 节点。(`tag` 不可靠：JSONPath 结果也可能自带 `tag` 之类的键。)
+    if (s.outerHtml === undefined && s.innerHtml === undefined) {
+      var jsonNode = {};
+      for (var k in s) {
+        if (Object.prototype.hasOwnProperty.call(s, k)) jsonNode[k] = s[k];
+      }
+      // 元素方法是给快照用的；JSON 节点上退化取值，保证脚本两种来源都能跑不报错。
+      jsonNode.text = function () { return S(s.title !== undefined ? s.title : ''); };
+      jsonNode.ownText = jsonNode.text;
+      jsonNode.html = function () { return ''; };
+      jsonNode.outerHtml = function () { return ''; };
+      jsonNode.attr = function (name) {
+        var v = s[S(name)];
+        return v === undefined || v === null ? '' : S(v);
+      };
+      jsonNode.hasAttr = function (name) {
+        return Object.prototype.hasOwnProperty.call(s, S(name));
+      };
+      jsonNode.tagName = function () { return ''; };
+      jsonNode.select = function () { return []; };
+      jsonNode.toString = function () { return JSON.stringify(s); };
+      return jsonNode;
+    }
     var attrs = s.attrs || {};
     return {
       text: function () { return S(s.text); },
@@ -842,13 +915,14 @@ const JS_PRELUDE: &str = r#"(function (g) {
     Integer: { parseInt: function (s) { return parseInt(s, 10); }, valueOf: function (s) { return parseInt(s, 10); } }
   };
   g.Packages = { java: J };
-  // `Packages.org.jsoup.Jsoup` —— Rhino 里 `Packages.<pkg>.<Class>` 的取法。
-  g.Packages.org = g.org;
 
   // Rhino 的 JavaImporter + with(importer) 语法（部分书源 jsLib 顶层使用）。
   // 把传入的包/类展开为实例属性, with 语句按属性名解析裸类名。
   function JavaImporter() {
     var self = this;
+    // `Packages.org.jsoup.Jsoup` 这种"包名+类名同形的对象"要按**类名**注册
+    // (`with (aly) { Jsoup.connect(url) }`), 不能把它的成员平铺成 `connect`/
+    // `parse` —— 那样 `Jsoup` 这个名字就不存在了。给对象标记类名后按类名注册。
     function absorb(value, fallbackName) {
       if (!value) return;
       if (typeof value === 'function') {
@@ -956,9 +1030,9 @@ const JS_PRELUDE: &str = r#"(function (g) {
   }
 
   // `org.jsoup.Jsoup.connect(url)` 链式 HTTP 客户端。legado 源用它做表单提交与
-  // 连通性探测: 「源仓库」订阅源的 header 脚本靠 `Jsoup.connect(url)...execute()`
-  // 逐站测响应耗时, 挑最快的镜像域名。底层复用宿主 `__http` 原语, 因此与书源
-  // 规则共享同一套 header / cookie 与代理设置。
+  // 连通性探测: 聚合类源的 header 脚本靠 `Jsoup.connect(url)...execute()` 逐站测
+  // 响应耗时, 挑最快的镜像域名。底层复用宿主 `__http` 原语, 因此与书源规则共享
+  // 同一套 header / cookie 与代理设置。
   function jsoupConnectionResponse(o) {
     return {
       statusCode: function () { return o.code; },
@@ -1071,7 +1145,6 @@ const JS_PRELUDE: &str = r#"(function (g) {
     parseBodyFragment: function (html) { return Jsoup.parse(html); },
     clean: function (html) { return S(html); }
   };
-
   // 给"包名+类名同形的对象"打上类名标记, 供 `JavaImporter` 按类名注册(见该函数)。
   // 必须**不可枚举**: 否则 `JSON.stringify(Jsoup)` / `for..in` 会把内部标记泄漏
   // 给源脚本, 变成它们从未见过的脏字段。
@@ -1100,6 +1173,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
     }
   };
   // `Packages.org.jsoup.Jsoup` —— Rhino 里 `Packages.<pkg>.<Class>` 的取法。
+  g.Packages.org = g.org;
 
   g.cache = {
     get: function (k) { return g.__store_get(S(k)); },
@@ -1406,6 +1480,18 @@ fn eval_js_inner_with_source(
                 },
             ),
         )?;
+        // 字节级 HTTP: `java.net.URL(...).openConnection()` 形态的脚本要发送原始
+        // 请求体(如 gzip 压缩的注册包)并拿回未解码的响应字节。请求/响应 body 都用
+        // latin1 字符串承载, 每个 char 就是一个字节。
+        let default_headers = source_info.headers.clone();
+        globals.set(
+            "__http_bytes",
+            Func::new(
+                move |method: String, url: String, body: String, headers: String| -> String {
+                    js_http_bytes(&method, &url, &body, &headers, &default_headers).to_string()
+                },
+            ),
+        )?;
         let default_headers = source_info.headers.clone();
         globals.set(
             "__connect",
@@ -1421,9 +1507,12 @@ fn eval_js_inner_with_source(
                  key: String,
                  iv: String,
                  data: String,
-                 format: String|
+                 format: String,
+                 flags: Opt<i64>|
                  -> String {
-                    match symmetric_codec(&op, &transformation, &key, &iv, &data, &format) {
+                    // 位标记见 JS 侧 `symmetric()`: 1=key、2=iv、4=载荷是字节序列。
+                    let flags = flags.0.unwrap_or(0);
+                    match symmetric_codec_with_flags(&op, &transformation, &key, &iv, &data, &format, flags) {
                         Ok(value) => value,
                         Err(e) => {
                             push_js_log(format!("[crypto] {transformation}: {e}"));
@@ -1737,6 +1826,32 @@ fn eval_js_inner_with_source(
                     .unwrap_or_default()
             }),
         )?;
+        // `java.hexDecodeToByteArray` / `java.base64DecodeToByteArray`：返回**字节数组**。
+        //
+        // legado 里这两个方法返回 Rhino 的 `ByteArray`，脚本按数组使用
+        //（`.length`、`.slice(start, end)`、按索引取值）。该源正文规则正是靠它们做
+        // AES 解密：`base64DecodeToByteArray(密文)` → 切出 IV → `hexDecodeToByteArray`
+        // 转 key 字节 → 交给 `createSymmetricCrypto`。
+        //
+        // 宿主以 JSON 数组文本返回（见 `bytes_to_json_array` 对生命周期约束的说明），
+        // JS 侧 `JSON.parse` 还原成普通数组 —— 它同样满足 `.length` / `.slice()` /
+        // 索引三种用法，且能被 `symmetric()` 识别为字节序列（见其 flags 位）。
+        java_obj.set(
+            "hexDecodeToByteArray",
+            Func::new(|input: String| -> String {
+                let bytes = hex::decode(input.trim()).unwrap_or_default();
+                bytes_to_json_array(&bytes)
+            }),
+        )?;
+        java_obj.set(
+            "base64DecodeToByteArray",
+            Func::new(|input: String| -> String {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(input.trim())
+                    .unwrap_or_default();
+                bytes_to_json_array(&bytes)
+            }),
+        )?;
         java_obj.set(
             "htmlFormat",
             Func::new(|input: String| -> String { java_html_format(&input) }),
@@ -1979,7 +2094,9 @@ pub(super) fn symmetric_crypt(
 }
 
 /// `__sym` 原语: 加密时 data 为明文, 按 format(base64/hex) 输出;
-/// 解密时按 format(base64/hex/auto) 解码输入, 输出 UTF-8 文本。
+/// 解密时按 format(base64/hex/auto/raw) 解码输入, 输出 UTF-8 文本。
+///
+/// 全部入参按**文本**（UTF-8）解释。字节序列入参请用 [`symmetric_codec_with_flags`]。
 fn symmetric_codec(
     op: &str,
     transformation: &str,
@@ -1988,26 +2105,70 @@ fn symmetric_codec(
     data: &str,
     format: &str,
 ) -> anyhow::Result<String> {
+    symmetric_codec_with_flags(op, transformation, key, iv, data, format, 0)
+}
+
+/// 带字节标记的 `__sym` 实现。
+///
+/// `flags` 是 JS 侧 `symmetric()` 传来的位标记: 1=key、2=iv、4=载荷是**字节序列**。
+/// 置位的入参按 latin1 逐字节取字节（每个 char 就是一个字节）；未置位的是普通
+/// 文本，按 UTF-8 编码 —— 后者保证 `café` 这类文本 key 不被改写。
+fn symmetric_codec_with_flags(
+    op: &str,
+    transformation: &str,
+    key: &str,
+    iv: &str,
+    data: &str,
+    format: &str,
+    flags: i64,
+) -> anyhow::Result<String> {
     let engine = &base64::engine::general_purpose::STANDARD;
+    let as_bytes = |value: &str, is_bytes: bool| -> Vec<u8> {
+        if is_bytes { latin1_bytes(value) } else { value.as_bytes().to_vec() }
+    };
+    let key_bytes = as_bytes(key, flags & 1 != 0);
+    let iv_bytes = as_bytes(iv, flags & 2 != 0);
     if op == "enc" {
-        let out = symmetric_crypt(true, transformation, key.as_bytes(), iv.as_bytes(), data.as_bytes())?;
+        let out = symmetric_crypt(
+            true,
+            transformation,
+            &key_bytes,
+            &iv_bytes,
+            &as_bytes(data, flags & 4 != 0),
+        )?;
         return Ok(if format == "hex" {
             hex::encode(out)
         } else {
             engine.encode(out)
         });
     }
+    // `raw` 表示调用方已按字节序列还原（每 char 一个字节），直接用；
+    // 其余格式（base64/hex/auto）都是文本编码，仍按文本处理。
     let trimmed = data.trim();
     let is_hex = !trimmed.is_empty()
         && trimmed.len() % 2 == 0
         && trimmed.chars().all(|c| c.is_ascii_hexdigit());
     let bytes = match format {
+        "raw" => latin1_bytes(data),
         "hex" => hex::decode(trimmed)?,
         "auto" if is_hex => hex::decode(trimmed)?,
         _ => engine.decode(trimmed)?,
     };
-    let out = symmetric_crypt(false, transformation, key.as_bytes(), iv.as_bytes(), &bytes)?;
+    let out = symmetric_crypt(false, transformation, &key_bytes, &iv_bytes, &bytes)?;
     Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// 把 JS 侧按 latin1 承载的**字节序列**还原成原始字节：每个 `char` 就是一个字节
+/// （JS 侧用 `String.fromCharCode(byte & 0xff)` 构造，因此正常情况下必然 ≤U+00FF）。
+///
+/// 只有确认入参是字节序列时才可调用（JS 侧 `__sym` 的 flags 位、`raw` 解密格式、
+/// `__http_bytes` 的 body）。普通文本 key 走 `str::as_bytes`（UTF-8）——
+/// 早先按「字符是否全 ≤0xFF」猜测，会把 `café` 这类文本 key 误当成字节序列。
+///
+/// 对超出范围的字符按低 8 位取值（与 JS 侧 `charCodeAt(i) & 0xff` 一致），
+/// 不做断言/panic：入参来自书源脚本，不能让异常输入中断求值。
+fn latin1_bytes(value: &str) -> Vec<u8> {
+    value.chars().map(|c| (c as u32 & 0xFF) as u8).collect()
 }
 
 fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Value<'js>> {
@@ -2143,6 +2304,29 @@ fn java_time_format(timestamp: i64) -> String {
 }
 
 /// legado `java.digestHex(data, algorithm)`: 计算 MD5/SHA-1/SHA-224/SHA-256/SHA-384/SHA-512 摘要(hex)
+/// 把字节序列序列化成 JSON 数组字符串，交给 JS 侧 `JSON.parse` 成普通数组。
+///
+/// legado 的 `java.base64DecodeToByteArray` / `hexDecodeToByteArray` 返回 Rhino 的
+/// `ByteArray`，脚本按数组使用（`.length`、`.slice(start, end)`、按索引取值），
+/// 并把它当 key/iv 传给 `createSymmetricCrypto`。
+///
+/// 这里不直接返回 `TypedArray`：`TypedArray<'js, T>` 对 `'js` **不变**，而宿主函数
+/// 都注册在 `with_reusable_context` 的 `impl FnOnce(Ctx<'_>, bool) -> Result<T>`
+/// 闭包里（`T` 是固定类型），拿不到与 ctx 一致的生命周期。走 JSON 数组既避开这个
+/// 约束，也天然满足 `.length` / `.slice()` / 索引三种用法。
+fn bytes_to_json_array(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 4 + 2);
+    out.push('[');
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&byte.to_string());
+    }
+    out.push(']');
+    out
+}
+
 fn java_digest_hex(input: &str, algorithm: &str) -> String {
     let bytes = input.as_bytes();
     let out = match normalize_digest_name(algorithm).as_str() {
@@ -2538,6 +2722,39 @@ fn js_request(
     default_headers: &[(String, String)],
     options: &JsonValue,
 ) -> JsonValue {
+    js_request_with_bytes(method, url, body, None, headers, default_headers, options, false)
+}
+
+fn latin1_bytes_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| *b as char).collect()
+}
+
+/// `java.net.URL(...).openConnection()` 形态的字节级请求: 请求体按 latin1
+/// 还原成原始字节发送, 响应体按 latin1 原样回传(不解码字符集、不自动解压),
+/// 由脚本自己决定如何解释。
+fn js_http_bytes(
+    method: &str,
+    url: &str,
+    body: &str,
+    headers: &str,
+    default_headers: &[(String, String)],
+) -> JsonValue {
+    let headers = serde_json::from_str::<JsonValue>(headers).unwrap_or(JsonValue::Null);
+    let body = (!body.is_empty()).then(|| latin1_bytes(body));
+    js_request_with_bytes(method, url, None, body, &headers, default_headers, &JsonValue::Null, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn js_request_with_bytes(
+    method: &str,
+    url: &str,
+    body: Option<String>,
+    body_bytes: Option<Vec<u8>>,
+    headers: &JsonValue,
+    default_headers: &[(String, String)],
+    options: &JsonValue,
+    raw_response: bool,
+) -> JsonValue {
     let url = url.trim().to_string();
     if url.is_empty() {
         return json!({ "body": "", "code": 0, "url": "", "headers": {} });
@@ -2574,6 +2791,7 @@ fn js_request(
     merged.retain(|(key, _)| !key.eq_ignore_ascii_case("proxy"));
     let spec = RequestSpec {
         url: request_url, method, headers: merged, body,
+        body_bytes,
         retry: options["retry"].as_u64().unwrap_or(2).min(5) as usize,
         charset: options["charset"].as_str().map(str::to_string),
         response_type: options.get("type").filter(|value| !value.is_null()).map(|value| value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string())),
@@ -2582,18 +2800,33 @@ fn js_request(
     let outcome = run_blocking_http(move || -> anyhow::Result<JsonValue> {
         let http = http?;
         let client = if let Some(proxy) = proxy.as_deref().filter(|v| Some(*v) != http.proxy.as_deref()) {
-            crate::crawler::http_client::build_source_client(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
+            if raw_response {
+                crate::crawler::http_client::build_raw_source_client(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
+            } else {
+                crate::crawler::http_client::build_source_client(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
+            }
+        } else if raw_response {
+            crate::crawler::http_client::build_raw_source_client(http.timeout_secs, http.proxy.as_deref(), http.session.cookies.clone())?
         } else { http.client };
-        let response = JS_HTTP_RUNTIME.block_on(http.session.request(&client, spec, concurrent_rate.as_deref()))?;
+        let response = if raw_response {
+            JS_HTTP_RUNTIME.block_on(http.session.request_raw(&client, spec, concurrent_rate.as_deref()))?
+        } else {
+            JS_HTTP_RUNTIME.block_on(http.session.request(&client, spec, concurrent_rate.as_deref()))?
+        };
         let headers = response.headers.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), json!(v))).collect::<serde_json::Map<_, _>>();
-        Ok(json!({"body":response.body, "code":response.status, "url":response.url, "headers":headers}))
+        let body = if raw_response { latin1_bytes_string(&response.raw_body) } else { response.body };
+        Ok(json!({"body":body, "code":response.status, "url":response.url, "headers":headers}))
     });
     let value = outcome.unwrap_or_else(|e| {
-        push_js_log(format!("[http] 请求失败: {e}"));
+        push_js_log(format!("[http] 请求失败: {e:#}"));
         json!({ "body": "", "code": 0, "url": url, "headers": {} })
     });
     // legado `java.getStrResponse()` 无参时返回"最近一次请求的响应"。
-    LAST_RESPONSE.with(|cell| cell.replace(Some(value.to_string())));
+    // 字节级响应(原始二进制)不是文本 StrResponse, 不覆盖这个槽位; 否则后续
+    // 依赖最近响应的 `loginCheckJs` 会读到无法按行解析的原始字节。
+    if !raw_response {
+        LAST_RESPONSE.with(|cell| cell.replace(Some(value.to_string())));
+    }
     value
 }
 
@@ -2720,6 +2953,9 @@ fn run_panel_request_inner(
 }
 
 /// 面板 `java.createSymmetricCrypto` 的桥实现, 复用书源规则的同一套密码学。
+///
+/// 面板侧 key/iv/data 都来自 `JSON.stringify` 过的字符串参数（只能是文本），
+/// 因此走文本语义（UTF-8），与改造前一致。
 pub fn panel_symmetric_crypto(payload: &JsonValue) -> anyhow::Result<String> {
     let text_of = |key: &str| payload.get(key).and_then(|v| v.as_str()).unwrap_or("");
     symmetric_codec(

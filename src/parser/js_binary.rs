@@ -58,6 +58,15 @@ pub fn run(operation: &str, payload: &Value) -> anyhow::Result<Value> {
             anyhow::ensure!(result.len() <= 64 * 1024 * 1024, "解压内容过大");
             Ok(output(result))
         }
+        // `Packages.java.util.zip.GZIPOutputStream`: 源脚本用它把设备注册包
+        // gzip 压缩后再按自定义头部字节发送。
+        "gzip" => {
+            use std::io::Write;
+            let data = bytes(&payload["data"])?;
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&data)?;
+            Ok(output(encoder.finish()?))
+        }
         _ => anyhow::bail!("不支持字节操作 {operation}"),
     }
 }
