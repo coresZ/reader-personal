@@ -187,6 +187,21 @@ pub(crate) fn build_source_client(timeout_secs: u64, proxy: Option<&str>, jar: A
     build_client_builder(timeout_secs, proxy)?.cookie_provider(jar).build().map_err(Into::into)
 }
 
+/// 与 [`build_source_client`] 相同, 但关闭响应的自动解压。
+///
+/// `java.net.URL(...).openConnection()` 形态的脚本按 Java 语义自行处理
+/// `Content-Encoding`(例如源脚本自己 new GZIPInputStream), 自动解压会把已解压
+/// 的正文再解一次并丢掉原始头部, 因此这条路径必须拿到未解码的字节。
+pub(crate) fn build_raw_source_client(timeout_secs: u64, proxy: Option<&str>, jar: Arc<super::source_session::SourceCookieJar>) -> anyhow::Result<Client> {
+    build_client_builder(timeout_secs, proxy)?
+        .gzip(false)
+        .brotli(false)
+        .deflate(false)
+        .cookie_provider(jar)
+        .build()
+        .map_err(Into::into)
+}
+
 fn build_client_builder(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<reqwest::ClientBuilder> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(timeout_secs))

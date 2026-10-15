@@ -27,6 +27,10 @@ pub struct RequestSpec {
     pub method: HttpMethod,
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
+    /// 原始字节请求体。`java.net.URL(...).openConnection()` 这类 Java 互操作脚本
+    /// 会发送未按字符集重编码的二进制包(如 gzip 注册包)。设置后优先于 `body`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<Vec<u8>>,
     pub retry: usize,
     pub response_type: Option<String>,
     pub charset: Option<String>,
@@ -44,6 +48,7 @@ impl Default for RequestSpec {
             method: HttpMethod::GET,
             headers: Vec::new(),
             body: None,
+            body_bytes: None,
             retry: 2,
             response_type: None,
             charset: None,
@@ -61,6 +66,10 @@ pub struct FetchResponse {
     pub url: String,
     pub status: u16,
     pub body: String,
+    /// 未经字符集解码的原始响应字节。字节级互操作脚本(`java.net.URL`)用它按
+    /// 原始字节解读响应(gzip / 二进制协议),普通文本请求不使用。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_body: Vec<u8>,
     pub content_type: Option<String>,
     pub headers: Vec<(String, String)>,
     pub is_successful: bool,
@@ -118,6 +127,25 @@ pub async fn fetch_with_client(
     request_client: &reqwest::Client,
     req: RequestSpec,
 ) -> anyhow::Result<FetchResponse> {
+    fetch_inner(request_client, req, false).await
+}
+
+/// 字节级请求: 请求体按原始字节发送, 响应体保留原始字节。
+///
+/// 调用方必须使用关闭了自动解压的客户端(见 `build_raw_source_client`),
+/// 否则 `Content-Encoding` 对应的字节在到达这里之前就已经被解压。
+pub async fn fetch_raw_with_client(
+    request_client: &reqwest::Client,
+    req: RequestSpec,
+) -> anyhow::Result<FetchResponse> {
+    fetch_inner(request_client, req, true).await
+}
+
+async fn fetch_inner(
+    request_client: &reqwest::Client,
+    req: RequestSpec,
+    raw: bool,
+) -> anyhow::Result<FetchResponse> {
     if let Some(response) = data_uri_response(&req)? { return Ok(response); }
     let mut last_err: Option<anyhow::Error> = None;
     let max_retries = req.retry;
@@ -140,7 +168,9 @@ pub async fn fetch_with_client(
             builder = builder.header(k, v);
         }
 
-        if let Some(body) = req.body {
+        if let Some(bytes) = req.body_bytes.clone() {
+            builder = builder.body(bytes);
+        } else if let Some(body) = req.body {
             if matches!(req.method, HttpMethod::POST) && !has_content_type {
                 builder = builder.header(
                     reqwest::header::CONTENT_TYPE,
@@ -173,6 +203,9 @@ pub async fn fetch_with_client(
                     })
                     .collect::<Vec<_>>();
                 let bytes = res.bytes().await?;
+                // 只有字节级请求才需要保留原始字节; 文本路径直接解码,
+                // 避免每个响应都多一次整体拷贝。
+                let raw_body = if raw { bytes.to_vec() } else { Vec::new() };
                 let mut body = if req
                     .response_type
                     .as_deref()
@@ -181,7 +214,11 @@ pub async fn fetch_with_client(
                 {
                     hex::encode(&bytes)
                 } else {
-                    decode_body(&bytes, req.charset.as_deref(), content_type.as_deref())
+                    if raw {
+                        String::new()
+                    } else {
+                        decode_body(&bytes, req.charset.as_deref(), content_type.as_deref())
+                    }
                 };
                 if is_xml_response(content_type.as_deref(), &body)
                     && !body.trim_start().starts_with("<?xml")
@@ -195,6 +232,7 @@ pub async fn fetch_with_client(
                         url,
                         status,
                         body,
+                        raw_body,
                         content_type,
                         headers,
                         is_successful,
@@ -243,10 +281,10 @@ pub(crate) fn data_uri_response(req: &RequestSpec) -> anyhow::Result<Option<Fetc
     } else { decoded.into_owned() };
     let content_type = meta.split(';').filter(|part| !part.eq_ignore_ascii_case("base64")).collect::<Vec<_>>().join(";");
     let body = if req.response_type.as_deref().is_some_and(|value| !value.is_empty()) {
-        hex::encode(bytes)
+        hex::encode(&bytes)
     } else { decode_body(&bytes, req.charset.as_deref(), Some(&content_type)) };
     Ok(Some(FetchResponse {
-        url: req.url.clone(), status: 200, body, content_type: Some(content_type),
+        url: req.url.clone(), status: 200, body, raw_body: bytes, content_type: Some(content_type),
         headers: Vec::new(), is_successful: true,
     }))
 }
@@ -302,6 +340,7 @@ impl From<StrResponse> for FetchResponse {
             url: value.url,
             status: value.code,
             body: value.body,
+            raw_body: Vec::new(),
             content_type: None,
             headers: value.headers,
             is_successful: value.is_successful,

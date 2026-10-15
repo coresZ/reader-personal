@@ -325,6 +325,7 @@ async fn login_check_js_sees_str_response_and_reauthenticates_on_401() {
     let res = FetchResponse {
         body: r#"{"code":401,"msg":"40101 未登录"}"#.into(),
         url: format!("{base}/legado/search?key=x"), status: 200,
+        raw_body: Vec::new(),
         headers: vec![], content_type: Some("application/json".into()), is_successful: true,
     };
     let script = source.login_check_js.clone().unwrap();

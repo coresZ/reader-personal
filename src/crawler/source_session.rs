@@ -154,19 +154,40 @@ impl SourceSession {
     }
 
     pub async fn request(&self, client: &reqwest::Client, req: super::fetcher::RequestSpec, rate: Option<&str>) -> anyhow::Result<super::fetcher::FetchResponse> {
+        self.request_with(client, req, rate, false).await
+    }
+
+    /// 字节级请求: 与 [`Self::request`] 相同的限速/串行语义, 但请求体按原始字节
+    /// 发送, 响应体不自动解压。
+    pub async fn request_raw(&self, client: &reqwest::Client, req: super::fetcher::RequestSpec, rate: Option<&str>) -> anyhow::Result<super::fetcher::FetchResponse> {
+        self.request_with(client, req, rate, true).await
+    }
+
+    async fn request_with(&self, client: &reqwest::Client, req: super::fetcher::RequestSpec, rate: Option<&str>, raw: bool) -> anyhow::Result<super::fetcher::FetchResponse> {
+        // 只有最后一步的发送方式随 `raw` 变化, 限速/串行逻辑完全一致:
+        // 用 `send` 收口, 避免在每条提前返回的分支里重复同一个 if/else。
+        macro_rules! send {
+            ($client:expr, $req:expr) => {
+                if raw {
+                    super::fetcher::fetch_raw_with_client($client, $req).await
+                } else {
+                    super::fetcher::fetch_with_client($client, $req).await
+                }
+            };
+        }
         let rate = rate.unwrap_or("").trim();
         if rate.is_empty() || rate == "0" || req.url.starts_with("data:") {
-            return super::fetcher::fetch_with_client(client, req).await;
+            return send!(client, req);
         }
         let (limit, duration, serial) = if let Some((limit, window)) = rate.split_once('/') {
             match (limit.trim().parse::<usize>(), window.trim().parse::<u64>()) {
                 (Ok(limit), Ok(window)) if limit > 0 => (limit, window, false),
-                _ => return super::fetcher::fetch_with_client(client, req).await,
+                _ => return send!(client, req),
             }
         } else {
             match rate.parse::<u64>() {
                 Ok(duration) => (1, duration, true),
-                Err(_) => return super::fetcher::fetch_with_client(client, req).await,
+                Err(_) => return send!(client, req),
             }
         };
         let mut starts = self.request_times.lock().await;
@@ -178,9 +199,12 @@ impl SourceSession {
             tokio::time::sleep_until(*starts.front().unwrap() + window).await;
         }
         starts.push_back(tokio::time::Instant::now());
-        if !serial { drop(starts); return super::fetcher::fetch_with_client(client, req).await; }
+        if !serial {
+            drop(starts);
+            return send!(client, req);
+        }
         // The guard releases even when a cancellable native request is dropped.
-        let response = super::fetcher::fetch_with_client(client, req).await;
+        let response = send!(client, req);
         drop(starts);
         response
     }
