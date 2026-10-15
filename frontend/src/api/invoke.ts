@@ -58,6 +58,7 @@ const COMMAND_BY_PATH: Record<string, string> = {
   '/reader3/readRemoteRssSourceFile': 'read_remote_rss_source_file',
   '/reader3/getRssArticles': 'get_rss_articles',
   '/reader3/getRssContent': 'get_rss_content',
+  '/reader3/openRssSourcePanel': 'open_rss_source_panel',
   '/reader3/getBookmarks': 'get_bookmarks',
   '/reader3/saveBookmark': 'save_bookmark',
   '/reader3/saveBookmarks': 'save_bookmarks',

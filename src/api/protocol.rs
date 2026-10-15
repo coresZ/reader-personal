@@ -332,7 +332,7 @@ fn render_source_panel_page_with_cookie(panel_id: &str, entry: &crate::service::
             panel_url
         ));
     }
-    bridge.push_str(&build_source_panel_bridge_script(panel_id));
+    bridge.push_str(&build_source_panel_bridge_script(panel_id, entry.external_links));
     if let Some(preload) = &entry.preload_js {
         bridge.push_str(&format!("<script>(0,eval)({});</script>", script_string(preload)));
     }
@@ -1272,12 +1272,18 @@ fn is_html_response(content_type: Option<&str>, body: &[u8]) -> bool {
 /// (legado `WebJsExtensions`)。面板里 `java.ajax` 是**同步**调用, 而 Tauri IPC
 /// 是异步的, 因此这里把 bridge 请求发到同源的 `/sourcePanelBridge`, 用同步
 /// `XMLHttpRequest` 取回结果 —— 与 legado 的同步 Java 桥语义一致。
-fn build_source_panel_bridge_script(panel_id: &str) -> String {
+///
+/// `external_links`: 面板内的二级链接是否交给系统浏览器打开(RSS 单 URL 源需要,
+/// 见 `SourcePanelEntry::external_links`)。
+fn build_source_panel_bridge_script(panel_id: &str, external_links: bool) -> String {
     let panel_id_json = script_string(panel_id);
+    let external_links_json = if external_links { "true" } else { "false" };
     format!(
         r#"<script>
 (function () {{
   var panelId = {panel_id_json};
+  // 二级链接是否交给系统浏览器: 见 SourcePanelEntry::external_links 的说明。
+  var externalLinks = {external_links_json};
   var bridgeBase = new URL("/sourcePanelBridge?panelId=" + encodeURIComponent(panelId), window.location.href).href;
   var nativeFetch = window.fetch.bind(window);
   var pageUrl = window.__readerPanelUrl || "";
@@ -1470,6 +1476,21 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
         return;
       }}
       if (!/^https?:$/.test(target.protocol)) return;
+      // RSS 单 URL 源: 首屏 HTML 是我们托管到 reader origin 的, 但页面里的链接
+      // 指向上游站点。在 iframe 内导航过去会被上游的 X-Frame-Options / CSP
+      // frame-ancestors 拒绝渲染 —— 表现为白屏。这类面板把二级链接交给系统浏览器。
+      //
+      // 只拦截"离开当前托管页"的跳转; 面板自身 URL(上面的 isPanelUrl 分支)与
+      // 同文档锚点不受影响。表单提交(GET/POST)也一并交出去, 否则同样白屏。
+      if (externalLinks) {{
+        event.preventDefault();
+        try {{
+          window.open(target.href, "_blank", "noopener");
+        }} catch (error) {{
+          window.location.href = target.href;
+        }}
+        return;
+      }}
       if (!event.cancelable) {{
         startNavigation(event);
         return;
@@ -1496,6 +1517,38 @@ fn build_source_panel_bridge_script(panel_id: &str) -> String {
   // Older webviews may not expose cancellable navigation. The host still
   // invalidates readiness when the frame leaves and verifies the next document.
   window.addEventListener("beforeunload", function () {{ if (!navigating) startNavigation(); }});
+
+  // RSS 单 URL 源的二级链接兜底: `window.navigation` 不可用时(老 WebView)上面的
+  // navigate 拦截不会触发, 只能靠捕获阶段的 click 拦下 <a> 跳转。
+  // 用事件委托而不是改写 href: 页面可能动态插入链接(JS 渲染的列表)。
+  if (externalLinks) {{
+    document.addEventListener("click", function (event) {{
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      var anchor = event.target && event.target.closest ? event.target.closest("a[href]") : null;
+      if (!anchor || anchor.hasAttribute("download")) return;
+      var target = (anchor.getAttribute("target") || "").toLowerCase();
+      if (target === "_blank") return; // 交给浏览器/系统处理
+      var raw = anchor.getAttribute("href") || "";
+      // 这里用单引号比较: 双引号加井号的字面量会提前终止外层的原始字符串。
+      if (!raw || raw.charAt(0) === '#') return;
+      if (/^(mailto|tel|javascript):/i.test(raw)) return;
+      var url;
+      try {{ url = realUrl(raw); }} catch (error) {{ return; }}
+      if (!/^https?:$/.test(url.protocol)) return;
+      // 面板自身 URL(同文档跳转/桥导航)不拦截, 保持原有行为。
+      if (isPanelUrl(url)) return;
+      if (pageUrl) {{
+        var current = new URL(pageUrl);
+        if (current.origin === url.origin && current.pathname === url.pathname && current.search === url.search) return;
+      }}
+      event.preventDefault();
+      try {{
+        window.open(url.href, "_blank", "noopener");
+      }} catch (error) {{
+        window.location.href = url.href;
+      }}
+    }}, true);
+  }}
   ["pushState", "replaceState"].forEach(function (method) {{
     var native = window.history[method];
     window.history[method] = function (state, title, url) {{
@@ -1961,7 +2014,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let source = BookSource {
-            book_source_url: format!("moyue://rapid/{}", uuid::Uuid::new_v4()),
+            book_source_url: format!("custom://rapid/{}", uuid::Uuid::new_v4()),
             header: Some("@js:var v=JSON.parse(source.getVariable()||'{}');JSON.stringify(v.token?{'Authorization':'Bearer '+v.token,'User-Agent':'Legado/3.0'}:{'User-Agent':'Legado/3.0'})".into()),
             ..Default::default()
         };
@@ -2330,12 +2383,12 @@ mod tests {
     #[test]
     fn login_target_preserves_nested_jump_url_query() {
         let target = resolve_proxy_target_url(
-            "https://www.deqixss.com/login.php?jumpurl=https://www.deqixss.com/",
-            "https://www.deqixss.com/",
+            "https://alpha.example.com/login.php?jumpurl=https://alpha.example.com/",
+            "https://alpha.example.com/",
         )
         .unwrap();
-        assert_eq!(target, "https://www.deqixss.com/login.php?jumpurl=https://www.deqixss.com/");
-        assert!(proxy_target_matches_source(&target, "https://www.deqixss.com/"));
+        assert_eq!(target, "https://alpha.example.com/login.php?jumpurl=https://alpha.example.com/");
+        assert!(proxy_target_matches_source(&target, "https://alpha.example.com/"));
     }
 
     #[test]
@@ -2673,9 +2726,60 @@ mod tests {
 
     // ─────────────────── 书源面板 (showBrowser) ───────────────────
 
+    /// RSS 单 URL 源的面板要把二级链接交给系统浏览器。
+    ///
+    /// 背景: RSS 面板只托管**首屏** HTML(在 reader origin 下渲染, 所以能正常显示);
+    /// 页面里的链接指向上游站点, 若在 iframe 内直接导航, 上游的 `X-Frame-Options`
+    /// / CSP `frame-ancestors` 会让 WebView 拒绝渲染 —— 表现为白屏。
+    ///
+    /// 书源登录面板必须保持 `false`: 登录/注册流程依赖 iframe 内导航。
+    #[test]
+    fn panel_bridge_external_links_flag_switches_handling() {
+        let rss = build_source_panel_bridge_script("panel-rss", true);
+        let book = build_source_panel_bridge_script("panel-book", false);
+
+        // 两种面板都要注入标志, 但取值不同。
+        assert!(rss.contains("var externalLinks = true"), "RSS 面板应开启外链跳转");
+        assert!(book.contains("var externalLinks = false"), "书源面板不应改变导航行为");
+
+        // RSS 面板: 两条拦截路径(现代 navigation 事件 + click 兜底)都要有。
+        // 注意断言的是**生成后**的 JS(`{{` 在原始字符串里已折叠为单个 `{`)。
+        assert!(
+            rss.contains("if (externalLinks) {"),
+            "应存在受标志控制的拦截分支"
+        );
+        assert!(
+            rss.contains(r#"addEventListener("click""#),
+            "老 WebView 没有 navigation API, 必须靠 click 兜底"
+        );
+        // 拦截后走系统浏览器(window.open 会命中 Tauri 壳的 on_new_window)。
+        assert!(rss.contains(r#"window.open(target.href, "_blank", "noopener")"#));
+        assert!(rss.contains(r#"window.open(url.href, "_blank", "noopener")"#));
+
+        // click 兜底必须挂在捕获阶段, 否则页面自己的 handler 可能先执行。
+        assert!(
+            rss.contains("}, true);"),
+            "click 监听需为捕获阶段"
+        );
+        // 修饰键/中键点击与 _blank 链接要放行, 避免抢掉浏览器默认行为。
+        assert!(rss.contains("event.button !== 0"));
+        assert!(rss.contains("if (target === \"_blank\") return;"));
+
+        // 书源面板必须保留原有导航逻辑: 登录/注册靠 iframe 内跳转完成。
+        // 标志只控制"是否走外链分支", 不能删掉 else 路径上的原有实现。
+        assert!(
+            book.contains(r#"window.location.assign(proxyUrl(target))"#),
+            "书源面板仍需把跳转代回代理 URL"
+        );
+        assert!(
+            book.contains("submitToProxy(event, target)"),
+            "书源面板的表单提交仍需走代理"
+        );
+    }
+
     #[test]
     fn panel_bridge_script_exposes_legado_api_surface() {
-        let script = build_source_panel_bridge_script("panel-1");
+        let script = build_source_panel_bridge_script("panel-1", false);
 
         // 插件面板依赖的宿主接口 (legado WebJsExtensions)
         for expected in [
@@ -2702,7 +2806,7 @@ mod tests {
     /// 导致面板所有 API 调用无签名 → 书籍信息为空、段评加载不出来)。
     #[test]
     fn panel_bridge_script_declares_crypto_methods() {
-        let script = build_source_panel_bridge_script("panel-1");
+        let script = build_source_panel_bridge_script("panel-1", false);
         for method in [
             "createSymmetricCrypto:",
             "aesEncodeToBase64String:",
@@ -2724,7 +2828,7 @@ mod tests {
     #[test]
     fn panel_bridge_script_does_not_patch_xhr() {
         // 曾经 patch XMLHttpRequest.prototype 导致桥自身的 XHR 也被拦截(自递归)。
-        let script = build_source_panel_bridge_script("panel-1");
+        let script = build_source_panel_bridge_script("panel-1", false);
         assert!(!script.contains("XMLHttpRequest.prototype"));
     }
 
@@ -2787,6 +2891,56 @@ mod tests {
         assert!(
             crate::service::book_service::get_source_panel(oldest).is_none(),
             "最旧面板应被淘汰(按插入顺序, 而非 HashMap 随机序)"
+        );
+    }
+
+    /// RSS 的 `singleUrl` 源(源地址本身就是"一篇文章")复用书源面板的**静态渲染**
+    /// 路径: 后端先抓好 HTML 再登记面板, 因此不查书源表。
+    ///
+    /// 这条用例守住该复用点 —— 面板 HTML 必须带上桥脚本与 `<base>`, 否则面板里的
+    /// 相对资源会以 `reader.localhost` 为基准解析而全部 404。
+    ///
+    /// 另外验证 `external_links` 从面板条目一路传到渲染出的桥脚本: 这正是
+    /// "点二级链接白屏" 的修复开关(上游页面的 X-Frame-Options 会让 iframe 拒绝渲染)。
+    #[test]
+    fn rss_static_panel_renders_bridge_and_base_for_non_book_source() {
+        let page_url = "https://yckceo.vip/";
+        let html = "<html><head><title>源仓库</title></head><body><a href=\"/a\">x</a></body></html>";
+        // 关键: 面板归属留空 —— RSS 源没有书源记录, 走的正是静态渲染分支。
+        // `external_links: true` 与 `open_rss_source_panel` 里的设置一致。
+        let entry = crate::service::book_service::SourcePanelEntry {
+            url: page_url.to_string(),
+            html: html.to_string(),
+            external_links: true,
+            ..Default::default()
+        };
+        let panel_id = crate::service::book_service::register_source_panel(entry.clone());
+
+        let rendered = render_source_panel_page(&panel_id, &entry, page_url, html);
+
+        assert!(
+            rendered.contains("__readerPanelBridgeReady") || rendered.contains("readerPanelBridge"),
+            "面板必须注入桥脚本: {}",
+            rendered.chars().take(200).collect::<String>()
+        );
+        assert!(
+            rendered.contains("<base href"),
+            "必须注入 <base> 让相对资源指回上游站点"
+        );
+        assert!(
+            rendered.contains("yckceo.vip"),
+            "面板 URL 应出现在页面里(桥用它做同源校验与代理拼接)"
+        );
+        // 原页面内容保留(静态渲染不是重写页面, 只是插入桥)。
+        assert!(rendered.contains("源仓库"), "原页面内容应保留");
+        // 外链开关必须随条目进入渲染结果, 否则二级链接仍会在 iframe 内白屏。
+        assert!(
+            rendered.contains("var externalLinks = true"),
+            "RSS 面板渲染结果必须开启外链跳转"
+        );
+        assert!(
+            rendered.contains(r#"addEventListener("click""#),
+            "必须带 click 兜底(老 WebView 无 navigation API)"
         );
     }
 }

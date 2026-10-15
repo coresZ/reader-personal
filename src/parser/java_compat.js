@@ -111,6 +111,49 @@
       getEncoder: function () { return {encodeToString: function (v) { return native('base64Encode', {data:array(v)}); }}; },
       getDecoder: function () { return {decode: function (v) { return native('base64Decode', {text:String(v)}); }}; }
     };
+    // `Packages.java.util.Collections`: 源脚本(如「源仓库」订阅源的 header 脚本)用
+    // `Collections.reverse(list)` 就地反转载荷列表, 缺了它会抛
+    // "cannot read property 'reverse' of undefined" 并中断整段脚本。
+    //
+    // 只交换**索引位置**, 绝不用 `array()` 重建列表: 入参常是 jsoup 包装过的
+    // Elements(元素带 `attr()`/`text()` 方法), 经 `array()` 转换会退化成纯数据,
+    // 之后 `char.attr('href')` 就成了 "not a function"。
+    // 与 Java 一致地返回 undefined 并修改入参。
+    function swapInPlace(list) {
+      var len = list.length >>> 0;
+      for (var i = 0, j = len - 1; i < j; i++, j--) {
+        var tmp = list[i]; list[i] = list[j]; list[j] = tmp;
+      }
+      return len;
+    }
+    var Collections = {
+      reverse: function (list) {
+        if (list === null || list === undefined) throw new TypeError('Collections.reverse: list is null');
+        swapInPlace(list);
+        return undefined;
+      },
+      sort: function (list) {
+        if (list === null || list === undefined) throw new TypeError('Collections.sort: list is null');
+        // 只对可比较的标量列表排序; 同样按索引写回, 保留元素对象本身。
+        var len = list.length >>> 0;
+        var order = [];
+        for (var i = 0; i < len; i++) order.push(list[i]);
+        order.sort(function (a, b) { return a < b ? -1 : a > b ? 1 : 0; });
+        for (var k = 0; k < len; k++) list[k] = order[k];
+        return undefined;
+      },
+      shuffle: function (list) {
+        if (list === null || list === undefined) throw new TypeError('Collections.shuffle: list is null');
+        var len = list.length >>> 0;
+        for (var i = len - 1; i > 0; i--) {
+          var j = Math.floor(Math.random() * (i + 1));
+          var tmp = list[i]; list[i] = list[j]; list[j] = tmp;
+        }
+        return undefined;
+      },
+      emptyList: function () { return []; },
+      singletonList: function (value) { return [value]; }
+    };
     function SecureRandom() {}
     SecureRandom.prototype.nextBytes = function (target) { arraycopy(native('random', {length:target.length}), 0, target, 0, target.length); };
     SecureRandom.prototype.generateSeed = function (length) { return native('random', {length:size(length)}); };
@@ -157,7 +200,7 @@
     types = g.__readerJavaTypes = {
       math:{BigInteger:BigInteger},
       lang:{String:JavaString, System:{currentTimeMillis:function () { return Date.now(); }, arraycopy:arraycopy}, Thread:{sleep:function (ms) { g.__sleep(Number(ms)); }}},
-      util:{Arrays:Arrays, Base64:Base64, zip:{GZIPInputStream:GZIPInputStream}},
+      util:{Arrays:Arrays, Base64:Base64, Collections:Collections, zip:{GZIPInputStream:GZIPInputStream}},
       security:{MessageDigest:MessageDigest, SecureRandom:SecureRandom},
       io:{ByteArrayInputStream:ByteArrayInputStream, ByteArrayOutputStream:ByteArrayOutputStream},
       crypto:{Cipher:Cipher, spec:{SecretKeySpec:SecretKeySpec, IvParameterSpec:IvParameterSpec}}

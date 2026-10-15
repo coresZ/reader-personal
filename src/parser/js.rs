@@ -842,6 +842,8 @@ const JS_PRELUDE: &str = r#"(function (g) {
     Integer: { parseInt: function (s) { return parseInt(s, 10); }, valueOf: function (s) { return parseInt(s, 10); } }
   };
   g.Packages = { java: J };
+  // `Packages.org.jsoup.Jsoup` —— Rhino 里 `Packages.<pkg>.<Class>` 的取法。
+  g.Packages.org = g.org;
 
   // Rhino 的 JavaImporter + with(importer) 语法（部分书源 jsLib 顶层使用）。
   // 把传入的包/类展开为实例属性, with 语句按属性名解析裸类名。
@@ -855,6 +857,13 @@ const JS_PRELUDE: &str = r#"(function (g) {
         return;
       }
       if (typeof value === 'object') {
+        // 显式标记的类名优先(见 jsoup 等的 `__classNames` 注册)。
+        var declared = value.__javaClassName;
+        if (declared) {
+          self[declared] = value;
+          return;
+        }
+        // 其余情况保持既有语义: 包对象按成员展开。
         Object.keys(value).forEach(function (k) { self[k] = value[k]; });
       }
     }
@@ -946,7 +955,99 @@ const JS_PRELUDE: &str = r#"(function (g) {
     return list;
   }
 
+  // `org.jsoup.Jsoup.connect(url)` 链式 HTTP 客户端。legado 源用它做表单提交与
+  // 连通性探测: 「源仓库」订阅源的 header 脚本靠 `Jsoup.connect(url)...execute()`
+  // 逐站测响应耗时, 挑最快的镜像域名。底层复用宿主 `__http` 原语, 因此与书源
+  // 规则共享同一套 header / cookie 与代理设置。
+  function jsoupConnectionResponse(o) {
+    return {
+      statusCode: function () { return o.code; },
+      statusMessage: function () { return ''; },
+      body: function () { return o.body; },
+      charset: function () { return 'UTF-8'; },
+      contentType: function () { return ''; },
+      url: function () { return o.url; },
+      header: function (k) { return o.headers && o.headers[S(k).toLowerCase()] !== undefined ? o.headers[S(k).toLowerCase()] : null; },
+      headers: function () { return o.headers || {}; },
+      hasHeader: function (k) { return !!(o.headers && o.headers[S(k).toLowerCase()] !== undefined); },
+      cookies: function () { return {}; },
+      parse: function () { return Jsoup.parse(o.body); }
+    };
+  }
+  function JsoupConnect(url) {
+    var opts = { url: S(url), method: 'GET', headers: {}, data: {}, body: null };
+    function encodeData(map) {
+      var parts = [];
+      for (var k in map) {
+        if (Object.prototype.hasOwnProperty.call(map, k)) {
+          parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(map[k]));
+        }
+      }
+      return parts.join('&');
+    }
+    var chain = {
+      // 超时/重定向/校验类选项由宿主客户端统一控制(源级超时与代理已生效),
+      // 这里接受调用但不逐项覆盖, 保持与书源规则一致的传输行为。
+      timeout: function () { return chain; },
+      maxBodySize: function () { return chain; },
+      validateTLSCertificates: function () { return chain; },
+      ignoreContentType: function () { return chain; },
+      ignoreHttpErrors: function () { return chain; },
+      followRedirects: function () { return chain; },
+      method: function (m) { opts.method = S(m).toUpperCase(); return chain; },
+      header: function (k, v) { opts.headers[S(k)] = S(v); return chain; },
+      headers: function (map) {
+        if (map) {
+          for (var k in map) {
+            if (Object.prototype.hasOwnProperty.call(map, k)) opts.headers[S(k)] = S(map[k]);
+          }
+        }
+        return chain;
+      },
+      userAgent: function (v) { opts.headers['User-Agent'] = S(v); return chain; },
+      referrer: function (v) { opts.headers['Referer'] = S(v); return chain; },
+      cookie: function (k, v) { opts.headers['Cookie'] = k + '=' + v; return chain; },
+      cookies: function (map) {
+        if (map) {
+          var parts = [];
+          for (var k in map) { if (Object.prototype.hasOwnProperty.call(map, k)) parts.push(k + '=' + map[k]); }
+          if (parts.length) opts.headers['Cookie'] = parts.join('; ');
+        }
+        return chain;
+      },
+      data: function (k, v) {
+        if (k && typeof k === 'object') {
+          for (var n in k) { if (Object.prototype.hasOwnProperty.call(k, n)) opts.data[S(n)] = S(k[n]); }
+        } else {
+          opts.data[S(k)] = S(v);
+        }
+        return chain;
+      },
+      requestBody: function (b) { opts.body = S(b); return chain; },
+      execute: function () {
+        if (typeof g.__http !== 'function') { throw new Error('Jsoup.connect: HTTP 原语不可用'); }
+        var body = opts.body;
+        if (body === null && opts.method === 'POST' && Object.keys(opts.data).length) {
+          body = encodeData(opts.data);
+          if (opts.headers['Content-Type'] === undefined) {
+            opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+          }
+        }
+        var raw = g.__http(opts.method, opts.url, body === null ? '' : body, JSON.stringify(opts.headers));
+        var parsed;
+        try { parsed = JSON.parse(raw); } catch (e) { parsed = { body: '', code: 0, url: '', headers: {} }; }
+        if (parsed === null || typeof parsed !== 'object') parsed = { body: '', code: 0, url: '', headers: {} };
+        if (parsed.headers === undefined || parsed.headers === null) parsed.headers = {};
+        return jsoupConnectionResponse(parsed);
+      },
+      get: function () { return chain.method('GET').execute(); },
+      post: function () { return chain.method('POST').execute(); },
+      head: function () { return chain.method('HEAD').execute(); }
+    };
+    return chain;
+  }
   var Jsoup = {
+    connect: function (url) { return JsoupConnect(url); },
     parse: function (html) {
       // 真实 JSoup 的 `Document.select` 覆盖**整个文档**（含 head/title/meta）。
       // 只取 `body, body *` 会让 `doc.select('title')` / `meta` 恒为空 ——
@@ -971,7 +1072,34 @@ const JS_PRELUDE: &str = r#"(function (g) {
     clean: function (html) { return S(html); }
   };
 
-  g.org = { jsoup: { Jsoup: Jsoup, Elements: function () { return jsoupElements('[]'); }, Element: function () { return null; }, Document: function () { return Jsoup.parse(''); } } };
+  // 给"包名+类名同形的对象"打上类名标记, 供 `JavaImporter` 按类名注册(见该函数)。
+  // 必须**不可枚举**: 否则 `JSON.stringify(Jsoup)` / `for..in` 会把内部标记泄漏
+  // 给源脚本, 变成它们从未见过的脏字段。
+  function tagJavaClassName(target, name) {
+    try {
+      Object.defineProperty(target, '__javaClassName', {
+        value: name, enumerable: false, writable: true, configurable: true
+      });
+    } catch (e) { /* 冻结对象无法打标记时按包对象成员展开处理 */ }
+    return target;
+  }
+  // `JavaImporter(Packages.org.jsoup.Jsoup)` 要按类名 Jsoup 注册。
+  tagJavaClassName(Jsoup, 'Jsoup');
+
+  // `org.jsoup.Connection.Method.HEAD` 这类常量: 源脚本用 `with (JavaImporter(...))`
+  // 后按裸名或 `Connection.Method.X` 传入 `method()`。
+  var JsoupConnection = { Method: { GET: 'GET', POST: 'POST', HEAD: 'HEAD', PUT: 'PUT', PATCH: 'PATCH', DELETE: 'DELETE', OPTIONS: 'OPTIONS', TRACE: 'TRACE' } };
+  tagJavaClassName(JsoupConnection, 'Connection');
+  g.org = {
+    jsoup: {
+      Jsoup: Jsoup,
+      Connection: JsoupConnection,
+      Elements: function () { return jsoupElements('[]'); },
+      Element: function () { return null; },
+      Document: function () { return Jsoup.parse(''); }
+    }
+  };
+  // `Packages.org.jsoup.Jsoup` —— Rhino 里 `Packages.<pkg>.<Class>` 的取法。
 
   g.cache = {
     get: function (k) { return g.__store_get(S(k)); },

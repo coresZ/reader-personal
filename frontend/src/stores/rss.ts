@@ -1,4 +1,4 @@
-﻿import { defineStore } from 'pinia'
+import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { deleteRssSource, deleteRssSources, getRssArticles, getRssContent, getRssSources, saveRssSources } from '../api/rss'
 import type { RssArticle, RssSource } from '../types'
@@ -6,7 +6,11 @@ import { saveRecentReadBook } from '../utils/recentBooks'
 import { toRssSourceDeletePayload } from '../utils/sourceSelection'
 
 type ArticleScope = 'source' | 'group' | 'all'
-type ScopedArticle = RssArticle & { variable?: string }
+type ScopedArticle = RssArticle & {
+  variable?: string
+  /** 该条目是"单 URL 源"的网页入口(源地址本身就是一篇文章), 而非真 feed 文章。 */
+  singleUrlEntry?: boolean
+}
 
 export const useRssStore = defineStore('rss', () => {
   const sources = ref<RssSource[]>([])
@@ -20,6 +24,10 @@ export const useRssStore = defineStore('rss', () => {
   const contentLoading = ref(false)
   const activeArticle = ref<ScopedArticle | null>(null)
   const activeContent = ref('')
+  /** 当前范围是否包含"单 URL 源"(源地址即一篇文章, 点开看网页而非文章列表)。 */
+  const singleUrlMode = ref(false)
+  /** 单 URL 源的地址是否由源里的 JS 求值得到(自动选到可用节点)。 */
+  const singleUrlResolved = ref(false)
 
   const activeSource = computed(() => sources.value.find((item) => item.sourceUrl === activeSourceUrl.value) || null)
   const enabledSources = computed(() => sources.value.filter((source) => source.enabled !== false))
@@ -135,11 +143,19 @@ export const useRssStore = defineStore('rss', () => {
       sortUrl: source.sortUrl || source.sourceUrl,
       page: pageNo,
     })
-    return (res.first || []).map((article) => ({
-      ...article,
-      variable: source.sourceUrl,
-      origin: source.sourceName || article.origin,
-    }))
+    // `singleUrl` 源没有文章列表, 后端只回一条合成条目; 标记它以便逐条区分,
+    // 避免"范围内有单 URL 源"就把真 feed 的文章也当成网页入口(会丢列表/数量/加载更多)。
+    const singleUrl = res.singleUrl === true
+    return {
+      articles: (res.first || []).map((article) => ({
+        ...article,
+        variable: source.sourceUrl,
+        origin: source.sourceName || article.origin,
+        singleUrlEntry: singleUrl || undefined,
+      })),
+      singleUrl,
+      urlEvaluated: res.urlEvaluated === true,
+    }
   }
 
   async function fetchArticles(reset = false) {
@@ -156,7 +172,16 @@ export const useRssStore = defineStore('rss', () => {
     loading.value = true
     try {
       const targets = resolveScopeSources()
-      const chunks = await Promise.all(targets.map((source) => fetchArticlesForSource(source, page.value)))
+      const results = await Promise.all(
+        targets.map((source) => fetchArticlesForSource(source, page.value)),
+      )
+      const chunks = results.map((result) => result.articles)
+      // `singleUrlMode` 只表示"**当前范围里每一条都是网页入口**", 用于决定列表标题等
+      // 整体呈现。混合范围(真 feed + 单 URL 源)必须按条目判断, 否则真 feed 的文章
+      // 会被连坐成网页入口。
+      const allSingleUrl = results.length > 0 && results.every((result) => result.singleUrl)
+      singleUrlMode.value = allSingleUrl
+      singleUrlResolved.value = results.some((result) => result.singleUrl && result.urlEvaluated)
       const list = chunks
         .flat()
         .sort((a, b) => {
@@ -166,7 +191,10 @@ export const useRssStore = defineStore('rss', () => {
         })
 
       articles.value = reset ? list : articles.value.concat(list)
-      hasMore.value = chunks.some((chunk) => chunk.length >= 50)
+      // 单 URL 源没有"下一页", 它的合成条目恒为 1 条, 不能据此认为还有更多。
+      hasMore.value = chunks.some(
+        (chunk) => chunk.length >= 50 && !chunk.every((item) => item.singleUrlEntry),
+      )
 
       if (list.length) {
         page.value += 1
@@ -263,6 +291,8 @@ export const useRssStore = defineStore('rss', () => {
     contentLoading,
     activeArticle,
     activeContent,
+    singleUrlMode,
+    singleUrlResolved,
     fetchSources,
     addSources,
     removeSource,

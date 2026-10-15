@@ -9,6 +9,7 @@ pub struct RssSource {
     pub source_group: Option<String>,
     pub source_comment: Option<String>,
     pub enabled: Option<bool>,
+    pub enabled_cookie_jar: Option<bool>,
     pub concurrent_rate: Option<String>,
     pub header: Option<String>,
     pub login_url: Option<String>,
@@ -28,6 +29,7 @@ pub struct RssSource {
     pub enable_js: Option<bool>,
     pub load_with_base_url: Option<bool>,
     pub custom_order: Option<i32>,
+    pub last_update_time: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

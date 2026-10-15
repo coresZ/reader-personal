@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <div class="rss-view">
     <header class="rss-toolbar">
       <div class="toolbar-top">
@@ -68,10 +68,9 @@
     >
       <aside class="article-list-panel">
         <div class="panel-head">
-          <h2>文章列表</h2>
-          <span>{{ store.articles.length }}</span>
-        </div>
-        <div class="panel-scroll article-list-scroll">
+          <h2>{{ store.singleUrlMode ? '网页入口' : '文章列表' }}</h2>
+          <span v-if="!store.singleUrlMode">{{ store.articles.length }}</span>
+        </div>        <div class="panel-scroll article-list-scroll">
           <div v-if="!store.sources.length" class="empty-box">还没有 RSS 源，先去管理页添加。</div>
           <div v-else-if="!store.activeSourceUrl" class="empty-box">请选择一个 RSS 源。</div>
           <template v-else>
@@ -80,17 +79,29 @@
               v-for="article in store.articles"
               :key="`${article.variable || 'rss'}-${article.link}`"
               class="article-item"
-              :class="{ active: store.activeArticle?.link === article.link && store.activeArticle?.variable === article.variable }"
+              :class="{
+                active: article.singleUrlEntry
+                  ? !!panelRequest && panelSourceUrl === (article.variable || store.activeSourceUrl)
+                  : store.activeArticle?.link === article.link &&
+                    store.activeArticle?.variable === article.variable,
+              }"
               @click="handleOpenArticle(article)"
               @contextmenu.prevent="handleArticleContextMenu($event, article)"
             >
               <div class="article-title">{{ article.title || '无标题' }}</div>
               <div class="article-meta-line">
-                <span>{{ formatRelativeTime(article.pubDate) || '暂无时间' }}</span>
-                <span v-if="article.origin" class="meta-sep">·</span>
-                <span v-if="article.origin">{{ article.origin }}</span>
+                <span v-if="article.singleUrlEntry">点击打开该网页</span>
+                <template v-else>
+                  <span>{{ formatRelativeTime(article.pubDate) || '暂无时间' }}</span>
+                  <span v-if="article.origin" class="meta-sep">·</span>
+                  <span v-if="article.origin">{{ article.origin }}</span>
+                </template>
               </div>
-              <div v-if="article.description" class="article-desc">{{ toPlainPreview(article.description) }}</div>
+              <div v-if="article.singleUrlEntry && article.link" class="article-desc rss-entry-url">{{ article.link }}</div>
+              <div
+                v-else-if="article.description"
+                class="article-desc"
+              >{{ toPlainPreview(article.description) }}</div>
             </button>
             </div>
             <button v-if="store.hasMore && !store.loading" class="load-more-btn" @click="store.fetchArticles()">加载更多</button>
@@ -99,8 +110,40 @@
         </div>
       </aside>
 
-      <article v-if="!isMobileLayout" class="article-content-panel" :class="{ collapsed: !store.activeArticle }">
-        <template v-if="store.activeArticle">
+      <article v-if="!isMobileLayout" class="article-content-panel" :class="{ collapsed: !store.activeArticle && !panelRequest }">
+        <!-- 单 URL 源(legado 语义): 源地址本身就是"一篇文章", 直接内嵌网页。 -->
+        <template v-if="panelRequest">
+          <div class="panel-head">
+            <div class="content-head-main">
+              <h2>{{ store.activeSource?.sourceName || '网页' }}</h2>
+              <div class="content-head-meta">
+                <div class="content-head-origin">{{ panelRequest.url }}</div>
+                <div v-if="store.singleUrlResolved" class="content-head-time">已自动选用可用节点</div>
+                <!-- 页面内的链接会被桥拦下并交给系统浏览器: 在 iframe 内直接导航
+                     会被上游的 X-Frame-Options 拒绝渲染(白屏)。 -->
+                <div class="content-head-time">页面内的链接将在系统浏览器中打开</div>
+              </div>
+            </div>
+            <button class="ghost-btn" @click="reloadPanel" :disabled="panelLoading">重新加载</button>
+          </div>
+          <div class="panel-scroll content-scroll">
+            <div v-if="panelLoading" class="empty-box">正在打开网页…</div>
+            <div v-else-if="panelError" class="empty-box panel-error">
+              <div>{{ panelError }}</div>
+              <button v-if="panelFallbackUrl" class="ghost-btn" @click="openExternally(panelFallbackUrl)">
+                用系统浏览器打开
+              </button>
+            </div>
+            <iframe
+              v-else-if="panelRequest.panelId"
+              class="rss-page-frame"
+              :title="store.activeSource?.sourceName || 'RSS 网页'"
+              :src="`${readerOrigin}/sourcePanel?__readerPanelId=${encodeURIComponent(panelRequest.panelId)}`"
+              sandbox="allow-scripts allow-forms allow-popups allow-modals allow-same-origin"
+            ></iframe>
+          </div>
+        </template>
+        <template v-else-if="store.activeArticle">
           <div class="panel-head">
             <div class="content-head-main">
               <h2>{{ store.activeArticle.title || '正文' }}</h2>
@@ -128,17 +171,24 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useRssStore } from '../stores/rss'
 import { showContextMenu } from '../composables/useContextMenu'
 import { useAppStore } from '../stores/app'
+import { openRssSourcePanel, type RssSourcePanel } from '../api/rss'
+import { readerOrigin } from '../api/scheme'
 import type { RssArticle } from '../types'
 
 const router = useRouter()
 const store = useRssStore()
 const appStore = useAppStore()
 const isMobileLayout = ref(false)
+/** 单 URL 源的内嵌网页面板(由后端抓页面后托管)。 */
+const panelRequest = ref<RssSourcePanel | null>(null)
+const panelLoading = ref(false)
+const panelError = ref('')
+const panelFallbackUrl = ref('')
 
 onMounted(async () => {
   syncViewportMode()
@@ -160,6 +210,108 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('resize', syncViewportMode)
 })
+
+/** 面板对应的源; 用于列表项高亮与切换判断。 */
+const panelSourceUrl = ref('')
+
+/**
+ * 面板请求序号: 快速切换单 URL 源时, 先发的请求可能后返回, 直接写状态会让
+ * 右侧显示上一个源的网页(经典竞态)。只接受最后一次请求的结果。
+ */
+let panelRequestSeq = 0
+
+/**
+ * 当前范围内唯一的"单 URL 条目"(如果有)。
+ *
+ * 混合范围(真 feed + 单 URL 源)里可能有多个单 URL 源, 此时不自动打开面板 ——
+ * 自动打开谁都不合理; 只有**当前源**是单 URL 源时才自动内嵌打开。
+ */
+const singleUrlEntry = computed(() => {
+  if (store.articles.length !== 1) return null
+  const entry = store.articles[0]
+  return entry?.singleUrlEntry ? entry : null
+})
+
+/**
+ * 单 URL 源没有文章列表, 选中源即打开网页(legado 的 singleUrl 语义)。
+ * 真 feed 源仍走原来的"点文章看正文"。
+ */
+watch(
+  // 依赖里必须含 `link`: 两个单 URL 源互相切换时
+  // `singleUrlMode` 与条目数都不变(都是 true / 1 条), 只靠它们无法触发刷新,
+  // 右侧会一直停在上一个源的网页。
+  () => [store.singleUrlMode, store.activeSourceUrl, singleUrlEntry.value?.link || ''] as const,
+  async () => {
+    // 不是"当前源即单 URL 源"时清掉网页面板, 否则右侧会残留旧网页。
+    if (!store.singleUrlMode || !singleUrlEntry.value) {
+      // 递增序号让在途的单 URL 请求作废, 防止它稍后返回又覆盖成网页。
+      panelRequestSeq += 1
+      panelRequest.value = null
+      panelError.value = ''
+      panelFallbackUrl.value = ''
+      panelLoading.value = false
+      panelSourceUrl.value = ''
+      return
+    }
+    if (isMobileLayout.value) return
+    const entry = singleUrlEntry.value
+    if (!entry.link) {
+      // 后端没解析出地址(源地址求值为空且无 sortUrl 兜底)。静默什么都不做会让
+      // 用户以为"点了没反应", 这里明确说明。
+      panelRequest.value = null
+      panelError.value = '该 RSS 源没有可打开的网页地址，请在管理页检查源配置。'
+      panelFallbackUrl.value = ''
+      panelLoading.value = false
+      return
+    }
+    await loadSourcePanel(entry.variable || store.activeSourceUrl, entry.link)
+  },
+)
+
+async function loadSourcePanel(sourceUrl: string, url: string) {
+  if (!sourceUrl) return
+  const seq = ++panelRequestSeq
+  panelLoading.value = true
+  panelError.value = ''
+  panelFallbackUrl.value = ''
+  try {
+    const result = await openRssSourcePanel({ sourceUrl, url })
+    if (seq !== panelRequestSeq) return
+    panelSourceUrl.value = sourceUrl
+    panelRequest.value = result
+    if (result.external) {
+      // 自定义 scheme 无法内嵌, 给出可点击的兜底入口。
+      panelRequest.value = null
+      panelFallbackUrl.value = result.url
+      panelError.value = '该地址需要交给系统处理（自定义协议）。'
+    }
+  } catch (error) {
+    if (seq !== panelRequestSeq) return
+    panelRequest.value = null
+    panelSourceUrl.value = sourceUrl
+    panelFallbackUrl.value = url
+    panelError.value = (error as Error).message || '网页打开失败'
+  } finally {
+    if (seq === panelRequestSeq) panelLoading.value = false
+  }
+}
+
+async function reloadPanel() {
+  const entry = singleUrlEntry.value
+  if (entry?.link) await loadSourcePanel(entry.variable || store.activeSourceUrl, entry.link)
+}
+
+/**
+ * 用系统浏览器打开地址。
+ *
+ * `window.open(..., '_blank')` 会命中 Tauri 壳的 `on_new_window`: 非白名单 host
+ * (RSS 网页都不在白名单)交给 `ShellExecuteW` 打开系统浏览器。自定义 scheme
+ * (如 `snssdk1128://`)同理交给系统处理。
+ */
+function openExternally(url: string) {
+  if (!url) return
+  window.open(url, '_blank', 'noopener')
+}
 
 function goManage() {
   router.push('/rss/manage')
@@ -210,7 +362,24 @@ async function handleReaderSourceChange() {
   }
 }
 
-async function handleOpenArticle(article: RssArticle & { variable?: string }) {
+async function handleOpenArticle(article: RssArticle & { variable?: string; singleUrlEntry?: boolean }) {
+  // 单 URL 源: 点条目就是"打开这个网页", 不抓正文。
+  // 按**条目**判断而非全局模式 —— 混合范围(真 feed + 单 URL 源)里
+  // 真 feed 的文章必须继续走正文提取。
+  if (article.singleUrlEntry) {
+    const sourceUrl = article.variable || store.activeSourceUrl
+    if (!article.link) {
+      appStore.showToast('该 RSS 源没有可打开的网页地址', 'warning')
+      return
+    }
+    if (isMobileLayout.value) {
+      // 移动端布局没有右侧面板区域, 交给系统浏览器。
+      openExternally(article.link)
+      return
+    }
+    if (sourceUrl) await loadSourcePanel(sourceUrl, article.link)
+    return
+  }
   if (isMobileLayout.value) {
     await router.push({
       name: 'rss-article',
@@ -446,6 +615,13 @@ function handleArticleContextMenu(event: MouseEvent, article: RssArticle & { var
   padding-right: 6px;
 }
 
+/* 内嵌网页时不要滚动条和外边距, 让 iframe 铺满。 */
+.content-scroll:has(.rss-page-frame) {
+  padding-right: 0;
+  overflow: hidden;
+  display: flex;
+}
+
 .content-head-main {
   display: flex;
   flex-direction: column;
@@ -536,6 +712,35 @@ function handleArticleContextMenu(event: MouseEvent, article: RssArticle & { var
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+/* 单 URL 源: 列表项显示真实要打开的地址, 单行省略。 */
+.rss-entry-url {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  word-break: break-all;
+  -webkit-line-clamp: 1;
+  font-family: var(--font-mono, monospace);
+}
+
+/* 内嵌网页: 填满正文区, 无内边距, 自身滚动。 */
+.rss-page-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: #fff;
+}
+
+.panel-error {
+  flex-direction: column;
+  gap: 10px;
+}
+
+.panel-error a {
+  color: var(--color-primary);
+  text-decoration: underline;
 }
 
 .content-html {
