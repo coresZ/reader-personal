@@ -715,7 +715,10 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   function processContentForDisplay(text: string) {
-    return convertContent(applyReplaceRules(text))
+    // 与手机端 ContentProcessor 一致: 先简繁转换, 再应用净化替换。
+    // 旧顺序会把替换结果再次交给 OpenCC, 例如「串行 → 序列」又会被 twp→cn
+    // 词表改回「串行」, 表现为替换规则怎么设都无效。
+    return applyReplaceRules(convertContent(text))
   }
 
   const displayContent = computed(() => {

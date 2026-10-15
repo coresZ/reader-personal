@@ -18,15 +18,15 @@
 //   'tw' = 台湾正体   'twp' = 台湾正体 + 台湾用词(phrase)
 //   'hk' = 香港繁体   'hkp' = 香港繁体 + 香港用词
 //   'cn' = 简体(大陆)
-// 两个方向都取**带短语**的配置(twp), 这样:
-//   - 繁→简: 台湾用词一并转成大陆用词(雷射→激光)
-//   - 简→繁: 输出台湾正体用词(激光→雷射), 与阅读繁体书的用户预期一致
-// 代价是简→繁方向要带上 STPhrases(982KB) 与 TWPhrasesRev/TWVariantsRevPhrases。
+// 与手机端 legado 保持一致, 只做字形转换, 不做地区词替换:
+//   - 繁→简: 序列/程序 保持原文, 不会变成 串行/进程
+//   - 简→繁: 输出台湾正体字形(计算机→計算機、头发→頭髮)
+// 不使用 twp 的台湾用词表: 它会把“序列”本地化成“串行”, 这正是 issue #12。
 import * as OpenCC from 'opencc-js/core';
 import * as Locale from 'opencc-js/preset';
 
-const toSimplified = OpenCC.ConverterFactory(Locale.from.twp, Locale.to.cn);
-const toTraditional = OpenCC.ConverterFactory(Locale.from.cn, Locale.to.twp);
+const toSimplified = OpenCC.ConverterFactory(Locale.from.tw, Locale.to.cn);
+const toTraditional = OpenCC.ConverterFactory(Locale.from.cn, Locale.to.tw);
 
 /* ─── HTML 感知的转换 ───
  *

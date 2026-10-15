@@ -7,7 +7,7 @@
 // 引擎演进: 先补了自建字符表(合并前后端两份, 覆盖 21/22 常用字), 但单字映射
 // 原理上处理不了短语与港台用词。现改用 opencc-js(纯 JS 版 OpenCC):
 //   - 短语级: 计算机→計算機、打印机→印表機
-//   - 港台用词: 雷射→激光、列印→打印、光碟→光盘
+//   - 字形优先: 序列/程序保持原词, 不做台湾用词本地化
 //   - 语境: 乾燥→干燥、頭髮→头发
 //
 // 这组测试同时锁住两件事:
@@ -31,17 +31,21 @@ describe('简繁转换: 繁体 → 简体', () => {
     expect(simplified('後爲啓夥屍擡')).toBe('后为启伙尸抬')
   })
 
-  it('短语级: 港台用词转成大陆用词(单字表做不到)', () => {
-    // 这些是台湾用语, 转成大陆用语不是简单的字形替换。
-    expect(simplified('雷射')).toBe('激光')
-    expect(simplified('列印')).toBe('打印')
-    expect(simplified('光碟')).toBe('光盘')
-    expect(simplified('介面')).toBe('界面')
-    expect(simplified('乳酪')).toBe('奶酪')
-    expect(simplified('相容')).toBe('兼容')
-    expect(simplified('滑鼠')).toBe('鼠标')
-    expect(simplified('軟體')).toBe('软件')
-    expect(simplified('資訊')).toBe('信息')
+  it('不做台湾用词本地化(与手机端字形转换一致)', () => {
+    // 这是 issue #12 的直接回归: twp 词表会把「序列」改成「串行」。
+    expect(simplified('序列')).toBe('序列')
+    expect(simplified('程序')).toBe('程序')
+    expect(simplified('序列之争')).toBe('序列之争')
+    // 台湾用词保持原样, 不再被替成大陆用词。
+    expect(simplified('雷射')).toBe('雷射')
+    expect(simplified('列印')).toBe('列印')
+    expect(simplified('光碟')).toBe('光碟')
+    expect(simplified('介面')).toBe('介面')
+    expect(simplified('乳酪')).toBe('乳酪')
+    expect(simplified('相容')).toBe('相容')
+    expect(simplified('滑鼠')).toBe('滑鼠')
+    expect(simplified('軟體')).toBe('软体')
+    expect(simplified('資訊')).toBe('资讯')
   })
 
   it('语境相关: 同一个字在不同词里结果不同', () => {
@@ -76,14 +80,13 @@ describe('简繁转换: 简体 → 繁体', () => {
       .toBe('這是一段簡體中文內容，用來測試轉換。')
   })
 
-  it('短语级: 输出台湾正体用词', () => {
-    // 用的是 twp(台湾正体 + 台湾用词)配置, 所以这些会变成台湾说法。
+  it('输出台湾正体字形, 不替换地区用词', () => {
     expect(traditionalized('计算机')).toBe('計算機')
-    expect(traditionalized('打印机')).toBe('印表機')
-    expect(traditionalized('激光')).toBe('雷射')
-    expect(traditionalized('鼠标')).toBe('滑鼠')
-    expect(traditionalized('软件')).toBe('軟體')
-    expect(traditionalized('信息')).toBe('資訊')
+    expect(traditionalized('打印机')).toBe('打印機')
+    expect(traditionalized('激光')).toBe('激光')
+    expect(traditionalized('鼠标')).toBe('鼠標')
+    expect(traditionalized('软件')).toBe('軟件')
+    expect(traditionalized('信息')).toBe('信息')
     // 「发」的多义由词决定: 头发→頭髮, 发财→發財
     expect(traditionalized('头发')).toBe('頭髮')
   })
@@ -113,7 +116,7 @@ describe('简繁转换: HTML 安全', () => {
     expect(simplified('<p class="繁體類名">文字</p>'))
       .toBe('<p class="繁體類名">文字</p>')
     expect(simplified('<a href="https://example.com/書">連結</a>'))
-      .toBe('<a href="https://example.com/書">链接</a>')
+      .toBe('<a href="https://example.com/書">连结</a>')
     expect(simplified('<img src="a.png" alt="圖片說明">'))
       .toBe('<img src="a.png" alt="圖片說明">')
   })

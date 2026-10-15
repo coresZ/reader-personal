@@ -803,6 +803,52 @@ describe('reader local txt chapters', () => {
   })
 })
 
+describe('reader content processing order', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    const storage = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: vi.fn((key: string) => storage.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
+      removeItem: vi.fn((key: string) => storage.delete(key)),
+      clear: vi.fn(() => storage.clear()),
+    })
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('先简繁转换, 再应用替换规则, 避免净化结果被词表覆盖', async () => {
+    const readerStore = useReaderStore()
+    readerStore.book = {
+      name: '诡秘之主',
+      author: '爱潜水的乌贼',
+      origin: 'test-source',
+      bookUrl: 'https://example.test/book',
+    }
+    readerStore.config.chineseMode = 'simplified'
+    readerStore.replaceRules = [
+      {
+        id: 1,
+        name: '修正序列',
+        pattern: '串行',
+        replacement: '序列',
+        scope: '*',
+        isEnabled: true,
+        isRegex: false,
+        order: 1,
+      },
+    ]
+
+    // 等 watcher 中的动态导入完成, 否则转换器尚未就绪。
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(readerStore.processContentForDisplay('序列')).toBe('序列')
+    expect(readerStore.processContentForDisplay('串行')).toBe('序列')
+  })
+})
+
 describe('reader toc auto refresh', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
