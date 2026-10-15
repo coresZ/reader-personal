@@ -705,6 +705,78 @@ describe('explore source switching race', () => {
   })
 })
 
+// ── 停用书源不进入发现页 ──
+
+describe('explore source enabled filter', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    getBookSourcesMock.mockReset()
+    exploreBookMock.mockReset()
+    getExploreKindsMock.mockReset()
+    runExploreActionMock.mockReset()
+    exploreBookMock.mockResolvedValue([])
+    getExploreKindsMock.mockResolvedValue([])
+    runExploreActionMock.mockResolvedValue(idleOutcome())
+  })
+
+  it('hides disabled sources from the explore source list', async () => {
+    const sourceStore = useSourceStore()
+    sourceStore.sources = [
+      { bookSourceName: '停用源', bookSourceUrl: 'https://off.example', enabled: false, enabledExplore: true, exploreUrl: '/off-list' },
+      { bookSourceName: '启用源', bookSourceUrl: 'https://on.example', enabled: true, enabledExplore: true, exploreUrl: '/on-list' },
+    ]
+    const store = useExploreStore()
+
+    expect(store.exploreSources.map((s) => s.bookSourceName)).toEqual(['启用源'])
+  })
+
+  // `enabled` 是 Option<bool>：没写过该字段（undefined）表示启用。
+  // 判据必须是 `!== false`，用严格 `=== true` 会把这类书源一并隐藏。
+  it('treats a missing enabled flag as enabled', async () => {
+    const sourceStore = useSourceStore()
+    sourceStore.sources = [
+      { bookSourceName: '未设置', bookSourceUrl: 'https://unset.example', enabledExplore: true, exploreUrl: '/unset-list' },
+    ]
+    const store = useExploreStore()
+
+    expect(store.exploreSources.map((s) => s.bookSourceName)).toEqual(['未设置'])
+  })
+
+  // 停用仍然要看 `enabledExplore`：只停用总开关的源不出现，但停用发现页的源
+  // 同样不出现 —— 两个条件都要满足。
+  it('still requires enabledExplore', async () => {
+    const sourceStore = useSourceStore()
+    sourceStore.sources = [
+      { bookSourceName: '启用但无发现', bookSourceUrl: 'https://noexp.example', enabled: true, enabledExplore: false, exploreUrl: '/x' },
+      { bookSourceName: '正常', bookSourceUrl: 'https://ok.example', enabled: true, enabledExplore: true, exploreUrl: '/ok' },
+    ]
+    const store = useExploreStore()
+
+    expect(store.exploreSources.map((s) => s.bookSourceName)).toEqual(['正常'])
+  })
+
+  // 当前源被停用后自动切到列表里首个可用源，否则界面会停在一个已经不可用的源上。
+  it('switches away from a source that becomes disabled', async () => {
+    const sourceStore = useSourceStore()
+    sourceStore.sources = [
+      { bookSourceName: '可用源', bookSourceUrl: 'https://on.example', enabled: true, enabledExplore: true, exploreUrl: JSON.stringify([{ title: '列表', url: '/on-list' }]) },
+    ]
+    const store = useExploreStore()
+    await store.init()
+    expect(store.activeSourceUrl).toBe('https://on.example')
+
+    // 该源被停用：再次 init 应把它换掉（列表已无可用源时清空）。
+    sourceStore.sources = [
+      { bookSourceName: '停用源', bookSourceUrl: 'https://on.example', enabled: false, enabledExplore: true, exploreUrl: JSON.stringify([{ title: '列表', url: '/on-list' }]) },
+    ]
+    await store.init()
+
+    expect(store.exploreSources).toEqual([])
+    expect(store.activeSourceUrl).toBe('')
+    expect(store.categories).toEqual([])
+  })
+})
+
 function sourceWithExplore(): BookSource {
   return {
     bookSourceName: 'm.epsilon.example.com',

@@ -22,7 +22,7 @@
             @import-local="triggerFileImport"
             @open-subscriptions="subscriptionPanelVisible = true"
             @export="exportSources"
-            @test-sources="testSources"
+            @test-sources="testSources()"
             @cancel-test="cancelSourceTest"
             @delete-invalid="removeInvalidSources"
             @create="createSource"
@@ -83,6 +83,7 @@
               @login="handleSourceLogin"
               @create="createSource"
               @import-local="triggerFileImport"
+              @more="handleEditorMore"
             />
           </div>
 
@@ -111,11 +112,11 @@
     <SourceGroupPrompt
       :visible="groupPromptVisible"
       :title="groupPromptMode === 'add' ? '添加到分组' : '从分组移除'"
-      :message="`将对选中的 ${selectedFilteredSources.length} 个书源${groupPromptMode === 'add' ? '添加' : '移除'}以下分组`"
+      :message="groupPromptMessage"
       :confirm-text="groupPromptMode === 'add' ? '添加' : '移除'"
       :suggestions="groupList"
       @confirm="handleGroupPromptConfirm"
-      @close="groupPromptVisible = false"
+      @close="closeGroupPrompt"
     />
   </Teleport>
 </template>
@@ -147,6 +148,7 @@ import {
   getBookSourceGroups,
   getBookSourceStats,
   getVisibleSelection,
+  isEditorTextUnchanged,
   moveBookSourcesToEdge,
   removeBookSourceGroups,
   toBookSourceDeletePayload,
@@ -156,7 +158,7 @@ import SourceEditorPanel from './source-manager/SourceEditorPanel.vue'
 import SourceLoginDialog from './source-manager/SourceLoginDialog.vue'
 import SourceFilterBar from './source-manager/SourceFilterBar.vue'
 import SourceList from './source-manager/SourceList.vue'
-import { showContextMenu } from '../composables/useContextMenu'
+import { showContextMenu, type MenuItem } from '../composables/useContextMenu'
 import SourceManagerHeader from './source-manager/SourceManagerHeader.vue'
 import SourceSubscriptionPanel from './source-manager/SourceSubscriptionPanel.vue'
 import SourceGroupPrompt from './source-manager/SourceGroupPrompt.vue'
@@ -199,6 +201,12 @@ const syncingSubscriptionUrl = ref('')
 
 const editingSource = ref<BookSource | null>(null)
 const editorText = ref(JSON.stringify(createEmptySource(), null, 2))
+/**
+ * 最近一次载入编辑器的原文(editSource/createSource 写入)。
+ * 用来判断"用户是否改过编辑器内容": 不能拿 editingSource 现序列化来比 ——
+ * toggleSource 会就地改那个对象, 比出来必然是"没改过", 于是把用户的编辑丢掉。
+ */
+const editorBaseline = ref(editorText.value)
 const resetSignal = ref(0)
 const sourceLoginLoading = ref(false)
 const loginPreviewVisible = ref(false)
@@ -207,6 +215,27 @@ const loginSource = ref<BookSource | null>(null)
 /** "更多"菜单里的分组操作输入弹窗(参考 legado 的 suggestion 输入框)。 */
 const groupPromptVisible = ref(false)
 const groupPromptMode = ref<'add' | 'remove'>('add')
+/** 分组弹窗的目标(空数组表示用当前多选集合; 单源菜单传入那一个源)。 */
+const groupPromptTargets = ref<BookSource[]>([])
+/** 打开弹窗时快照的多选计数: 关闭动画期间 targets 已清空, 依赖它保持文案稳定。 */
+const groupPromptFallbackCount = ref(0)
+
+/** 分组弹窗说明文案: 单源时点名书源, 多选时说数量。
+ *
+ *  目标在打开弹窗时快照到 `groupPromptTargets`(单源菜单传 1 个), 为 0 表示
+ *  "用当前多选集合"。这里不用 `selectedFilteredSources.length` 兜底计数:
+ *  ① 弹窗关闭动画期间 `closeGroupPrompt()` 已清空 targets, 若现算计数会闪成
+ *  「0 个」; ② 多元素 explicitTargets 时现算计数会与实际目标不符。
+ *  因此计数也取自同一份快照, 在打开时一并算好。 */
+const groupPromptMessage = computed(() => {
+  const verb = groupPromptMode.value === 'add' ? '添加' : '移除'
+  const targets = groupPromptTargets.value
+  if (targets.length === 1) {
+    return `将对「${targets[0].bookSourceName}」${verb}以下分组`
+  }
+  const count = groupPromptTargets.value.length || groupPromptFallbackCount.value
+  return `将对选中的 ${count} 个书源${verb}以下分组`
+})
 
 const groupList = computed(() => getBookSourceGroups(sources.value))
 
@@ -273,6 +302,7 @@ async function loadSources() {
   try {
     sources.value = await getBookSources()
     pruneSelection()
+    syncEditingSource()
   } catch (e: unknown) {
     appStore.showToast((e as Error).message, 'error')
   } finally {
@@ -283,12 +313,73 @@ async function loadSources() {
   }
 }
 
+/** 编辑器内容与最新数据分叉时的统一提醒(每次会话只提示一次, 不打断连续操作)。
+ *
+ *  定义在 `syncEditingSource`/`toggleSource` 之前: 这两处会在用户操作时调用它,
+ *  而模块级 `let` 存在 TDZ, 声明顺序靠后会留下隐患。 */
+let editorStaleWarned = false
+function warnEditorStale() {
+  if (editorStaleWarned) return
+  editorStaleWarned = true
+  appStore.showToast('编辑框内是打开时的旧内容，直接保存会覆盖刚做的改动；可重新打开该源', 'warning')
+}
+
+/**
+ * 列表刷新后让编辑面板跟上最新数据。
+ *
+ * 菜单操作(启用/停用、发现开关、置顶/沉底等)会改动正在编辑的那个源:
+ * 置顶/沉底走 `loadSources()` 重建数组(toggleSource 则是 `Object.assign`
+ * 就地改对象), 两种路径都会让面板停在旧内容上 —— 概览显示旧值, 用户随后
+ * 点「保存」还会把刚做的改动覆盖回去。
+ *
+ * 判据必须用**打开编辑时记下的文本**(editorBaseline), 不能拿当前对象重新
+ * 序列化: `toggleSource` 就地改的正是 editingSource 指向的那个对象, 重新
+ * 序列化会得到"已更新"的结果, 于是把用户的编辑误判成没改过而直接丢弃。
+ *
+ * 比较按解析后的语义做, 这样「格式化」(只改缩进) 后仍算无改动。
+ */
+function syncEditingSource() {
+  const current = editingSource.value
+  if (!current) return
+  const latest = sources.value.find((item) => item.bookSourceUrl === current.bookSourceUrl)
+  if (!latest) return
+  if (isEditorUnchanged()) {
+    editSource(latest)
+    return
+  }
+  // 编辑器有未保存修改: 内容一律不覆盖。但若磁盘上的记录在这期间已经变了
+  //（置顶/沉底/发现开关等菜单操作），用户随后点「保存」会把它整份写回、
+  // 静默回退那次操作 —— 这种情况必须提示, 而不是默默放过。
+  // 判据用「最新记录 vs 打开时的快照」的语义比较: 没变就不提示, 避免普通刷新噪声。
+  if (!isEditorTextUnchanged(JSON.stringify(latest, null, 2), editorBaseline.value)) {
+    warnEditorStale()
+  }
+}
+
+/** 编辑器内容是否仍是载入时那一份(忽略缩进等格式差异)。 */
+function isEditorUnchanged() {
+  return isEditorTextUnchanged(editorText.value, editorBaseline.value)
+}
+
 async function toggleSource(source: BookSource) {
   const next = { ...source, enabled: source.enabled === false ? true : false }
   try {
     await saveBookSource(next)
     Object.assign(source, next)
     await sourceStore.fetchSources(true)
+    // 就地改的是 sources 里的同一个对象, 不会经过 loadSources, 得在这里同步
+    // 编辑面板: 否则编辑器文本还带着旧的 enabled, 用户随后点「保存」会把这次
+    // 停用/启用静默回退。
+    if (editingSource.value?.bookSourceUrl === source.bookSourceUrl) {
+      if (isEditorUnchanged()) {
+        editorText.value = JSON.stringify(source, null, 2)
+        editorBaseline.value = editorText.value
+      } else {
+        // 编辑器有未保存修改: 不能覆盖用户内容, 但也不能让这次菜单操作被
+        // 随后的「保存」静默回退 —— 必须让用户知道编辑器里的是旧快照。
+        warnEditorStale()
+      }
+    }
     appStore.showToast('书源状态已更新', 'success')
   } catch (e: unknown) {
     appStore.showToast((e as Error).message, 'error')
@@ -335,22 +426,61 @@ async function removeSource(source: BookSource) {
 }
 
 function handleSourceContextMenu({ source, event }: { source: BookSource; event: MouseEvent }) {
+  showContextMenu(event, buildSourceMenuItems(source), source)
+}
+
+/** 编辑面板的「更多」: 对当前正在编辑的书源弹出与右键一致的操作菜单。 */
+function handleEditorMore(event: MouseEvent) {
+  if (!editingSource.value) return
+  showContextMenu(event, buildSourceMenuItems(editingSource.value, { includeEdit: false }), editingSource.value)
+}
+
+/**
+ * 单个书源的完整操作菜单(列表右键与编辑面板「更多」共用一套)。
+ * 参考 legado 单源菜单 sourceMenuActions: 置顶/置底、启用/停用、启用发现、
+ * 测试、导出、分组、删除。
+ *
+ * includeEdit 为 false 时省略「编辑」项: 编辑面板里本就停在编辑态, 那一项
+ * 只会把编辑器内容重载回磁盘版本, 静默丢掉未保存的修改。
+ */
+function buildSourceMenuItems(source: BookSource, opts: { includeEdit?: boolean } = {}): MenuItem[] {
   const pinned = typeof source.customOrder === 'number' && source.customOrder < 0
   const enabled = source.enabled !== false
-  const menuItems = [
-    { label: '编辑', action: () => editSource(source) },
+  const exploreEnabled = source.enabledExplore === true
+  const items: MenuItem[] = []
+  if (opts.includeEdit !== false) {
+    items.push({ label: '编辑', action: () => editSource(source) })
+    items.push({ divider: true })
+  }
+  items.push(
+    { label: enabled ? '停用' : '启用', action: () => toggleSource(source) },
+    {
+      label: exploreEnabled ? '停用发现' : '启用发现',
+      action: () => setSourceExploreEnabled(source, !exploreEnabled),
+    },
+    { divider: true },
     {
       label: pinned ? '取消置顶' : '置顶',
       action: () => (pinned ? unpinSource(source) : pinSource(source)),
     },
+    { label: '沉底', action: () => sinkSourceToBottom(source) },
+    { divider: true },
+    { label: '添加到分组…', action: () => openGroupPrompt('add', [source]) },
+    { label: '从分组移除…', action: () => openGroupPrompt('remove', [source]) },
+    { divider: true },
+    { label: '导出此书源', action: () => exportSourcesList([source]) },
     {
-      label: enabled ? '停用' : '启用',
-      action: () => toggleSource(source),
+      label: '测试此书源',
+      action: () => testSources([source]),
+      // 用 getter 而非快照值: 菜单项存于 reactive 的 `state.items`, 模板渲染时
+      // 读取该属性即会追踪 `testingSources` —— 后台测试跑完后菜单里的禁用态
+      // 会立即解除, 不必关掉菜单再打开。
+      get disabled() { return testingSources.value },
     },
     { divider: true },
     { label: '删除', danger: true, action: () => removeSource(source) },
-  ]
-  showContextMenu(event, menuItems, source)
+  )
+  return items
 }
 
 async function removeSelectedSources() {
@@ -417,9 +547,11 @@ function handleSelectionMore(event: MouseEvent) {
 async function applySelectedSources(
   update: (source: BookSource) => BookSource,
   successMessage: (count: number) => string,
+  explicitTargets?: BookSource[],
 ) {
   // 与 removeSelectedSources 相同的快照原则: 异步等待期间筛选可能变化。
-  const targets = [...selectedFilteredSources.value]
+  // explicitTargets 用于单源菜单等"目标已确定"的入口。
+  const targets = explicitTargets?.length ? [...explicitTargets] : [...selectedFilteredSources.value]
   if (!targets.length) {
     appStore.showToast('请先选择要操作的书源', 'warning')
     return
@@ -470,31 +602,70 @@ async function moveSelectedSources(edge: 'top' | 'bottom') {
   }
 }
 
-function openGroupPrompt(mode: 'add' | 'remove') {
-  if (!selectedFilteredSources.value.length) {
+/** 单源沉底: 复用批量的排序计算, 但提示语按单源措辞。置顶走后端 pinSource(数值等价)。 */
+async function sinkSourceToBottom(source: BookSource) {
+  const targetUrls = new Set([source.bookSourceUrl])
+  try {
+    const updated = moveBookSourcesToEdge(sources.value, targetUrls, 'bottom')
+    const changed = updated.filter((item) => targetUrls.has(item.bookSourceUrl))
+    await saveBookSources(changed)
+    appStore.showToast(`已沉底「${source.bookSourceName}」`, 'success')
+    await loadSources()
+  } catch (e: unknown) {
+    appStore.showToast((e as Error).message || '操作失败', 'error')
+  }
+}
+
+function setSourceExploreEnabled(source: BookSource, enabled: boolean) {
+  return applySelectedSources(
+    (item) => ({ ...item, enabledExplore: enabled }),
+    () => (enabled ? `已启用「${source.bookSourceName}」的发现` : `已停用「${source.bookSourceName}」的发现`),
+    [source],
+  )
+}
+
+function openGroupPrompt(mode: 'add' | 'remove', explicitTargets?: BookSource[]) {
+  const count = explicitTargets?.length || selectedFilteredSources.value.length
+  if (!count) {
     appStore.showToast('请先选择要操作的书源', 'warning')
     return
   }
+  groupPromptTargets.value = explicitTargets ? [...explicitTargets] : []
+  // 与 targets 同批快照: 关闭动画期间 targets 会被清空, 计数不能依赖现算。
+  groupPromptFallbackCount.value = selectedFilteredSources.value.length
   groupPromptMode.value = mode
   groupPromptVisible.value = true
 }
 
+function closeGroupPrompt() {
+  groupPromptVisible.value = false
+  groupPromptTargets.value = []
+}
+
 async function handleGroupPromptConfirm(groupsInput: string) {
   const mode = groupPromptMode.value
-  groupPromptVisible.value = false
+  const targets = groupPromptTargets.value
+  closeGroupPrompt()
   await applySelectedSources(
     (source) => (mode === 'add' ? addBookSourceGroups(source, groupsInput) : removeBookSourceGroups(source, groupsInput)),
     (count) => (mode === 'add' ? `已将 ${count} 个书源加入分组` : `已将 ${count} 个书源移出分组`),
+    targets.length ? targets : undefined,
   )
 }
 
-async function testSources() {
-  const targets = selectedFilteredSources.value.length ? selectedFilteredSources.value : sources.value
+async function testSources(explicitTargets?: BookSource[]) {
+  const targets = explicitTargets?.length
+    ? explicitTargets
+    : (selectedFilteredSources.value.length ? selectedFilteredSources.value : sources.value)
   if (!targets.length) {
     appStore.showToast('没有可测试的书源', 'warning')
     return
   }
-  const scopeText = selectedFilteredSources.value.length ? `选中的 ${targets.length}` : `全部 ${targets.length}`
+  // 单源入口与批量入口的措辞分开: 前者点名书源, 后者说数量。
+  const single = explicitTargets?.length === 1 ? explicitTargets[0] : null
+  const scopeText = single
+    ? `「${single.bookSourceName}」这 1`
+    : (selectedFilteredSources.value.length ? `选中的 ${targets.length}` : `全部 ${targets.length}`)
   const ok = await appStore.confirmDialog(`将测试${scopeText} 个书源。测试会请求外部站点，耗时可能较长，是否继续？`, { title: '测试书源' })
   if (!ok) return
 
@@ -644,12 +815,14 @@ function hasSourceGroup(source: BookSource, groupName: string) {
 function createSource() {
   editingSource.value = null
   editorText.value = JSON.stringify(createEmptySource(), null, 2)
+  editorBaseline.value = editorText.value
   resetSignal.value += 1
 }
 
 function editSource(source: BookSource) {
   editingSource.value = source
   editorText.value = JSON.stringify(source, null, 2)
+  editorBaseline.value = editorText.value
 }
 
 function formatEditor() {

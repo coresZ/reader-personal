@@ -132,11 +132,18 @@ export const useExploreStore = defineStore('explore', () => {
   const hasMore = ref(true)
   const error = ref<string | null>(null)
 
-  // 只认 `enabledExplore`：`enabled` 管的是搜索/阅读可用性，停用一个源
-  //（临时排查、或该源搜索坏但发现页仍可用）不代表不想在发现页用它。
-  // legado 的发现页列表同样不筛 `enabled`。
+  // 停用的书源不出现在发现页：`enabled` 是「书源总开关」，停用后搜索、缓存、
+  // 可读书源探测都已把它排除（后端 `list_enabled`），发现页若仍列出它，用户会在
+  // 这里选到一个整体已停用的源。
+  //
+  // 判据用 `enabled !== false` 而非 `=== true`：`enabled` 是 `Option<bool>`，
+  // 缺省（`None`/`undefined`）表示启用 —— 与后端 `is_enabled()`（`enabled !=
+  // Some(false)`）和书源管理页的复选框（`:checked="source.enabled !== false"`）
+  // 保持一致。用严格 `=== true` 会把所有没写过该字段的书源一并隐藏。
   const exploreSources = computed(() => {
-    return sourceStore.sources.filter((s: BookSource) => s.enabledExplore && s.exploreUrl)
+    return sourceStore.sources.filter(
+      (s: BookSource) => s.enabled !== false && s.enabledExplore && s.exploreUrl,
+    )
   })
 
   const currentSource = computed(() => {

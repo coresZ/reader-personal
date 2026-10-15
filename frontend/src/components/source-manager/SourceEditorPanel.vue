@@ -8,6 +8,18 @@
       <div class="editor-actions">
         <button class="mini-btn" type="button" @click="$emit('format')">格式化</button>
         <button class="mini-btn primary" type="button" @click="$emit('save')">保存</button>
+        <button
+          v-if="source"
+          class="mini-btn"
+          type="button"
+          title="更多操作"
+          @click="$emit('more', $event)"
+        >
+          更多
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12">
+            <path d="m6 9 6 6 6-6" />
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -131,6 +143,8 @@ defineEmits<{
   login: []
   create: []
   'import-local': []
+  /** 点击「更多」: 抛出点击事件以便在光标处弹出操作菜单。 */
+  more: [event: MouseEvent]
 }>()
 
 const activeTab = ref<TabKey>('overview')
@@ -366,6 +380,9 @@ watch(
 
 .mini-btn {
   min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 0 10px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);

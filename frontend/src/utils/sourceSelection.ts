@@ -92,6 +92,26 @@ export function moveBookSourcesToEdge(
   })
 }
 
+/**
+ * 编辑器内容是否仍等于最近一次载入的文本(忽略缩进等格式差异)。
+ *
+ * 用于判断"用户有没有动过编辑器": 只有没动过时, 调用方才能安全地用最新数据
+ * 覆盖编辑器内容。**不能**拿编辑对象重新序列化来比 —— 就地修改对象
+ * (`Object.assign`) 的路径会让重新序列化的结果提前变成"已更新", 从而把用户
+ * 正在写的内容误判成没改过而丢弃。
+ */
+export function isEditorTextUnchanged(currentText: string, baselineText: string) {
+  const current = currentText.trim()
+  const baseline = baselineText.trim()
+  if (current === baseline) return true
+  try {
+    return JSON.stringify(JSON.parse(current)) === JSON.stringify(JSON.parse(baseline))
+  } catch {
+    // 解析不了(例如用户只写了一半) → 当作有改动, 调用方绝不能覆盖它。
+    return false
+  }
+}
+
 export function filterBookSources(
   sources: BookSource[],
   filterText: string,

@@ -6,6 +6,7 @@ import {
   getBookSourceOverview,
   getBookSourceStats,
   getVisibleSelection,
+  isEditorTextUnchanged,
   moveBookSourcesToEdge,
   removeBookSourceGroups,
   toBookSourceDeletePayload,
@@ -156,5 +157,27 @@ describe('sourceSelection', () => {
 
     expect(moveBookSourcesToEdge(sources, new Set(), 'top')).toBe(sources)
     expect(moveBookSourcesToEdge(sources, new Set(), 'bottom')).toBe(sources)
+  })
+
+  it('treats reformatted editor text as unchanged but real edits as changed', () => {
+    const baseline = JSON.stringify({ bookSourceName: 'A', enabled: true }, null, 2)
+
+    // 原样、或仅缩进不同(点过「格式化」) → 无改动, 可以用最新数据覆盖
+    expect(isEditorTextUnchanged(baseline, baseline)).toBe(true)
+    expect(isEditorTextUnchanged(baseline, baseline.trim())).toBe(true)
+    expect(isEditorTextUnchanged(
+      JSON.stringify({ bookSourceName: 'A', enabled: true }),
+      baseline,
+    )).toBe(true)
+
+    // 真改了字段 → 有改动, 绝不覆盖用户的编辑
+    expect(isEditorTextUnchanged(
+      JSON.stringify({ bookSourceName: 'B', enabled: true }, null, 2),
+      baseline,
+    )).toBe(false)
+    expect(isEditorTextUnchanged(baseline, JSON.stringify({ bookSourceName: 'A', enabled: false }, null, 2))).toBe(false)
+
+    // 写了一半、JSON 解析不了 → 按"有改动"处理, 不能当没改过而丢弃
+    expect(isEditorTextUnchanged('{ "bookSourceName": ', baseline)).toBe(false)
   })
 })
