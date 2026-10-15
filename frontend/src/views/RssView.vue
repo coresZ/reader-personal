@@ -306,7 +306,7 @@ async function reloadPanel() {
  *
  * `window.open(..., '_blank')` 会命中 Tauri 壳的 `on_new_window`: 非白名单 host
  * (RSS 网页都不在白名单)交给 `ShellExecuteW` 打开系统浏览器。自定义 scheme
- * (如 `snssdk1128://`)同理交给系统处理。
+ * (如 `app-scheme://`)同理交给系统处理。
  */
 function openExternally(url: string) {
   if (!url) return

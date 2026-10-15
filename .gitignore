@@ -39,5 +39,8 @@ toc_tmp.html
 *.tmp.html
 .ace-tool/
 
+# 本地探针/取证临时目录（下载的书源 JSON、抓取页面、一次性 Rust 探针等，不入库）
+tmp_probe/
+
 # 改动前的临时回滚副本（内容已进版本库, 不必再存一份）
 backups/

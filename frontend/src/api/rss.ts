@@ -52,7 +52,7 @@ export interface RssSourcePanel {
   title?: string
   /** 后端托管的面板 id; `external` 为真时没有面板。 */
   panelId?: string
-  /** 自定义 scheme(如 `snssdk1128://`): 需要交给系统处理, 不走内嵌面板。 */
+  /** 自定义 scheme(如 `app-scheme://`): 需要交给系统处理, 不走内嵌面板。 */
   external?: boolean
 }
 

@@ -32,9 +32,9 @@ describe('rss store singleUrl 分流', () => {
   })
 
   it('当前源是单 URL 源时进入网页入口模式', async () => {
-    getRssSourcesMock.mockResolvedValueOnce([source('http@js:x', '源仓库')])
+    getRssSourcesMock.mockResolvedValueOnce([source('http@js:x', '脚本地址源')])
     getRssArticlesMock.mockResolvedValueOnce({
-      first: [article('https://www.yckceo.com', '源仓库')],
+      first: [article('https://mirror.example.com', '脚本地址源')],
       second: null,
       singleUrl: true,
       urlEvaluated: true,
@@ -51,20 +51,20 @@ describe('rss store singleUrl 分流', () => {
   })
 
   it('混合范围(真 feed + 单 URL 源)不把真 feed 连坐成网页入口', async () => {
-    // 用户真实数据里就是这种组合: 8 个单 URL 源 + 1 个真 atom 源。
+    // 真实数据里常是这种组合: 单 URL 源 + 真 atom 源。
     getRssSourcesMock.mockResolvedValueOnce([
-      source('https://github.com/hadc188/reader/releases.atom', '版本'),
-      source('http@js:x', '源仓库'),
+      source('https://feeds.example.com/releases.atom', '版本'),
+      source('http@js:x', '脚本地址源'),
     ])
     getRssArticlesMock.mockImplementation(async (params) => {
       if (params.sourceUrl.includes('releases.atom')) {
         return {
-          first: [article('https://github.com/hadc188/reader/releases/tag/v1.5.4', 'Reader v1.5.4')],
+          first: [article('https://feeds.example.com/releases/tag/v1.5.4', 'Reader v1.5.4')],
           second: null,
         }
       }
       return {
-        first: [article('https://www.yckceo.com', '源仓库')],
+        first: [article('https://mirror.example.com', '脚本地址源')],
         second: null,
         singleUrl: true,
       }
@@ -80,7 +80,7 @@ describe('rss store singleUrl 分流', () => {
 
     // 但每条仍按自己的来源正确标记。
     const atom = store.articles.find((item) => item.title === 'Reader v1.5.4')
-    const entry = store.articles.find((item) => item.title === '源仓库')
+    const entry = store.articles.find((item) => item.title === '脚本地址源')
     expect(atom?.singleUrlEntry).toBeUndefined()
     expect(entry?.singleUrlEntry).toBe(true)
   })
@@ -88,8 +88,8 @@ describe('rss store singleUrl 分流', () => {
   it('只有单 URL 源的范围才进入网页入口模式', async () => {
     // 两个源都在 legado 分组, 且都是单 URL 源 → 该分组范围内全是网页入口。
     getRssSourcesMock.mockResolvedValueOnce([
-      { ...source('http@js:a', '源仓库'), sourceGroup: 'legado' },
-      { ...source('https://pan.example', 'Meow云'), sourceGroup: 'legado' },
+      { ...source('http@js:a', '脚本地址源'), sourceGroup: 'legado' },
+      { ...source('https://pan.example', '网盘入口'), sourceGroup: 'legado' },
     ])
     getRssArticlesMock.mockResolvedValue({
       first: [article('https://example.test/x', '网页')],
@@ -105,9 +105,9 @@ describe('rss store singleUrl 分流', () => {
   })
 
   it('单 URL 源的合成条目不算"还有下一页"', async () => {
-    getRssSourcesMock.mockResolvedValueOnce([source('http@js:x', '源仓库')])
+    getRssSourcesMock.mockResolvedValueOnce([source('http@js:x', '脚本地址源')])
     getRssArticlesMock.mockResolvedValue({
-      first: [article('https://www.yckceo.com', '源仓库')],
+      first: [article('https://mirror.example.com', '脚本地址源')],
       second: null,
       singleUrl: true,
     })

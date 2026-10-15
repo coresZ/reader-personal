@@ -11,26 +11,43 @@ use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-const YCKCEO_INDEX: &str = "https://www.yckceo.com/yuedu/shuyuan/index.html";
-const YCKCEO_JSON_PREFIX: &str = "https://www.yckceo.com/yuedu/shuyuan/json/id";
-const YCKCEO_SMOKE_SEED_IDS: &[&str] = &["7124", "6990", "6931"];
+/// 源仓库索引入口, 由环境变量覆盖; 默认值只是占位, 使用前必须配置。
+fn source_index_url() -> String {
+    env::var("LIVE_SOURCE_INDEX").unwrap_or_else(|_| "https://source-index.example.com/".to_string())
+}
+
+/// 源仓库明细接口前缀, 由环境变量覆盖。
+fn source_json_prefix() -> String {
+    env::var("LIVE_SOURCE_JSON_PREFIX").unwrap_or_else(|_| "https://source-index.example.com/json/id".to_string())
+}
+
+/// 可选的固定样本 ID, 用于在索引不可达时仍能跑通 smoke。
+fn smoke_seed_ids() -> Vec<String> {
+    env::var("LIVE_SOURCE_SEED_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "hits the live YCKCeo source repository and public book sites"]
-async fn yckceo_live_non_webview_sources_end_to_end() {
-    let target_passes = env_usize("YCKCEO_TARGET_PASSES", 3);
-    let max_candidates = env_usize("YCKCEO_MAX_CANDIDATES", 24);
-    let pages = env_usize("YCKCEO_INDEX_PAGES", 1);
+#[ignore = "hits a live source repository and public book sites"]
+async fn live_sources_end_to_end() {
+    let target_passes = env_usize("LIVE_SOURCE_TARGET_PASSES", 3);
+    let max_candidates = env_usize("LIVE_SOURCE_MAX_CANDIDATES", 24);
+    let pages = env_usize("LIVE_SOURCE_INDEX_PAGES", 1);
 
     let http = HttpClient::new(20, None).expect("http client");
     // `client()` 返回 clone 出来的 owned Client；辅助函数借用以避免在循环里反复 clone。
     let client = http.client();
-    let ids = fetch_yckceo_ids(&client, pages)
+    let ids = fetch_live_source_ids(&client, pages)
         .await
-        .expect("fetch YCKCeo index");
-    assert!(!ids.is_empty(), "YCKCeo index returned no source ids");
+        .expect("fetch source index");
+    assert!(!ids.is_empty(), "源仓库索引没有返回任何源 id");
 
-    let cache_root = env::temp_dir().join(format!("reader-rust-yckceo-{}", Uuid::new_v4()));
+    let cache_root = env::temp_dir().join(format!("reader-rust-live-source-{}", Uuid::new_v4()));
     let service = BookService::new(
         http.clone(),
         RuleEngine::new().expect("rule engine"),
@@ -79,26 +96,27 @@ async fn yckceo_live_non_webview_sources_end_to_end() {
 
     assert!(
         passed.len() >= target_passes,
-        "expected at least {target_passes} YCKCeo non-WebView live sources to pass, got {}. attempted: {:?}",
+        "expected at least {target_passes} live non-WebView sources to pass, got {}. attempted: {:?}",
         passed.len(),
         attempted
     );
 }
 
-async fn fetch_yckceo_ids(client: &reqwest::Client, pages: usize) -> anyhow::Result<Vec<String>> {
-    let id_re = Regex::new(r"/yuedu/shuyuan/content/id/(\d+)\.html")?;
+async fn fetch_live_source_ids(client: &reqwest::Client, pages: usize) -> anyhow::Result<Vec<String>> {
+    let id_re = Regex::new(r"/content/id/(\d+)\.html")?;
     let mut ids = Vec::new();
     let mut seen = HashSet::new();
-    for id in YCKCEO_SMOKE_SEED_IDS {
-        if seen.insert((*id).to_string()) {
-            ids.push((*id).to_string());
+    for id in smoke_seed_ids() {
+        if seen.insert(id.clone()) {
+            ids.push(id);
         }
     }
+    let index = source_index_url();
     for page in 1..=pages.max(1) {
         let url = if page == 1 {
-            YCKCEO_INDEX.to_string()
+            index.clone()
         } else {
-            format!("{YCKCEO_INDEX}?page={page}")
+            format!("{index}?page={page}")
         };
         let html = client
             .get(url)
@@ -121,7 +139,7 @@ async fn fetch_candidate_source(
     client: &reqwest::Client,
     id: &str,
 ) -> anyhow::Result<Option<(BookSource, String)>> {
-    let url = format!("{YCKCEO_JSON_PREFIX}/{id}.json");
+    let url = format!("{}/{id}.json", source_json_prefix());
     let value: Value = client
         .get(url)
         .send()
@@ -225,7 +243,7 @@ async fn smoke_source(
     keyword: &str,
 ) -> Result<SmokePass, String> {
     let books = service
-        .search_book("yckceo-live", source, keyword, 1)
+        .search_book("live-source", source, keyword, 1)
         .await
         .map_err(|err| format!("search failed: {err:?}"))?;
     let book = books
@@ -234,7 +252,7 @@ async fn smoke_source(
         .ok_or_else(|| "search returned no usable books".to_string())?;
 
     let info = service
-        .get_book_info("yckceo-live", source, &book.book_url)
+        .get_book_info("live-source", source, &book.book_url)
         .await
         .map_err(|err| format!("book info failed for {}: {err:?}", book.book_url))?;
     let toc_url = info
@@ -243,7 +261,7 @@ async fn smoke_source(
         .filter(|url| !url.trim().is_empty())
         .unwrap_or_else(|| book.book_url.clone());
     let (chapters, _) = service
-        .get_chapter_list_first_page("yckceo-live", source, &toc_url)
+        .get_chapter_list_first_page("live-source", source, &toc_url)
         .await
         .map_err(|err| format!("toc failed for {toc_url}: {err:?}"))?;
     let chapter = chapters
@@ -253,7 +271,7 @@ async fn smoke_source(
         })
         .ok_or_else(|| "toc returned no readable chapter".to_string())?;
     let content = service
-        .get_content("yckceo-live", &book.book_url, source, &chapter.url)
+        .get_content("live-source", &book.book_url, source, &chapter.url)
         .await
         .map_err(|err| format!("content failed for {}: {err:?}", chapter.url))?;
     let content_chars = content.trim().chars().count();
