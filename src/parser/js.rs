@@ -1595,15 +1595,40 @@ fn eval_js_inner_with_source(
                             )
                             .to_string()
                         }
-                        _ => crate::parser::rule_engine::RuleEngine::eval_rule_on(
-                            &rule,
-                            &content,
-                            &rule_base_url,
-                            false,
-                        )
-                        .into_iter()
-                        .next()
-                        .unwrap_or_default(),
+                        _ => {
+                            // legado 语义按模式区分：
+                            // - `Mode.Json`(`AnalyzeByJSonPath.getString`)：值是 List 时
+                            //   `joinToString("\n")`，多值**换行拼接**。
+                            // - `Mode.Regex`(`AnalyzeByRegex.getElement`)：只用**第一个**匹配。
+                            // - `Mode.Default`(`AnalyzeByJSoup.getString`)：多值换行拼接。
+                            //
+                            // 用 `list=false` 取单值：这条路径要能处理 `||` / `&&` 组合
+                            //（`extract_content` 按段独立判模式），多值展开由 `getStringList`
+                            // 承担。该源 bookUrl 脚本写的是 `java.getString("@href||$.url")`，
+                            // `@href` 在 JSON 项上为空、要回落到 `$.url`；用 list 模式会绕过
+                            // 组合分流，整条被当成一个 JSONPath 求值 → 空 → 书链只剩
+                            // `.../column//`（ID 段缺失）。
+                            //
+                            // featured 分支依赖多值拼接：
+                            // `String(java.getString("$..todayWorksIds[*]")).split("\n")`
+                            // 期望拿到**全部** id。（JSONPath 通配命中多项时
+                            // `extract_content` 已返回换行拼接的字符串。）
+                            let rule_trimmed = rule.trim();
+                            let regex_mode = rule_trimmed.starts_with("@regex:")
+                                || rule_trimmed.starts_with("@Regex:")
+                                || rule_trimmed.starts_with(':');
+                            let values = crate::parser::rule_engine::RuleEngine::eval_rule_on(
+                                &rule,
+                                &content,
+                                &rule_base_url,
+                                false,
+                            );
+                            if regex_mode {
+                                values.into_iter().next().unwrap_or_default()
+                            } else {
+                                values.join("\n")
+                            }
+                        }
                     }
                 }),
             )?;
