@@ -94,7 +94,7 @@ async fn actual_settings_buttons_save_the_confirmed_page() {
     };
     use std::sync::Arc;
     let Some(mut source) = load_source() else { return };
-    source.book_source_url = format!("光遇测试{}", uuid::Uuid::new_v4());
+    source.book_source_url = format!("聚合源测试{}", uuid::Uuid::new_v4());
     let root = std::env::temp_dir().join(format!("reader-aggregate-panel-{}", uuid::Uuid::new_v4()));
     let service = BookService::new(HttpClient::new(5, None).unwrap(), RuleEngine::new().unwrap(), FileCache::new(root.join("cache")), root.to_str().unwrap());
     assert_eq!(service.login_book_source(&source).await.unwrap()["fields"].as_array().unwrap().len(), 34);
@@ -152,7 +152,7 @@ async fn token_url_login_sources_carry_session_into_the_panel() {
     let s3 = seen.clone();
     let app = Router::new()
         .route("/legado/login", post(|| async {
-            serde_json::json!({"code": 200, "data": {"token": "mock-token-abc123", "user": {"nickname": "墨阅测试号"}}}).to_string()
+            serde_json::json!({"code": 200, "data": {"token": "mock-token-abc123", "user": {"nickname": "测试用户号"}}}).to_string()
         }))
         .route("/user/token-login", get(move |headers: HeaderMap| {
             let s = s2.clone();
@@ -171,8 +171,8 @@ async fn token_url_login_sources_carry_session_into_the_panel() {
                 let line = record(&headers, "/user");
                 let logged = line.contains("mysession=panel-session-42");
                 s.lock().unwrap().push(line);
-                if logged { "<html><head><title>墨阅个人中心</title></head><body>已登录</body></html>" }
-                else { "<html><head><title>墨阅个人中心</title></head><body>未登录</body></html>" }
+                if logged { "<html><head><title>书源四个人中心</title></head><body>已登录</body></html>" }
+                else { "<html><head><title>书源四个人中心</title></head><body>未登录</body></html>" }
             }
         }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -180,8 +180,8 @@ async fn token_url_login_sources_carry_session_into_the_panel() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let source: BookSource = serde_json::from_value(serde_json::json!({
-        "bookSourceName": "墨阅·极速(测试)", "bookSourceUrl": "moyue://rapid",
-        "jsLib": "var host = 'https://moyue.app';",
+        "bookSourceName": "书源四(测试)", "bookSourceUrl": "custom://rapid",
+        "jsLib": "var host = 'https://iota.example.com';",
         "header": "@js:var v=JSON.parse(source.getVariable()||'{}');JSON.stringify(v.token?{'Authorization':'Bearer '+v.token}:{})",
         "loginUrl": "function login(flag){\n\
             try{ result=JSON.parse(source.getLoginInfo()||'{}'); }catch(e){ result={}; }\n\
@@ -194,13 +194,13 @@ async fn token_url_login_sources_carry_session_into_the_panel() {
         "loginUi": serde_json::json!([
             {"name": "邮箱", "type": "text", "default": ""},
             {"name": "密码", "type": "password", "default": ""},
-            {"name": "登录墨阅", "type": "button", "action": "login(true)"},
+            {"name": "登录书源四", "type": "button", "action": "login(true)"},
             {"name": "个人中心", "type": "button", "action":
-                "(function(){var v={};try{v=JSON.parse(source.getVariable()||'{}');}catch(e){}var t=String(v.token||'');if(!t){java.toast('请先登录书源账号');return;}var bh=String(v.host||'')||host;java.startBrowser(bh+'/user/token-login?token='+encodeURIComponent(t),'墨阅·个人中心');})()"}
+                "(function(){var v={};try{v=JSON.parse(source.getVariable()||'{}');}catch(e){}var t=String(v.token||'');if(!t){java.toast('请先登录书源账号');return;}var bh=String(v.host||'')||host;java.startBrowser(bh+'/user/token-login?token='+encodeURIComponent(t),'书源四·个人中心');})()"}
         ]).to_string(),
     })).unwrap();
 
-    let root = std::env::temp_dir().join(format!("reader-moyue-{}", uuid::Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("reader-custom-{}", uuid::Uuid::new_v4()));
     let service = BookService::new(HttpClient::new(5, None).unwrap(), RuleEngine::new().unwrap(), FileCache::new(root.join("cache")), root.to_str().unwrap());
 
     // 层1: 走生产登录管线；线路指向本地模拟站（源本身支持 loginInfo['线路']）
@@ -289,8 +289,8 @@ async fn login_check_js_sees_str_response_and_reauthenticates_on_401() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let source: BookSource = serde_json::from_value(serde_json::json!({
-        "bookSourceName": "墨阅登录校验(测试)",
-        "bookSourceUrl": format!("moyue://checkjs-{}", uuid::Uuid::new_v4()),
+        "bookSourceName": "书源四登录校验(测试)",
+        "bookSourceUrl": format!("custom://checkjs-{}", uuid::Uuid::new_v4()),
         "jsLib": format!("var host = '{base}';"),
         "header": "@js:var v=JSON.parse(source.getVariable()||'{}');JSON.stringify(v.token?{'Authorization':'Bearer '+v.token}:{})",
         "loginUrl": format!(

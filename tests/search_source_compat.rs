@@ -152,13 +152,13 @@ async fn rejected_search_response_reports_status_instead_of_an_empty_success() {
 #[test]
 fn repeated_title_links_and_empty_authors_preserve_all_matching_book_addresses() {
     let source = book_source_from_value(json!({
-        "bookSourceUrl":"https://www.min-yuan.com", "bookSourceName":"小原列表结构",
+        "bookSourceUrl":"https://beta.example.com", "bookSourceName":"列表结构",
         "ruleSearch":{"bookList":".hotcontent .item||.novelslist2 li||dl", "name":"a@title||h3@text||a@text", "author":".s4@text||p@text##作者：", "bookUrl":"a@href"}
     })).unwrap();
     let rows = ["femn", "cjqq", "vxel", "ofrv", "ozzb"].iter().map(|id|format!(
         "<div class='generated item'><div class='image'><a href='/txt/{id}/' title='斗破苍穹'><img></a></div><dl><dt><a href='/txt/{id}/' title='斗破苍穹'>斗破苍穹</a></dt><div class='btm'>目录信息</div></dl></div>"
     )).collect::<String>();
-    let books = RuleEngine::new().unwrap().search_books(&source, &format!("<div class='hotcontent'>{rows}</div>"), "https://www.min-yuan.com/search/");
+    let books = RuleEngine::new().unwrap().search_books(&source, &format!("<div class='hotcontent'>{rows}</div>"), "https://beta.example.com/search/");
     assert_eq!(books.len(), 5);
     assert!(books.iter().all(|book| book.name == "斗破苍穹" && book.author.is_empty()));
     assert_eq!(books.iter().map(|book| &book.book_url).collect::<std::collections::HashSet<_>>().len(), 5);
@@ -201,7 +201,7 @@ async fn exported_sources_http_diagnostics() {
     for index in [1, 2] {
         let source = book_source_from_value(values[index].clone()).unwrap();
         if let (1, Ok(body)) = (index, std::fs::read_to_string("../.tmp-issue7/live-1-search.html")) {
-            let books = RuleEngine::new().unwrap().search_books(&source, &body, "https://www.min-yuan.com/search/");
+            let books = RuleEngine::new().unwrap().search_books(&source, &body, "https://beta.example.com/search/");
             println!("FIXTURE_REPORT {}", json!({"source":source.book_source_name,"count":books.len(),"exactTitleCount":books.iter().filter(|b|b.name=="斗破苍穹").count()}));
         }
         match service.debug_source_step("probe", &source, "search", "斗破苍穹", "", "").await {
@@ -224,9 +224,9 @@ async fn exported_sources_http_diagnostics() {
             let _ = prime.send().await;
         }
         let mut request = if index == 1 {
-            direct.post("https://www.min-yuan.com/search/").header("Content-Type","application/x-www-form-urlencoded").body(format!("searchkey={}",urlencoding::encode("斗破苍穹")))
+            direct.post("https://beta.example.com/search/").header("Content-Type","application/x-www-form-urlencoded").body(format!("searchkey={}",urlencoding::encode("斗破苍穹")))
         } else {
-            direct.get(format!("https://m.libahao2.com/sou?wd={}",urlencoding::encode("斗破苍穹")))
+            direct.get(format!("https://m.gamma.example.com/sou?wd={}",urlencoding::encode("斗破苍穹")))
         };
         for (key,value) in &headers { request = request.header(key,value); }
         match request.send().await {

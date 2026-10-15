@@ -67,11 +67,11 @@ describe('bookshelf search state', () => {
   it('can start a search with the active explore source selected', () => {
     const store = useBookshelfStore()
 
-    store.startSearch('星门', { scope: 'source', sourceUrl: 'https://m.cuoceng.com' })
+    store.startSearch('星门', { scope: 'source', sourceUrl: 'https://m.epsilon.example.com' })
 
     expect(store.searchKey).toBe('星门')
     expect(store.searchScope).toBe('source')
-    expect(store.searchSourceUrl).toBe('https://m.cuoceng.com')
+    expect(store.searchSourceUrl).toBe('https://m.epsilon.example.com')
   })
 })
 

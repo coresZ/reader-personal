@@ -72,7 +72,7 @@ async fn aggregate_catalog_rebuilds_review_urls_once_without_clearing_content() 
             "chapterName": "$.title",
             "chapterUrl": r#"<js>
 var bookId = java.get('book_id');
-var sessionId = java.getCookie('fanqienovel.com', 'sessionid');
+var sessionId = java.getCookie('theta.example.com', 'sessionid');
 var payload = {book_id:bookId,item_id:result.item_id};
 'data:;base64,'+java.base64Encode(JSON.stringify(payload))+','+JSON.stringify({
     type:'gycontent',

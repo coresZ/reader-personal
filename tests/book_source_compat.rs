@@ -193,7 +193,7 @@ line2"
 fn url_analyzer_supports_single_brace_key_and_page_placeholders() {
     let source = BookSource {
         book_source_name: "Legacy placeholders".to_string(),
-        book_source_url: "https://m.cuoceng.com".to_string(),
+        book_source_url: "https://m.epsilon.example.com".to_string(),
         ..Default::default()
     };
 
@@ -208,7 +208,7 @@ fn url_analyzer_supports_single_brace_key_and_page_placeholders() {
 
     assert_eq!(
         spec.url,
-        "https://m.cuoceng.com/book/so/%E6%98%9F%E9%97%A8/3.html"
+        "https://m.epsilon.example.com/book/so/%E6%98%9F%E9%97%A8/3.html"
     );
 }
 

@@ -24,9 +24,9 @@ fn java_get_cookie_accepts_domain_tags_and_named_values() {
     let http = HttpClient::new(2, None).unwrap();
     let source = BookSource { book_source_url: format!("https://comments-{}.test", uuid::Uuid::new_v4()), ..Default::default() };
     let context = http.source_context("comment-fixture", &source.book_source_url, None).unwrap();
-    context.session.cookies.set(&url::Url::parse("https://fanqienovel.com/").unwrap(), "sessionid=fixture==; other=kept").unwrap();
+    context.session.cookies.set(&url::Url::parse("https://theta.example.com/").unwrap(), "sessionid=fixture==; other=kept").unwrap();
     let result = with_http_context(context, || with_source(&source, || eval_js(
-        "JSON.stringify({named:java.getCookie('fanqienovel.com','sessionid'),missing:java.getCookie('fanqienovel.com','missing'),full:java.getCookie('https://fanqienovel.com/'),nullKey:java.getCookie('fanqienovel.com',null)})",
+        "JSON.stringify({named:java.getCookie('theta.example.com','sessionid'),missing:java.getCookie('theta.example.com','missing'),full:java.getCookie('https://theta.example.com/'),nullKey:java.getCookie('theta.example.com',null)})",
         "", "https://fixture.test/book/comments",
     ))).expect("The cookie helper used by the original aggregate chapter rule must be callable");
     let result: Value = serde_json::from_str(&result).unwrap();
@@ -37,7 +37,7 @@ fn java_get_cookie_accepts_domain_tags_and_named_values() {
     assert_eq!(result["full"], result["nullKey"]);
     let other = BookSource { book_source_url: format!("https://other-comments-{}.test", uuid::Uuid::new_v4()), ..Default::default() };
     let context = http.source_context("comment-fixture", &other.book_source_url, None).unwrap();
-    let cookie = with_http_context(context, || with_source(&other, || eval_js("java.getCookie('fanqienovel.com','sessionid')", "", ""))).unwrap();
+    let cookie = with_http_context(context, || with_source(&other, || eval_js("java.getCookie('theta.example.com','sessionid')", "", ""))).unwrap();
     assert!(cookie.is_empty());
 }
 
@@ -58,8 +58,8 @@ let content_url;
 
 if (sources == '卷') {
     content_url = item_id;
-} else if (['番茄', '七猫', '塔读'].includes(sources) && tab == "小说") {
-    const fqssionid = java.getCookie('fanqienovel.com', 'sessionid');
+} else if (['源甲', '源乙', '源丁'].includes(sources) && tab == "小说") {
+    const fqssionid = java.getCookie('theta.example.com', 'sessionid');
     const sourcess = sources.replace('svip_', '');
     content_url = `data:;base64,${encodedGycontent},${JSON.stringify({
         type: "gycontent",
@@ -77,16 +77,16 @@ if (sources == '卷') {
     })).unwrap();
     let http = HttpClient::new(2, None).unwrap();
     let context = http.source_context("comment-fixture", &source.book_source_url, None).unwrap();
-    context.session.cookies.set(&url::Url::parse("https://fanqienovel.com/").unwrap(), "sessionid=fixture-session").unwrap();
+    context.session.cookies.set(&url::Url::parse("https://theta.example.com/").unwrap(), "sessionid=fixture-session").unwrap();
     with_http_context(context, || with_source(&source, || {
         eval_js("java.put('book_id','fixture-book')", "", "https://fixture.test/toc").unwrap();
         take_js_logs();
-        let body = json!({"data":[{"title":"测试章节","item_id":"fixture-chapter","source":"番茄","tab":"小说"}]}).to_string();
+        let body = json!({"data":[{"title":"测试章节","item_id":"fixture-chapter","source":"源甲","tab":"小说"}]}).to_string();
         let (chapters, _) = RuleEngine::new().unwrap().chapter_list(&source, &body, "https://fixture.test/toc", None);
         assert_eq!(chapters.len(), 1);
         let chapter_url = &chapters[0].url;
         assert!(chapter_url.starts_with("data:;base64,"), "chapter URL must retain review options; logs: {:?}", take_js_logs());
-        assert!(chapter_url.contains("/get_review?book_id=fixture-book&item_id=fixture-chapter&ssionid=fixture-session&source=番茄"));
+        assert!(chapter_url.contains("/get_review?book_id=fixture-book&item_id=fixture-chapter&ssionid=fixture-session&source=源甲"));
         let spec = analyze_url(chapter_url, "", 1, &source.book_source_url, &source).unwrap();
         assert_eq!(spec.response_type.as_deref(), Some("gycontent"));
     }));

@@ -154,7 +154,7 @@ async fn yckceo_heavy_sources_live_smoke() {
     use reader_rust::service::book_service::BookService;
     use reader_rust::storage::cache::file_cache::FileCache;
 
-    // 挑选: js 重度(番茄/七猫/魔丸/智能书库) + 登录页刚修的得奇 + 简单对照(大文学)
+    // 挑选覆盖面: 重度依赖 JS 的源 + 带登录页的源 + 结构简单的源作对照
     let wanted = ["yck-7897.json", "yck-7895.json", "yck-7813.json", "yck-7930.json", "yck-7929.json", "yck-7928.json"];
     let sources: Vec<(String, BookSource)> = load_sources()
         .into_iter()

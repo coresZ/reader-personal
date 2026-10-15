@@ -49,10 +49,10 @@ describe('source image HTML repair', () => {
 
 describe('source image options with Legado literals', () => {
   it('reads the actual mixed-quote chapter-review shape', () => {
-    const raw = `https://site/chapter.svg,{'type':'qtbzs',"click":"showCmt('https://site/review?a=1&b=2','番茄','本章说' )",'style':'FULL'}`
+    const raw = `https://site/chapter.svg,{'type':'qtbzs',"click":"showCmt('https://site/review?a=1&b=2','源甲','本章说' )",'style':'FULL'}`
     expect(parseSourceImageOptions(raw)).toMatchObject({
       url: 'https://site/chapter.svg',
-      click: "showCmt('https://site/review?a=1&b=2','番茄','本章说' )",
+      click: "showCmt('https://site/review?a=1&b=2','源甲','本章说' )",
       style: 'full',
     })
   })

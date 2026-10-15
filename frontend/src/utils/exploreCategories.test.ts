@@ -73,7 +73,7 @@ describe('isJsExploreUrl', () => {
   })
 
   it('leaves plain text and json rules to the local parser', () => {
-    expect(isJsExploreUrl('玄幻::https://m.libahao2.com/xuanhuan/{{page}}/')).toBe(false)
+    expect(isJsExploreUrl('玄幻::https://m.gamma.example.com/xuanhuan/{{page}}/')).toBe(false)
     expect(isJsExploreUrl('[{"title":"书 库","url":"/x"}]')).toBe(false)
     expect(isJsExploreUrl('')).toBe(false)
     expect(isJsExploreUrl(null)).toBe(false)

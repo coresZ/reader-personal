@@ -19,9 +19,9 @@ const urls = {
   chapter: 'https://comments.example.test/chapter?book_id=book-1&item_id=chapter-1&source=%E7%95%AA%E8%8C%84',
 }
 const scripts = {
-  paragraph: "showCmt('" + urls.paragraph + "', '番茄' ,'段评')",
+  paragraph: "showCmt('" + urls.paragraph + "', '源甲' ,'段评')",
   god: "showCmt('" + urls.god + "','段评' )",
-  chapter: "showCmt('" + urls.chapter + "','番茄','本章说' )",
+  chapter: "showCmt('" + urls.chapter + "','源甲','本章说' )",
 }
 function icon(label: string) {
   return 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" width="48" height="24" viewBox="0 0 48 24"><rect x="1" y="1" width="46" height="22" fill="#eee" stroke="#777"/><text x="18" y="18">' + label + '</text></svg>')
@@ -46,7 +46,7 @@ const rawHtml = '<p style="margin-top:0;margin-bottom:.2em">' + passage + '<img 
 const expected = document.createElement('div')
 expected.innerHTML = repairSourceImageHtml(rawHtml)
 
-const book = { name: '段评测试', author: '测试作者', origin: sourceUrl, originName: '光遇聚合', bookUrl, durChapterIndex: 0 }
+const book = { name: '段评测试', author: '测试作者', origin: sourceUrl, originName: '聚合源', bookUrl, durChapterIndex: 0 }
 const chapters = [{ index: 0, title: '第一章', url: chapterUrl }]
 const calls: Array<{ command: string; req: unknown }> = []
 mockIPC((command, payload) => {

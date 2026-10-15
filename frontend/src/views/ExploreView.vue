@@ -70,7 +70,7 @@
            对齐 legado ExploreAdapter —— 这些控件由 exploreUrl 的 JS 生成，
            其取值(infoMap)会回送给书源脚本参与后续求值。
 
-           聚合类书源常有 6~10 个控件（光遇 9 个、书山 8 个），横排必然换行。
+           聚合类书源常有 6~10 个控件（一个源可有近十个），横排必然换行。
            窄窗口下把它们折进可折叠区域，默认收起 —— 否则工具栏会涨到 125px+，
            比旧布局还占地方。宽窗口控件一行放得下，则不需要折叠按钮。 -->
       <div class="toolbar-controls-wrap" v-if="store.controls.length > 0">
@@ -190,7 +190,7 @@
 
     <!-- 登录面板：与书源管理里用的是同一个组件。
          它只暴露 v-model，关闭后重新求值一次分类 —— 登录态会决定有些分类
-         （光遇的「晴天书架」「会员榜」）能不能取到数据。 -->
+         （聚合源的「晴天书架」「会员榜」）能不能取到数据。 -->
     <SourceLoginDialog
       v-model="store.showLogin"
       v-if="store.currentSource"
@@ -316,7 +316,7 @@ function onPressButton(ctrl: ExploreKind) {
 }
 
 /**
- * 落实书源 action 登记的意图（如书山的「🔍搜索」按钮）。
+ * 落实书源 action 登记的意图（如书源三的「🔍搜索」按钮）。
  *
  * `java.searchBook(key, source)` 只表达"发起这次搜索"，真正的搜索框与结果页
  * 归书架视图所有：这里把关键词交给 bookshelf store 并跳过去。
@@ -347,7 +347,7 @@ function onBrowserToast(message: string) {
 }
 
 // 登录面板关闭后重新求值分类：登录态会决定部分分类能否取到数据
-//（光遇的「晴天书架」「会员榜」未登录时是空的）。
+//（聚合源的「晴天书架」「会员榜」未登录时是空的）。
 watch(
   () => store.showLogin,
   (visible, wasVisible) => {

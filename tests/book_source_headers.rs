@@ -20,7 +20,7 @@ async fn script_and_panel_requests_evaluate_headers_with_current_source_state() 
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let source = BookSource {
-        book_source_url: format!("moyue://rapid/{}", Uuid::new_v4()),
+        book_source_url: format!("custom://rapid/{}", Uuid::new_v4()),
         header: Some("@js:var v=JSON.parse(source.getVariable()||'{}');JSON.stringify(v.token?{'Authorization':'Bearer '+v.token,'User-Agent':'Legado/3.0'}:{'User-Agent':'Legado/3.0'})".into()),
         ..Default::default()
     };

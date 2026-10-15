@@ -44,7 +44,7 @@ export function exploreKindChars(kind: ExploreKind): string[] {
 /**
  * 控件的显示名：优先后端求值好的 `viewName`，否则回退 `title`。
  *
- * legado 让书源自定义控件文字（光遇的筛选用 `'请选择类型'`，七猫用一段读源
+ * legado 让书源自定义控件文字（聚合源的筛选用 `'请选择类型'`，源乙用一段读源
  * 变量的 JS），显示名已在后端沙箱解析完成。
  */
 export function exploreKindLabel(kind: ExploreKind): string {
@@ -91,7 +91,7 @@ export function exploreBook(params: ExploreBookParams) {
  * rquickjs 沙盒里执行 `@js:` / `<js>` 规则（对齐 legado `exploreKinds()`）。
  *
  * `infoMap` 是发现页控件的当前取值：JS 型规则会读它来决定生成哪些分类
- * （如"源站=番茄"下的排行榜），缺省时后端按空 map 求值并回填默认值。
+ * （如"源站=源甲"下的排行榜），缺省时后端按空 map 求值并回填默认值。
  */
 export function getExploreKinds(params: {
   bookSourceUrl: string

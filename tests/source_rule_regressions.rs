@@ -105,14 +105,14 @@ fn book_info_initialization_runs_before_field_selection() {
     assert_eq!(book.author, "作者甲");
 }
 
-/// 七猫系源的两个关键语法（yckceo id 7895 回归）:
+/// 该源的两个关键语法（yckceo id 7895 回归）:
 /// 1. bookList 用省略 `$` 前缀的 JSON 点路径（`data.books`）
 /// 2. 字段尾部的 `@put:{"bid":"$.id"}`（legado putPattern 任意位置分离），
 ///    put 的值跨阶段对 `java.get()` 可见。
 #[test]
-fn qimao_style_bare_json_paths_and_trailing_put_rules() {
+fn bare_json_paths_and_trailing_put_rules() {
     let source = book_source_from_value(json!({
-        "bookSourceUrl":"https://bare-json.test", "bookSourceName":"七猫风格",
+        "bookSourceUrl":"https://bare-json.test", "bookSourceName":"该源风格",
         "ruleSearch":{"bookList":"data.books", "name":"original_title", "bookUrl":"@js:'https://api.test/detail?id='+'{{$.id}}'"},
         "ruleBookInfo":{"init":"data.book", "name":"title@put:{\"bid\":\"$.id\"}"}
     })).unwrap();
@@ -169,7 +169,7 @@ async fn content_rule_business_error_is_reported_to_the_user() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let source = book_source_from_value(json!({
-        "bookSourceName": "VIP提示测试", "bookSourceUrl": "moyue://vip-test",
+        "bookSourceName": "VIP提示测试", "bookSourceUrl": "custom://vip-test",
         "jsLib": "function J(r){ if(typeof r==='string'){ try{return JSON.parse(r);}catch(e){ return {}; } } return r||{}; }",
         "ruleContent": { "content":
             "<js>var r=J(result); if(r.code==403){ throw '本书源为VIP专属内容，开通VIP后可阅读'; } r.msg;</js>" }

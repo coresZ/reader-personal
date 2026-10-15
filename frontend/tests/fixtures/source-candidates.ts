@@ -21,10 +21,10 @@ const sourceUrls = {
   sudugu: 'https://sudugu.example.invalid',
 }
 const sources: BookSource[] = [
-  { bookSourceName: '得奇小说', bookSourceUrl: sourceUrls.deqi, enabled: true },
-  { bookSourceName: '小原文学网(搜索修复)', bookSourceUrl: sourceUrls.xiaoyuan, enabled: true },
-  { bookSourceName: '光遇聚合26.10.9', bookSourceUrl: sourceUrls.aggregate, enabled: true },
-  { bookSourceName: '速读谷', bookSourceUrl: sourceUrls.sudugu, enabled: true },
+  { bookSourceName: '书源一', bookSourceUrl: sourceUrls.deqi, enabled: true },
+  { bookSourceName: '书源二', bookSourceUrl: sourceUrls.xiaoyuan, enabled: true },
+  { bookSourceName: '聚合源', bookSourceUrl: sourceUrls.aggregate, enabled: true },
+  { bookSourceName: '书源三', bookSourceUrl: sourceUrls.sudugu, enabled: true },
 ]
 const common = { name: '斗破苍穹', author: '天蚕土豆' }
 const deqi: SearchBook = {
@@ -51,7 +51,7 @@ const authorVariants: SearchBook[] = variantAuthors.map((author, index) => ({
   lastChapter: '分站' + (index + 3),
 }))
 const sudugu: SearchBook = {
-  ...deqi, origin: sourceUrls.sudugu, originName: '速读谷',
+  ...deqi, origin: sourceUrls.sudugu, originName: '书源三',
   bookUrl: sourceUrls.sudugu + '/book/1',
 }
 const hits = [
@@ -116,7 +116,7 @@ mockIPC((command, payload) => {
     case 'cancel_book_search': return
     case 'get_chapter_list': {
       const hit = findHit(req.bookUrl, req.bookSourceUrl)
-      const label = hit.lastChapter || '小原第' + hit.bookUrl.split('/').at(-1) + '版'
+      const label = hit.lastChapter || '第' + hit.bookUrl.split('/').at(-1) + '版'
       return ok([{ index: 0, title: label + ' · 第一章', url: hit.bookUrl + '#chapter=1' }])
     }
     case 'get_book_info': return ok(toBook(findHit(req.url, req.bookSourceUrl)))

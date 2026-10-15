@@ -4,12 +4,16 @@ export interface ExploreCategory {
 }
 
 /**
- * exploreUrl 是否是「需要执行 JS 才能得到分类」的规则。
+ * exploreUrl 是否是「必须执行 JS 才能得到分类」的规则。
  *
- * 这类规则（七猫/书山/墨阅/光遇/故事族都用）在前端只做字符串启发式解析是
- * 永远得不到分类的 —— `parseExploreCategories` 会返回空数组，于是发现页
- * 分类栏与书列表一起空掉。它们必须交给后端 `get_explore_kinds` 在沙盒里
- * 真正求值（对齐 legado `BookSourceExtensions.exploreKinds()`）。
+ * `@js:` / `<js>` 前缀（聚合类书源常用）在前端只做字符串启发式
+ * 解析永远得不到分类 —— `parseExploreCategories` 返回空数组，于是发现页分类栏
+ * 与书列表一起空掉。它们必须交给后端 `get_explore_kinds` 在沙盒里真正求值
+ * （对齐 legado `BookSourceExtensions.exploreKinds()`）。
+ *
+ * 注意这个判据**不是**决定要不要走后端的唯一条件：`loadKinds` 在本地解析不出
+ * 任何分类时也会回退到后端，覆盖 `[{'title':...}]` 这类裸 JS 字面量
+ * —— 它没有 `@js:` 前缀，但同样不是合法 JSON。两处配合，不必在这里堆规则。
  */
 export function isJsExploreUrl(rule?: string | null): boolean {
   const trimmed = rule?.trim().toLowerCase()
