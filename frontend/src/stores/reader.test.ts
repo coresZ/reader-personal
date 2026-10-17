@@ -686,6 +686,41 @@ describe('reader local txt chapters', () => {
     expect(syncLegadoBookProgress).not.toHaveBeenCalled()
   })
 
+  it('prefers the local chapter position over a zeroed shelf position on reopen', async () => {
+    const appStore = useAppStore()
+    const readerStore = useReaderStore()
+    appStore.setLegadoSyncEnabled(false)
+    const book = {
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'test-source',
+      bookUrl: 'https://example.test/local-position',
+      durChapterIndex: 0,
+      durChapterPos: 0,
+      durChapterTime: 1_700_000_000_000,
+    }
+    localStorage.setItem(
+      `reader-position:${book.bookUrl}`,
+      JSON.stringify({
+        chapterIndex: 0,
+        progress: 0.72,
+        updatedAt: 1_700_000_100_000,
+      }),
+    )
+    vi.mocked(getChapterList).mockResolvedValue([
+      { title: '第一章', url: 'chapter-0', index: 0 },
+    ])
+    vi.mocked(getBookContent).mockResolvedValue('本地章节正文')
+
+    await readerStore.loadBook(book)
+
+    expect(readerStore.chapterScrollProgress).toBe(0.72)
+    const savedSession = vi.mocked(localStorage.setItem).mock.calls
+      .filter(([key]) => key === 'reader-last-session')
+      .at(-1)
+    expect(savedSession?.[1]).toContain('"chapterScrollProgress":0.72')
+  })
+
   it('uses the saved chapter when restoring an offline reader session', async () => {
     const appStore = useAppStore()
     const readerStore = useReaderStore()

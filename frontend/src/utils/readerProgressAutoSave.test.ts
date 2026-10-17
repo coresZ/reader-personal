@@ -58,7 +58,7 @@ describe('readerProgressAutoSave', () => {
     expect(flush).toHaveBeenCalledTimes(1)
   })
 
-  it('persists only once when home navigation, route leave, and unmount overlap', async () => {
+  it('saves local position on every exit hook but blocks server flush once', async () => {
     const disposeAutoSave = vi.fn()
     const savePosition = vi.fn()
     const flushToServer = vi.fn()
@@ -77,13 +77,13 @@ describe('readerProgressAutoSave', () => {
     saver.flushKeepalive()
 
     expect(disposeAutoSave).toHaveBeenCalledTimes(1)
-    expect(savePosition).toHaveBeenCalledTimes(1)
+    expect(savePosition).toHaveBeenCalledTimes(3)
     expect(flushToServer).toHaveBeenCalledTimes(1)
     expect(flushToServerKeepalive).not.toHaveBeenCalled()
     expect(flushToLegado).toHaveBeenCalledTimes(1)
   })
 
-  it('sends only one keepalive when pagehide, beforeunload, and unmount overlap', () => {
+  it('re-saves local position but sends only one keepalive when exit hooks overlap', async () => {
     const disposeAutoSave = vi.fn()
     const savePosition = vi.fn()
     const flushToServer = vi.fn()
@@ -97,14 +97,15 @@ describe('readerProgressAutoSave', () => {
 
     saver.flushKeepalive()
     saver.flushKeepalive()
+    await Promise.resolve()
 
     expect(disposeAutoSave).toHaveBeenCalledTimes(1)
-    expect(savePosition).toHaveBeenCalledTimes(1)
+    expect(savePosition).toHaveBeenCalledTimes(2)
     expect(flushToServer).not.toHaveBeenCalled()
     expect(flushToServerKeepalive).toHaveBeenCalledTimes(1)
   })
 
-  it('does not run a blocking flush after a gesture navigation keepalive already persisted', async () => {
+  it('runs the final blocking flush after a gesture navigation keepalive', async () => {
     const disposeAutoSave = vi.fn()
     const savePosition = vi.fn()
     const flushToServer = vi.fn()
@@ -120,8 +121,8 @@ describe('readerProgressAutoSave', () => {
     await saver.flushBeforeRouteLeave()
 
     expect(disposeAutoSave).toHaveBeenCalledTimes(1)
-    expect(savePosition).toHaveBeenCalledTimes(1)
-    expect(flushToServer).not.toHaveBeenCalled()
+    expect(savePosition).toHaveBeenCalledTimes(2)
+    expect(flushToServer).toHaveBeenCalledTimes(1)
     expect(flushToServerKeepalive).toHaveBeenCalledTimes(1)
   })
 

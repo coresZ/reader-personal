@@ -169,6 +169,7 @@
           lineHeight: config.lineHeight,
           '--reader-page-width': config.pageWidth + 'px',
           '--reader-side-padding': '24px',
+          '--reader-page-vertical-padding': config.pageVerticalPadding + 'px',
           '--reader-page-step': horizontalPageStepStyle,
           '--reader-text-width': horizontalTextWidth + 'px',
         }"
@@ -217,14 +218,6 @@
         </div>
       </article>
 
-      <Transition name="fade">
-        <div v-if="!store.loading && isHorizontalPageMode && isHorizontalAtEnd" class="horizontal-next-floating">
-          <button class="next-btn" :disabled="!store.hasNext" @click="nextChapter">
-            {{ store.hasNext ? '下一章' : '没有更多了' }}
-          </button>
-        </div>
-      </Transition>
-
       <div
         v-if="!showChapterLoading && isContinuousMode"
         class="continuous-reading"
@@ -255,12 +248,6 @@
             }"
             v-html="chapter.html"
           ></div>
-
-          <div v-if="chapter.index === continuousChapters[continuousChapters.length - 1]?.index" class="chapter-footer">
-            <button class="next-btn" :disabled="!store.hasNext" @click="nextChapter">
-              {{ store.hasNext ? '继续加载下一章' : '已经到底了' }}
-            </button>
-          </div>
         </section>
 
         <div v-if="continuousLoadingNext" class="continuous-loading-inline">正在加载下一章...</div>
@@ -388,7 +375,6 @@ import { useReaderStore, fontPresets, TOC_END_CHECK_INTERVAL_MS } from '../store
 import { useAppStore } from '../stores/app'
 import { getBookInfo, getBookshelfWithCacheInfo } from '../api/bookshelf'
 import { evalSourceClick, type ShowBrowserRequest } from '../api/sourceClick'
-import { readerOrigin } from '../api/scheme'
 import { applySystemTheme } from '../utils/systemUi'
 import { APP_VIEWPORT_CHANGE_EVENT, syncViewportSize } from '../utils/viewport'
 import { isReaderInteractiveClickTarget } from '../utils/readerClick'
@@ -398,7 +384,8 @@ import {
   shouldRevealReaderControls,
 } from '../utils/readerHoverControls'
 import { shouldPreferServerReadingPosition, type ReadingPositionSnapshot } from '../utils/readingPosition'
-import { isLocalBook } from '../utils/localBook'
+import { isLocalBook, isLocalEpubBook } from '../utils/localBook'
+import { rewriteCssAssetUrls, toReaderAssetUrl } from '../utils/localEpubAsset'
 import { processSourceImageOptions } from '../utils/sourceImageOptions'
 import { repairSourceImageHtml } from '../utils/sourceImageHtml'
 import { handleReaderFontSizeWheel } from '../utils/readerFontSize'
@@ -703,26 +690,31 @@ const pendingLegadoPageRestore = ref<{
 } | null>(null)
 let pendingRestoreAttempts = 0
 let skipPositionRestoreIndex: number | null = null
-let skipPositionRestoreUntil = 0
 
 /** 「往前翻跨章」的落位意图: 目标章(上一章)的索引, 期望落在它的**末页**。
  *  分页重建完成后由 applyPendingPrevChapterLanding 消费(见那边的说明)。 */
 let pendingPrevChapterLandingIndex: number | null = null
 
-/** 标记某章节的进入来自滚动/主动跳转, 无需恢复上次阅读位置。带 1 秒过期,
- *  避免残留标记误吞后续打开书籍时的位置恢复(如阅读器内书架换书不重挂载)。 */
+/** 标记某章节的进入来自滚动/主动跳转, 无需恢复上次阅读位置。
+ *
+ *  这里**不能**用"带过期的乐观标记"来实现: 跨章翻页要等书源正文返回才真正切
+ *  过去, 网络慢或未命中缓存时可能远超 1 秒。旧实现的 1 秒过期会在这段时间里
+ *  静默失效, 随后的位置恢复便读到该章历史位置并把页码拽走 —— 表现就是"从上一
+ *  章末页翻进来, 却落在上次读到的第 3 页"(issue #14 第 9 条的变体)。
+ *
+ *  标记因此改为**计数消费**: 只在"下一次进入索引 index 的那一次"生效, 由
+ *  consumeSkipPositionRestore 取走并立即作废, 与耗时无关。残留也不会误吞后续
+ *  打开书籍的位置恢复 —— 换书时 bookUrl watcher 会清掉它。 */
 function markSkipPositionRestore(index: number) {
   skipPositionRestoreIndex = index
-  skipPositionRestoreUntil = Date.now() + 1000
 }
 
+/** 消费一次跳过标记: 命中才作废, 保证一次进入最多被豁免一次。 */
 function shouldSkipPositionRestore(index: number) {
   if (skipPositionRestoreIndex == null) return false
-  if (Date.now() >= skipPositionRestoreUntil) {
-    skipPositionRestoreIndex = null
-    return false
-  }
-  return skipPositionRestoreIndex === index
+  if (skipPositionRestoreIndex !== index) return false
+  skipPositionRestoreIndex = null
+  return true
 }
 let suppressPositionSaveUntil = 0
 let suppressContinuousScrollSyncUntil = 0
@@ -949,9 +941,63 @@ function applyParagraphSpacingToBlockChildren(wrapper: HTMLElement) {
   })
 }
 
+/**
+ * 当前章节是否来自本地 EPUB 的自带排版。
+ *
+ * 判据是后端 `local_epub_book.rs` 的 `CHAPTER_SCOPE_CLASS` 包裹类(两处必须一致):
+ * 书源正文里也可能出现 `<style>`, 那些仍要走既有的书源清洗流程。
+ */
+function isEpubChapterHtml(html: string) {
+  return isLocalEpubBook(store.book) && html.includes('epub-chapter-content')
+}
+
+/** 承载本地 EPUB 原书样式的 `<style>` 元素(整本书共用一份)。 */
+const EPUB_STYLE_ELEMENT_ID = 'reader-epub-book-style'
+
+/**
+ * 把章节里的 `<style>` 取出并合并注入文档 head, 同时从正文中移除。
+ *
+ * 原书样式在导入时已按 `.epub-chapter-content` 作用域化, 因此放到 head 也只
+ * 影响本章容器, 不会波及阅读器界面; 而留在正文里会被横向分页的 `inline` 分支
+ * 包进 `<p>`, 有被 `Range.cloneContents` 切成半截 CSS 的风险。
+ * 每章的内容相同, 按内容比对去重, 避免重复注入。
+ */
+function moveEpubStylesToHead(root: HTMLElement) {
+  const styles = Array.from(root.querySelectorAll('style'))
+  if (!styles.length) return
+  const css = styles
+    .map((style) => rewriteCssAssetUrls(style.textContent || ''))
+    .filter(Boolean)
+    .join('\n')
+  styles.forEach((style) => style.remove())
+  if (!css) return
+
+  let element = document.getElementById(EPUB_STYLE_ELEMENT_ID) as HTMLStyleElement | null
+  if (!element) {
+    element = document.createElement('style')
+    element.id = EPUB_STYLE_ELEMENT_ID
+    document.head.appendChild(element)
+  }
+  if (element.textContent !== css) element.textContent = css
+}
+
 function formatChapterHtml(rawText: string) {
   if (!rawText) return ''
   const text = rawText
+  // 本地 EPUB 自带排版: 章节 HTML 里内联了原书(已作用域化的)CSS, 图片也按原书
+  // 比例排布。这里不能再走下面的书源清洗流程 —— 它会删掉 <style>、剥掉内联
+  // 字号字体, 还会按阅读器设置重写每个 <p> 的 margin, 恰好把这些样式全部抵消。
+  if (isEpubChapterHtml(text)) {
+    const wrapper = document.createElement('div')
+    wrapper.innerHTML = text
+    // 原书样式从正文流里摘出来注入文档 head: 样式已按 `.epub-chapter-content`
+    // 作用域化, 放在 head 同样只作用于本章容器; 留在正文里则会被分页逻辑当成
+    // 内联内容包进 <p>, 一旦该页被切分, `Range.cloneContents` 会切出半截 CSS。
+    moveEpubStylesToHead(wrapper)
+    rewriteLocalEpubAssetSrcs(wrapper)
+    highlightSearchText(wrapper)
+    return wrapper.innerHTML
+  }
   const stripLeadingIndent = (line: string) => line.replace(/^[\u3000\u00A0 \t]+/, '')
   const wrapper = document.createElement('div')
 
@@ -1033,17 +1079,45 @@ async function handleSourceImageClick(event: MouseEvent) {
   }
 }
 
+/**
+ * 把章节里 `/reader3/localEpubAsset?...` 形式的资源地址改写成自定义协议地址
+ * (`${readerOrigin}/epub?...`)。
+ *
+ * 三处都要改写: `<img src>`、封面页用的 SVG `<image xlink:href>`、以及内联
+ * `<style>` 里 `url()` 引用的背景图。只处理 `<img>` 会让封面页和带背景图的
+ * 页面整块 404。
+ */
 function rewriteLocalEpubAssetSrcs(root: HTMLElement) {
-  const images = Array.from(root.querySelectorAll('img')) as HTMLImageElement[]
-  images.forEach((image) => {
+  root.querySelectorAll('img').forEach((image) => {
     const src = image.getAttribute('src') || ''
-    // Legacy relative asset URLs are mapped to the custom scheme endpoint
-    // (`${readerOrigin}/epub?bookUrl=...&path=...`); already-absolute
-    // URLs pass through unchanged. No auth params are needed anymore.
-    if (src.startsWith('/reader3/localEpubAsset')) {
-      const query = src.includes('?') ? src.slice(src.indexOf('?')) : ''
-      image.setAttribute('src', `${readerOrigin}/epub${query}`)
+    const next = toReaderAssetUrl(src)
+    if (next !== src) image.setAttribute('src', next)
+  })
+
+  // SVG `<image>`: `xlink:href` 在 HTML 解析下会被放进 xlink 命名空间,
+  // 直接读 `getAttribute('xlink:href')` 未必命中, 两种读法都试一遍。
+  root.querySelectorAll('image').forEach((element) => {
+    const xlinkNs = 'http://www.w3.org/1999/xlink'
+    const xlinkHref = element.getAttributeNS(xlinkNs, 'href')
+      || element.getAttribute('xlink:href')
+    if (xlinkHref) {
+      const next = toReaderAssetUrl(xlinkHref)
+      if (next !== xlinkHref) {
+        element.setAttributeNS(xlinkNs, 'xlink:href', next)
+        element.setAttribute('xlink:href', next)
+      }
     }
+    const href = element.getAttribute('href')
+    if (href) {
+      const next = toReaderAssetUrl(href)
+      if (next !== href) element.setAttribute('href', next)
+    }
+  })
+
+  root.querySelectorAll('style').forEach((style) => {
+    const css = style.textContent || ''
+    const next = rewriteCssAssetUrls(css)
+    if (next !== css) style.textContent = next
   })
 }
 
@@ -1110,12 +1184,10 @@ const {
   horizontalPageStepStyle,
   horizontalTextWidth,
   horizontalPages,
-  isHorizontalAtEnd,
   horizontalLastPageStart,
   isHorizontalPagesStale,
   rebuildHorizontalPages,
   updateHorizontalMetrics,
-  updateHorizontalEndState,
   alignHorizontalToNearestPage,
   resetHorizontalPagePosition,
 } = useHorizontalPaging(
@@ -1125,6 +1197,9 @@ const {
     fontWeight: config.value.fontWeight,
     lineHeight: config.value.lineHeight,
     pageWidth: config.value.pageWidth,
+    pageVerticalPadding: config.value.pageVerticalPadding,
+    paragraphSpacing: config.value.paragraphSpacing,
+    firstLineIndent: config.value.firstLineIndent,
   })),
   currentFontFamily,
   formattedContent,
@@ -1305,7 +1380,6 @@ function syncHorizontalPageState() {
   const maxPage = Math.max(0, horizontalPages.value.length - 1)
   const progress = maxPage <= 0 ? 1 : horizontalPageIndex.value / maxPage
   store.setChapterScrollProgress(progress)
-  updateHorizontalEndState()
   if (shouldPreloadNextChapter()) {
     store.preloadAroundChapter(store.currentIndex)
   }
@@ -1418,7 +1492,7 @@ function applyPendingPrevChapterLanding(): boolean {
 
 // Navigation
 function goHome() {
-  persistReadingProgressKeepalive()
+  captureProgressForSync()
   try {
     sessionStorage.setItem('reader-skip-offline-restore', '1')
   } catch {
@@ -1514,6 +1588,12 @@ async function prevChapter() {
     // 已经不可靠。
     const landingPending = isHorizontalPageMode.value
       && pendingPrevChapterLandingIndex === targetIndex
+    // 跨章翻页是「进入目标章某一端」的明确意图: 向前落到新章首页, 向后由
+    // applyPendingPrevChapterLanding 落到上一章末页。该章上次留下的阅读位置
+    // 不属于这次进入, 必须挡在恢复之外 —— 否则位置恢复会把刚落好的页码拽走
+    // (向后翻就会从末页跳到倒数第二页)。与目录跳转同一个标记、同一时机:
+    // 在 await 之前置位, 因为索引变化触发的 watcher 可能早于本函数返回。
+    markSkipPositionRestore(targetIndex)
     await store.prevChapter()
     if (landingPending) {
       // 落位改由 applyPendingPrevChapterLanding 在分页重建后兑现。这里**不能**走
@@ -1545,6 +1625,9 @@ async function nextChapter() {
   }
 
   if (!isContinuousMode.value) {
+    // 与 prevChapter 同理: 跨章前进是「去新章开头」的明确意图, 目标章的历史
+    // 位置不能参与这次恢复。置位必须在 await 之前(索引 watcher 可能先跑)。
+    markSkipPositionRestore(targetIndex)
     await store.nextChapter()
     scrollToTop('instant')
     return
@@ -1911,7 +1994,6 @@ async function restoreLegadoReadingPosition() {
     if (pageIndex < 0 || !pages.length) return false
     // 一屏恰好一页: 目标页索引直接就是它在页面列表里的下标。
     horizontalPageIndex.value = clampReaderPageIndex(pageIndex, pages.length)
-    updateHorizontalEndState()
     pendingLegadoPageRestore.value = null
     legadoPositionRestoreAttempts = 0
     legadoPositionRestoreSettling = false
@@ -2068,22 +2150,51 @@ function restoreReadingPositionInternal(saved: SavedReadingPosition | null, fina
   }
 
   if (isHorizontalPageMode.value) {
-    if (store.loading || container.scrollWidth <= container.clientWidth + 4) {
+    // 左右分页的画面位置**只由 `horizontalPageIndex` 的 transform 驱动**,
+    // 滚动容器是 overflow: hidden、没有可滚动空间(见 .horizontal-page-mode
+    // 与 horizontalPageTransform)。所以这里绝不能像纵向/连续模式那样按
+    // `scrollLeft` 定位: 那个轴上 maxScroll 恒为 0, scrollTo 是空操作 ——
+    // 恢复"成功"了却停在第一页, 正是「重进回到章节开头」的根因。
+    //
+    // 位置必须落回页索引。`syncHorizontalPageState` 保存的进度就是
+    // `horizontalPageIndex / 末页索引`, 这里按同一个公式反向映射即可,
+    // 与窗口缩放、改排版后的比例映射(readerPageIndexFromProgress)同源。
+    if (store.loading || !horizontalPages.value.length) {
       debugPositionLog('restore waiting: horizontal content not ready', {
         saved,
         loading: store.loading,
-        scrollWidth: container.scrollWidth,
-        clientWidth: container.clientWidth,
+        pages: horizontalPages.value.length,
       })
       return false
     }
-    const maxScroll = Math.max(0, container.scrollWidth - container.clientWidth)
-    container.scrollTo({ left: maxScroll * Math.max(0, Math.min(1, saved.progress || 0)), behavior: 'instant' })
+    // 分页还是上一章的产物时, 页数是旧章的, 按它算索引会落错页。
+    // 等 rebuildHorizontalPages 用新章正文重建完再恢复。
+    if (isHorizontalPagesStale()) {
+      debugPositionLog('restore waiting: horizontal pages are stale', {
+        saved,
+        pages: horizontalPages.value.length,
+      })
+      return false
+    }
+    const pageIndex = readerPageIndexFromProgress(
+      Math.max(0, Math.min(1, saved.progress || 0)),
+      horizontalPages.value.length,
+    )
+    horizontalPageIndex.value = pageIndex
+    // 索引与容器的 scrollLeft 无关, 但仍归零: 旧实现留下的非零 scrollLeft
+    // 会被 handleScroll 当成翻页信号。
+    if (container.scrollLeft !== 0) {
+      container.scrollTo({ left: 0, behavior: 'auto' })
+    }
     if (finalize) {
       pendingRestorePosition.value = null
       pendingRestoreAttempts = 0
+      // 恢复本身会改变索引, 这里同步一次让本章进度与页索引对齐; 期间禁止
+      // 保存, 否则 handleScroll 会拿恢复中途的索引覆盖掉刚读到位置。
+      suppressPositionSaveUntil = Date.now() + 400
+      syncHorizontalPageState()
     }
-    debugPositionLog('restored horizontal position', { saved, maxScroll })
+    debugPositionLog('restored horizontal position', { saved, pageIndex })
     return true
   }
 
@@ -2586,7 +2697,6 @@ function handleScroll() {
       if (container.scrollLeft !== 0) {
         container.scrollTo({ left: 0, behavior: 'auto' })
       }
-      updateHorizontalEndState()
       if (shouldPreloadNextChapter()) {
         store.preloadAroundChapter(store.currentIndex)
       }
@@ -3108,8 +3218,9 @@ async function openInfo() {
   }
 }
 
-onBeforeRouteLeave(() => {
-  persistReadingProgressKeepalive()
+onBeforeRouteLeave(async () => {
+  captureProgressForSync()
+  await readerProgressExitSaver.flushBeforeRouteLeave()
   return true
 })
 
@@ -3338,7 +3449,6 @@ watch(() => config.value.readMethod, async () => {
     resetHorizontalPagePosition()
   }
   await rebuildHorizontalPages()
-  updateHorizontalEndState()
   scheduleRestoreReadingPosition()
 })
 
@@ -3352,14 +3462,13 @@ watch(() => store.currentIndex, () => {
   beginHorizontalJump(true)
   resetHorizontalPagePosition()
   void rebuildHorizontalPages().then(applyPendingPrevChapterLanding)
-  updateHorizontalEndState()
 })
 
 // 排版参数变化(字号/行高/段距/页宽/首行缩进)会重新分页, 页数与页边界都变了。
 // 按**阅读进度比例**把位置映射到新分页, 而不是一律回到第一页 —— 否则在设置里
 // 拖一下字号或页宽就会跳回本章开头, 还会把这个 0 进度写回书架。
 watch(
-  [() => config.value.fontSize, () => config.value.fontWeight, () => config.value.lineHeight, () => config.value.paragraphSpacing, () => config.value.firstLineIndent, () => config.value.pageWidth],
+  [() => config.value.fontSize, () => config.value.fontWeight, () => config.value.lineHeight, () => config.value.paragraphSpacing, () => config.value.firstLineIndent, () => config.value.pageWidth, () => config.value.pageVerticalPadding],
   () => {
     if (!isHorizontalPageMode.value) return
     const previousMax = Math.max(0, horizontalPages.value.length - 1)
@@ -3477,6 +3586,11 @@ watch(() => store.loading, (loading) => {
 })
 
 watch(() => store.book?.bookUrl, () => {
+  // 换书(阅读器内切书、不重挂载)时清掉上一本残留的跳过标记与落位意图。
+  // 标记现在是"命中的那一次进入即作废"的计数消费, 没有时间兜底: 换书后若
+  // 恰好进入同号章节, 残留标记会误豁免那一次本该恢复的位置。
+  skipPositionRestoreIndex = null
+  clearPendingPrevChapterLanding()
   loadSavedReadingPosition()
   scheduleRefreshOfflineCacheState()
 })
@@ -3781,7 +3895,7 @@ watch(
   min-width: var(--reader-page-step);
   height: 100%;
   min-height: 100%;
-  padding: 24px var(--reader-side-padding);
+  padding: var(--reader-page-vertical-padding) var(--reader-side-padding);
   box-sizing: border-box;
 }
 
@@ -3887,6 +4001,14 @@ watch(
   box-shadow: inset 0 0 0 1px rgba(201, 127, 58, 0.18);
 }
 
+/* 本地 EPUB: 正文排版以原书 CSS 为准(原书规则随章节内联, 在 DOM 中位于本组件
+   样式之后, 因此会覆盖这里的阅读器默认值)。这里只兜底图片不溢出容器。 */
+:deep(.epub-chapter-content img),
+:deep(.epub-chapter-content svg) {
+  max-width: 100%;
+  height: auto;
+}
+
 :deep(.chapter-text font),
 :deep(.chapter-text big),
 :deep(.chapter-text small),
@@ -3920,21 +4042,6 @@ watch(
   padding-bottom: 40px;
 }
 
-.horizontal-next-floating {
-  position: absolute;
-  left: 50%;
-  bottom: calc(20px + var(--safe-area-bottom));
-  transform: translateX(-50%);
-  z-index: 12;
-  pointer-events: none;
-}
-
-.horizontal-next-floating .next-btn {
-  pointer-events: auto;
-  background: rgba(255, 255, 255, 0.75);
-  backdrop-filter: blur(6px);
-}
-
 .continuous-loading-inline {
   text-align: center;
   padding: 18px 24px;
@@ -3956,15 +4063,13 @@ watch(
 
 .next-btn:hover:not(:disabled) {
   opacity: 1;
-  background: rgba(0,0,0,0.05);
+  background: rgba(0, 0, 0, 0.05);
 }
 
 .next-btn:disabled {
   opacity: 0.2;
   cursor: not-allowed;
 }
-
-
 
 /* Slide Drawer Overlay */
 .reader-overlay {

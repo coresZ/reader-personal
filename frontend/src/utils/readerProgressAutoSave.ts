@@ -1,4 +1,5 @@
 type TimerHandle = ReturnType<typeof setTimeout> | number
+const KEEPALIVE_SETTLE_TIMEOUT_MS = 800
 
 export interface ReaderProgressAutoSaveSchedulerOptions {
   intervalMs: number
@@ -11,7 +12,7 @@ export interface ReaderProgressExitSaverOptions {
   disposeAutoSave: () => void
   savePosition: () => void
   flushToServer: () => Promise<void> | void
-  flushToServerKeepalive: () => void
+  flushToServerKeepalive: () => Promise<void> | void
   flushToLegado?: () => Promise<void> | void
 }
 
@@ -70,13 +71,18 @@ export function createReaderProgressExitSaver({
   flushToServerKeepalive,
   flushToLegado,
 }: ReaderProgressExitSaverOptions) {
-  let persisted = false
   let routeFlushPromise: Promise<void> | null = null
+  let routeFlushed = false
+  let keepaliveSent = false
+  let autoSaveDisposed = false
+  let keepaliveThenFinal: Promise<void> | null = null
+  let finalFlushCompleted = false
 
   function beginPersist() {
-    if (persisted) return false
-    persisted = true
-    disposeAutoSave()
+    if (!autoSaveDisposed) {
+      autoSaveDisposed = true
+      disposeAutoSave()
+    }
     savePosition()
     return true
   }
@@ -84,17 +90,38 @@ export function createReaderProgressExitSaver({
   return {
     async flushBeforeRouteLeave() {
       if (routeFlushPromise) return routeFlushPromise
-      if (!beginPersist()) return
-      routeFlushPromise = Promise.resolve(flushToServer())
+      if (routeFlushed) {
+        beginPersist()
+        return
+      }
+      routeFlushed = true
+      beginPersist()
+      const previous = keepaliveThenFinal
+      routeFlushPromise = Promise.race([
+        Promise.resolve(previous),
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, KEEPALIVE_SETTLE_TIMEOUT_MS)
+        }),
+      ])
+        .then(() => flushToServer())
+        .then(() => {
+          finalFlushCompleted = true
+        })
         .then(() => flushToLegado?.())
+        .finally(() => {
+          routeFlushPromise = null
+        })
         .catch(() => undefined)
       await routeFlushPromise
     },
 
     flushKeepalive() {
-      if (!beginPersist()) return
-      flushToServerKeepalive()
-      void flushToLegado?.()
+      beginPersist()
+      if (keepaliveSent || finalFlushCompleted) return
+      keepaliveSent = true
+      keepaliveThenFinal = Promise.resolve(flushToServerKeepalive())
+        .then(() => flushToLegado?.())
+        .then(() => undefined)
     },
 
     flushTemporaryKeepalive() {

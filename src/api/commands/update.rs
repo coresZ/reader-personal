@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -9,6 +11,10 @@ use serde_json::Value;
 use crate::api::AppState;
 use crate::error::error::{ApiResponse, AppError};
 use crate::service::update_service::GithubAsset;
+
+/// 当前正在执行的桌面更新任务。应用内更新同一时间只允许一个进行，
+/// 取消命令只需置位这个共享标志，由下载循环在块之间检查并退出。
+static UPDATE_CANCELLATION: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
 #[derive(Debug, Deserialize)]
 pub struct VersionUpdateQuery {
@@ -77,7 +83,22 @@ pub async fn apply_desktop_update(
         ));
     }
 
+    let cancelled = Arc::new(AtomicBool::new(false));
+    {
+        let mut current = UPDATE_CANCELLATION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = current.take() {
+            previous.store(true, Ordering::Relaxed);
+        }
+        *current = Some(cancelled.clone());
+    }
+    let _guard = UpdateCancellationGuard;
+
     send_progress(&on_event, "checking", Some(0), 0, 0, "正在确认最新版本");
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(AppError::BadRequest("更新已取消".to_string()));
+    }
     let info = match state.update_service.check(false).await {
         Ok(info) => info,
         Err(error) => {
@@ -106,7 +127,7 @@ pub async fn apply_desktop_update(
     let mut last_reported_bytes = 0_u64;
     let download_result = state
         .update_service
-        .download_asset_to_path(asset, &temporary_path, |downloaded, total| {
+        .download_asset_to_path(asset, &temporary_path, &cancelled, |downloaded, total| {
             let percent = (total > 0).then(|| {
                 ((downloaded.saturating_mul(100) / total).min(100)) as u8
             });
@@ -130,7 +151,12 @@ pub async fn apply_desktop_update(
         Ok(downloaded) => downloaded,
         Err(error) => {
             cleanup_file(&temporary_path);
-            send_progress(&on_event, "failed", None, 0, 0, "更新文件下载失败");
+            let message = if error.to_string().contains("更新已取消") {
+                "更新已取消"
+            } else {
+                "更新文件下载失败"
+            };
+            send_progress(&on_event, "failed", None, 0, 0, message);
             return Err(error);
         }
     };
@@ -143,6 +169,11 @@ pub async fn apply_desktop_update(
         asset.size,
         "正在校验更新文件",
     );
+    if cancelled.load(Ordering::Relaxed) {
+        cleanup_file(&temporary_path);
+        send_progress(&on_event, "failed", None, 0, 0, "更新已取消");
+        return Err(AppError::BadRequest("更新已取消".to_string()));
+    }
     if let Err(error) = validate_update_package(asset, &temporary_path, downloaded) {
         cleanup_file(&temporary_path);
         send_progress(
@@ -221,6 +252,39 @@ pub async fn apply_desktop_update(
             asset_name: asset.name.clone(),
             message: "更新文件已下载并打开，请按系统提示完成安装".to_string(),
         }))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelDesktopUpdateRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[tauri::command]
+pub async fn cancel_desktop_update(
+    _req: Option<CancelDesktopUpdateRequest>,
+) -> Result<ApiResponse<Value>, AppError> {
+    let cancelled = UPDATE_CANCELLATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|flag| {
+            flag.store(true, Ordering::Relaxed);
+            true
+        })
+        .unwrap_or(false);
+    Ok(ApiResponse::ok(serde_json::json!({ "cancelled": cancelled })))
+}
+
+struct UpdateCancellationGuard;
+
+impl Drop for UpdateCancellationGuard {
+    fn drop(&mut self) {
+        let mut current = UPDATE_CANCELLATION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = None;
     }
 }
 

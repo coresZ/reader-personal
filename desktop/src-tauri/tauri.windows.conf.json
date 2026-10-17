@@ -4,7 +4,8 @@
   "bundle": {
     "windows": {
       "nsis": {
-        "installerHooks": "./windows-hooks.nsh"
+        "installerHooks": "./windows-hooks.nsh",
+        "template": "./installer.nsi"
       }
     }
   }

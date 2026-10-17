@@ -23,6 +23,7 @@
 
 !define READER_OLD_UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Reader"
 !define READER_OLD_MANUPRODUCTKEY "Software\hadc188\Reader"
+!define READER_STABLE_MANUPRODUCTKEY "Software\hadc188\Reader"
 
 !macro ReaderLStopOldBuild
   ; The previous build may still be running and holding the SQLite database
@@ -201,4 +202,7 @@
 
 !macro NSIS_HOOK_POSTINSTALL
   !insertmacro ReaderLMigrateFromOldName
+  ; Keep a product-name-independent record. Future releases can find the
+  ; install directory even if PRODUCTNAME changes again.
+  WriteRegStr SHCTX "${READER_STABLE_MANUPRODUCTKEY}" "" "$INSTDIR"
 !macroend

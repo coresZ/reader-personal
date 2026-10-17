@@ -39,6 +39,19 @@ pub async fn build_state(cfg: &AppConfig) -> anyhow::Result<AppState> {
     let cache = FileCache::new(format!("{}/cache", cfg.storage_dir));
 
     let book_service = Arc::new(BookService::new(http.clone(), parser, cache, &cfg.storage_dir));
+    // Search results can be abandoned by a crash or forced quit, bypassing the
+    // frontend's session cleanup. Only unreferenced files older than the
+    // threshold are removed, so an active cover cache is never evicted.
+    match book_service
+        .clean_stale_search_covers(std::time::Duration::from_secs(30 * 60))
+        .await
+    {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(removed, "cleaned stale search cover cache")
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!("failed to clean stale search cover cache: {err}"),
+    }
     let book_source_service = Arc::new(BookSourceService::new(repo, &cfg.storage_dir));
     let local_txt_book_service = Arc::new(LocalTxtBookService::new(&cfg.storage_dir));
     let local_epub_book_service = Arc::new(LocalEpubBookService::new(&cfg.storage_dir));

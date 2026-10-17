@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -8,6 +9,22 @@ use crate::app::window_state::{
     capture, monitor_rects, sanitize, sanitize_geometry, InitialGeometry, WindowState,
     WindowStateStore,
 };
+
+/// 本轮关闭请求是否已被前端接管。
+///
+/// 外壳在拦截关闭请求后启动看门狗: 宽限期内前端若已 hide(关闭到托盘)或
+/// destroy(退出), 就在这里置位, 看门狗据此退让; 否则替前端结束窗口, 避免
+/// "窗口关不掉"。
+///
+/// 用显式回执而不是轮询窗口可见性: 隐藏到托盘后用户可能立刻从托盘重新打开
+/// 窗口, 轮询会把那次重开误判成"前端没响应"并销毁窗口。
+pub static CLOSE_REQUEST_HANDLED: AtomicBool = AtomicBool::new(false);
+
+/// 前端回执: 这一轮关闭请求已经处理完(窗口已隐藏或已销毁)。
+#[tauri::command]
+pub fn acknowledge_close_request() {
+    CLOSE_REQUEST_HANDLED.store(true, Ordering::SeqCst);
+}
 
 /// 窗口模式状态, 供前端决定是否使用紧凑布局。
 #[derive(Debug, Clone, Copy, Serialize)]

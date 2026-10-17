@@ -44,6 +44,7 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
         commands::book::get_chapter_list,
         commands::book::get_book_content,
         commands::book::delete_book_cache,
+        commands::book::clear_search_cover_cache,
         commands::book::get_cached_chapter_urls,
         commands::book::get_bookshelf,
         commands::book::upload_txt_book,
@@ -131,6 +132,7 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
         commands::update::get_version_update,
         commands::update::dismiss_version_update,
         commands::update::apply_desktop_update,
+        commands::update::cancel_desktop_update,
         commands::user::save_user_config,
         commands::user::get_user_config,
         commands::user::upload_file,
@@ -162,5 +164,6 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
         commands::window::configure_boss_key,
         commands::window::get_window_mode,
         commands::window::toggle_mini_mode,
+        commands::window::acknowledge_close_request,
     ]
 }

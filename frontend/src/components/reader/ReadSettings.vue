@@ -283,13 +283,37 @@
       </div>
 
       <!-- 页面宽度：左右分页时正文的行宽（窗口更宽时正文居中、两侧留白） -->
-      <div class="setting-row">
-        <label>页面宽度</label>
-        <div class="stepper">
-          <button class="step-btn" @click="step('pageWidth', -50, 400, 1200)" title="减小页面宽度">−</button>
-          <span class="step-val">{{ config.pageWidth }}</span>
-          <button class="step-btn" @click="step('pageWidth', 50, 400, 1200)" title="增大页面宽度">+</button>
+      <div class="setting-row slider-row">
+        <div class="slider-head">
+          <label>页面宽度</label>
+          <span class="slider-value">{{ config.pageWidth }} px</span>
         </div>
+        <input
+          type="range"
+          class="settings-slider"
+          :min="READER_PAGE_WIDTH_MIN"
+          :max="READER_PAGE_WIDTH_MAX"
+          step="50"
+          :value="config.pageWidth"
+          @input="updateSlider('pageWidth', $event)"
+        >
+      </div>
+
+      <!-- 左右分页时每页正文的上下留白 -->
+      <div class="setting-row slider-row">
+        <div class="slider-head">
+          <label>左右页上下边距</label>
+          <span class="slider-value">{{ config.pageVerticalPadding }} px</span>
+        </div>
+        <input
+          type="range"
+          class="settings-slider"
+          min="0"
+          :max="READER_PAGE_VERTICAL_PADDING_MAX"
+          step="4"
+          :value="config.pageVerticalPadding"
+          @input="updateSlider('pageVerticalPadding', $event)"
+        >
       </div>
       </section>
 
@@ -629,6 +653,11 @@ import {
   type SpeechAudioFormat,
 } from '../../utils/openaiSpeech'
 import { READER_FONT_SIZE_MAX, READER_FONT_SIZE_MIN } from '../../utils/readerFontSize'
+import {
+  READER_PAGE_VERTICAL_PADDING_MAX,
+  READER_PAGE_WIDTH_MAX,
+  READER_PAGE_WIDTH_MIN,
+} from '../../stores/reader'
 import {
   READER_BACKGROUND_OPACITY_STEP,
   percentToReaderOpacity,
@@ -1011,12 +1040,10 @@ function isThemeActive(index: number) {
     : !store.isNight && store.themeIndex === index
 }
 
-function step(key: 'pageWidth', delta: number, min: number, max: number) {
-  const val = Math.max(min, Math.min(max, (config.value[key] as number) + delta))
-  store.updateConfig(key, val)
-}
-
-function updateSlider(key: 'fontSize' | 'fontWeight' | 'animateDuration', event: Event) {
+function updateSlider(
+  key: 'fontSize' | 'fontWeight' | 'animateDuration' | 'pageWidth' | 'pageVerticalPadding',
+  event: Event,
+) {
   const value = Number((event.target as HTMLInputElement).value)
   if (Number.isFinite(value)) {
     store.updateConfig(key, value)

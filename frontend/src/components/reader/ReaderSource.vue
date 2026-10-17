@@ -128,7 +128,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useReaderStore } from '../../stores/reader'
 import { useAppStore } from '../../stores/app'
 import { useSourceStore } from '../../stores/source'
@@ -173,9 +173,26 @@ const currentSource = computed(() => {
 })
 
 function sourceNameByOrigin(origin: string): string {
-  const found = sourceStore.sources.find((s) => s.bookSourceUrl === origin)
+  const found = sourceStore.sources.find((s) => sourceKey(s.bookSourceUrl) === sourceKey(origin))
   return found?.bookSourceName || origin
 }
+
+/** 与 sourceNameByOrigin 相同的比较口径: 去掉首尾空白与末尾斜杠。 */
+function sourceKey(origin: string): string {
+  const normalized = (origin || '').trim()
+  if (!normalized) return ''
+  return normalized.replace(/\/+$/, '')
+}
+
+/** 已启用书源的 origin 集合; 书源列表还没拿到时返回 null(此时不做过滤)。 */
+const enabledSourceOrigins = computed<Set<string> | null>(() => {
+  if (!sourceStore.sources.length) return null
+  return new Set(
+    sourceStore.sources
+      .filter((source) => source.enabled !== false)
+      .map((source) => sourceKey(source.bookSourceUrl)),
+  )
+})
 
 function normalizeText(value?: string) {
   return (value || '')
@@ -215,6 +232,23 @@ onMounted(() => {
   startSearch()
 })
 
+// 首次进入应用直接打开阅读页时, 书源列表往往晚于本面板就绪: 那一次合并因为
+// 还不知道启用集合而放行了全部候选。等列表到位后重做一次, 把已经删除或禁用
+// 的书源从列表中剔除, 并保住仍然有效的选择。
+watch(enabledSourceOrigins, (enabled) => {
+  if (!enabled) return
+  results.value = results.value.filter((item) => enabled.has(sourceKey(item.origin)))
+  const selected = selectedCandidate.value
+  if (selected && enabled.has(sourceKey(selected.book.origin))) return
+  selectedCandidate.value = null
+  candidatePreview.value = null
+  // 搜索已经结束时不会再收到 payload, 这里自己补选首项, 免得对照面板就此消失。
+  if (!searching.value && preparedResults.value.length) {
+    void selectCandidate(preparedResults.value[0])
+  }
+  if (store.book) mergeCandidates(store.book.sourceCandidates || [])
+})
+
 onUnmounted(() => {
   closeAvailableSourceSSE()
 })
@@ -239,9 +273,13 @@ function mergeCandidates(candidates: SearchBook[]) {
   if (!store.book || !candidates.length) return
   const currentBook = store.book
   const currentKey = sourceCandidateKey(currentBook)
+  // 书架保存的候选是换源当时的快照, 其中可能有后来已被删除或禁用的书源;
+  // 只展示仍在启用列表里的源, 与详情页换源的口径一致。
+  const enabled = enabledSourceOrigins.value
   results.value = mergeSourceCandidates(results.value, candidates.filter((item) => (
     sourceCandidateKey(item) !== currentKey
     && matchesSourceSwitchTitle(currentBook.name, item.name)
+    && (!enabled || enabled.has(sourceKey(item.origin)))
   )))
 }
 

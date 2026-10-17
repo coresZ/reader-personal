@@ -1,6 +1,11 @@
 import { defineStore } from 'pinia'
 import { ref, watch, computed } from 'vue'
-import { applyDesktopVersionUpdate, dismissVersionUpdate, getVersionUpdate } from '../api/update'
+import {
+  applyDesktopVersionUpdate,
+  cancelDesktopVersionUpdate,
+  dismissVersionUpdate,
+  getVersionUpdate,
+} from '../api/update'
 import { addReadingStats } from '../api/readingStats'
 import type { DesktopUpdateProgress, VersionUpdateInfo } from '../types'
 import { applySystemTheme } from '../utils/systemUi'
@@ -324,9 +329,63 @@ export const useAppStore = defineStore('app', () => {
   }>(initialReadingStats)
   let readingSessionStartedAt = 0
   let readingSessionBook: { bookUrl: string; bookName: string; bookAuthor: string } | null = null
+  const readingSessionActive = ref(false)
+  let readingSessionVisibilityBound = false
+  let readingSessionHasWindowFocus = true
 
   function persistStats() {
     localStorage.setItem(STATS_KEY, JSON.stringify(readingStats.value))
+  }
+
+  function readingSessionShouldRun() {
+    if (!readingSessionBook?.bookUrl) return false
+    if (typeof document === 'undefined') return true
+    return document.visibilityState !== 'hidden' && readingSessionHasWindowFocus
+  }
+
+  function resumeReadingSessionClock() {
+    if (!readingSessionShouldRun()) {
+      pauseReadingSessionClock()
+      return
+    }
+    // 以**计时起点**为准判断是否在跑, 而不是看 `readingSessionActive`:
+    // 后者只是镜像, 任何一处忘记同步都会让这里空转(见 flushReadingSession 的说明)。
+    if (!readingSessionStartedAt) {
+      readingSessionStartedAt = Date.now()
+    }
+    readingSessionActive.value = true
+  }
+
+  function pauseReadingSessionClock() {
+    if (!readingSessionActive.value) return
+    flushReadingSession()
+    readingSessionActive.value = false
+  }
+
+  function handleReadingSessionVisibilityChange() {
+    if (document.visibilityState === 'hidden') {
+      pauseReadingSessionClock()
+    } else {
+      resumeReadingSessionClock()
+    }
+  }
+
+  function handleReadingSessionWindowBlur() {
+    readingSessionHasWindowFocus = false
+    pauseReadingSessionClock()
+  }
+
+  function handleReadingSessionWindowFocus() {
+    readingSessionHasWindowFocus = true
+    resumeReadingSessionClock()
+  }
+
+  function bindReadingSessionVisibility() {
+    if (readingSessionVisibilityBound || typeof document === 'undefined') return
+    document.addEventListener('visibilitychange', handleReadingSessionVisibilityChange)
+    window.addEventListener('blur', handleReadingSessionWindowBlur)
+    window.addEventListener('focus', handleReadingSessionWindowFocus)
+    readingSessionVisibilityBound = true
   }
 
   function flushReadingSession() {
@@ -334,6 +393,13 @@ export const useAppStore = defineStore('app', () => {
     const delta = Math.max(0, Math.round((Date.now() - readingSessionStartedAt) / 1000))
     readingStats.value.totalSeconds += delta
     readingSessionStartedAt = 0
+    // 计时起点归零后必须同时把"正在计时"标志放掉。
+    //
+    // `readingSessionActive` 是 `readingSessionStartedAt > 0` 的镜像, 两者
+    // 不一致时 `resumeReadingSessionClock` 会因为 `!readingSessionActive` 不成立
+    // 而不再设置新的起点 —— 换书(flush 后立刻 resume)就会让时长永久冻结,
+    // 直到下一次失焦/聚焦把它重新拉起来。
+    readingSessionActive.value = false
     persistStats()
     // Sync to the server-side reading_stats table (best-effort).
     if (delta > 0) {
@@ -383,6 +449,16 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  async function cancelDesktopUpdate() {
+    if (!desktopUpdateLoading.value) return false
+    try {
+      const result = await cancelDesktopVersionUpdate()
+      return Boolean(result?.cancelled)
+    } catch {
+      return false
+    }
+  }
+
   function setReadingSessionBook(bookUrl?: string, bookName?: string, bookAuthor?: string) {
     const normalizedUrl = bookUrl?.trim() || ''
     const nextBook = normalizedUrl
@@ -397,17 +473,19 @@ export const useAppStore = defineStore('app', () => {
     const wasRunning = readingSessionStartedAt > 0
     if (wasRunning) flushReadingSession()
     readingSessionBook = nextBook
-    if (wasRunning) readingSessionStartedAt = Date.now()
+    if (wasRunning) resumeReadingSessionClock()
   }
 
   function startReadingSession(bookUrl?: string, bookName?: string, bookAuthor?: string) {
     setReadingSessionBook(bookUrl, bookName, bookAuthor)
-    if (!readingSessionStartedAt) readingSessionStartedAt = Date.now()
+    bindReadingSessionVisibility()
+    resumeReadingSessionClock()
   }
 
   function stopReadingSession() {
-    flushReadingSession()
+    pauseReadingSessionClock()
     readingSessionBook = null
+    readingSessionActive.value = false
   }
 
   function markBookOpened(bookUrl: string) {
@@ -520,7 +598,7 @@ export const useAppStore = defineStore('app', () => {
     networkProxyMode, networkProxyUrl, networkProxyStatus, applyNetworkProxy, setNetworkProxy,
     versionUpdate, versionUpdateLoading, desktopUpdateLoading, desktopUpdateProgress, versionUpdateChecked, canCheckVersionUpdate, hasVersionUpdateReminder,
     autoCheckUpdate, setAutoCheckUpdate, runStartupVersionCheck,
-    checkVersionUpdate, dismissVersionUpdateReminder, applyDesktopUpdate,
+    checkVersionUpdate, dismissVersionUpdateReminder, applyDesktopUpdate, cancelDesktopUpdate,
     showLoginModal, showSettingsDrawer, showSourceManager, showUserManager, showWebdavManager,
     updateDialogVisible, closeUpdateProgressDialog,
     isOnline, setOnlineStatus,

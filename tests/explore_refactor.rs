@@ -513,6 +513,8 @@ fn explore_action_reports_search_and_open_intents() {
     assert_eq!(intent["kind"], "search");
     assert_eq!(intent["payload"]["key"], "剑来");
     assert!(intent["payload"]["source"].as_str().unwrap_or("").contains("源丙"));
+    // legado: source.getKey() 返回 bookSourceUrl（不是书籍地址）
+    assert_eq!(intent["payload"]["source"], "源丙::https://shushan.test");
 
     let open = svc
         .explore_action(&src, "java.open('login','http',null)", &HashMap::new())

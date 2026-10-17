@@ -363,6 +363,40 @@ impl ReadingStatsService {
         .await?;
         Ok(result.rows_affected())
     }
+
+    /// 书架详情页编辑书名/作者后迁移按书统计。
+    ///
+    /// 本地书的 `book_url` 是 `md5("{user_ns}:{文件名}:{内容md5}")`(TXT) / 
+    /// `md5_bytes("{user_ns}:{文件名}:", 内容)`(EPUB)。**文件名参与了哈希**，所以
+    /// 在书架里改名不会改变 URL —— 改的只是展示名。这正是本方法存在的理由:
+    /// 统计列表按 `(book_name, book_author)` 分组，不改历史行的名字，改名后的
+    /// 时长就会被算到另一个(旧名)条目下，看起来像"丢了几十小时"。
+    ///
+    /// 也正因如此，删掉本地文件后改文件名重新导入会生成新的 `book_url`，
+    /// 那条路径不在本方法的覆盖范围内。
+    ///
+    /// 改名后若与书架里另一本同名同作者的书撞车，统计展示会把两者并成一条 ——
+    /// 这是 `get_by_book` 既有的分组口径，此处不另行处理。
+    pub async fn rename_book_stats(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        book_name: &str,
+        book_author: &str,
+    ) -> Result<u64, AppError> {
+        let result = sqlx::query(
+            "UPDATE reading_book_stats
+             SET book_name = ?3, book_author = ?4
+             WHERE user_ns = ?1 AND book_url = ?2",
+        )
+        .bind(user_ns)
+        .bind(book_url)
+        .bind(book_name.trim())
+        .bind(book_author.trim())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -587,6 +621,68 @@ mod tests {
         let books = service.get_by_book("default", "2026-08-08", "2026-08-09").await.unwrap();
         assert_eq!(books.len(), 1);
         assert_eq!(books[0].book_name, "另一本");
+    }
+
+    #[tokio::test]
+    async fn rename_book_stats_updates_all_rows_for_local_book_url() {
+        let service = setup_service().await;
+        service
+            .add_reading(
+                "default",
+                120,
+                300,
+                Some("2026-08-08"),
+                Some("local-txt:abc"),
+                Some("旧书名"),
+                Some("旧作者"),
+            )
+            .await
+            .unwrap();
+        service
+            .add_reading(
+                "default",
+                180,
+                500,
+                Some("2026-08-09"),
+                Some("local-txt:abc"),
+                Some("旧书名"),
+                Some("旧作者"),
+            )
+            .await
+            .unwrap();
+        service
+            .add_reading(
+                "default",
+                60,
+                100,
+                Some("2026-08-08"),
+                Some("local-txt:other"),
+                Some("另一本"),
+                Some("其他作者"),
+            )
+            .await
+            .unwrap();
+
+        let updated = service
+            .rename_book_stats(
+                "default",
+                "local-txt:abc",
+                "新书名",
+                "新作者",
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 2);
+
+        let books = service
+            .get_by_book("default", "2026-08-08", "2026-08-09")
+            .await
+            .unwrap();
+        let renamed = books.iter().find(|book| book.book_url == "local-txt:abc").unwrap();
+        assert_eq!(renamed.book_name, "新书名");
+        assert_eq!(renamed.seconds, 300);
+        assert_eq!(renamed.characters, 800);
+        assert!(books.iter().any(|book| book.book_name == "另一本"));
     }
 
     #[tokio::test]

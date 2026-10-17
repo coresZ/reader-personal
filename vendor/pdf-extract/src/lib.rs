@@ -816,9 +816,9 @@ impl<'a> PdfFont for PdfSimpleFont<'a> {
         if let Some(width) = width {
             return *width;
         } else {
-            let mut widths = self.widths.iter().collect::<Vec<_>>();
-            widths.sort_by_key(|x| x.0);
-            dlog!("missing width for {} len(widths) = {}, {:?} falling back to missing_width {:?}", id, self.widths.len(), widths, self.font);
+            // 这里原本会先把整张 width 表 collect 成 Vec 再 sort_by_key, 只为拼一句
+            // `dlog!` —— 而 `dlog!` 是编译期展开成空的宏。缺宽的字符在中文书里是
+            // 常态(几十万次), 每次都排一遍几千条宽度纯属浪费。
             return self.missing_width;
         }
     }

@@ -2,11 +2,11 @@ import { computed, nextTick, ref } from 'vue'
 import type { ComputedRef, Ref } from 'vue'
 import type { useReaderStore } from '../stores/reader'
 import { getReaderTextWidth } from '../utils/readerTextWidth'
+import { READER_PAGE_VERTICAL_PADDING_MAX } from '../stores/reader'
 import { parseReaderParagraph } from '../utils/readerParagraphRange'
 
 type ReaderStore = ReturnType<typeof useReaderStore>
 const HORIZONTAL_PAGE_SIDE_PADDING = 24
-const HORIZONTAL_PAGE_VERTICAL_PADDING = 24
 const HORIZONTAL_PAGE_MIN_BOTTOM_GUARD = 18
 const HORIZONTAL_PAGE_BOTTOM_GUARD_LINES = 0.5
 const NON_STARTING_PUNCTUATION = new Set([
@@ -286,7 +286,15 @@ function constrainBlockMedia(blockHtml: string, pageHeightPx: number, lineHeight
 
 export function useHorizontalPaging(
   store: ReaderStore,
-  config: ComputedRef<{ fontSize: number; fontWeight: number; lineHeight: number; pageWidth: number }>,
+  config: ComputedRef<{
+    fontSize: number
+    fontWeight: number
+    lineHeight: number
+    pageWidth: number
+    pageVerticalPadding: number
+    paragraphSpacing: number
+    firstLineIndent: boolean
+  }>,
   currentFontFamily: ComputedRef<string>,
   formattedContent: ComputedRef<string>,
   isHorizontalPageMode: ComputedRef<boolean>,
@@ -300,11 +308,13 @@ export function useHorizontalPaging(
   const horizontalTextWidth = ref(0)
   const horizontalPageStepStyle = computed(() => `${Math.max(1, horizontalPageStep.value)}px`)
   const horizontalPages = ref<string[]>([])
-  const isHorizontalAtEnd = ref(false)
   /** 最近一次分页实际用到的正文快照。换章后 `horizontalPages` 还是**上一章**的
    *  分页结果, 而 `formattedContent` 已经是新章的 —— 两者不等就说明分页过期。
    *  搜索跳转要靠它决定"能否直接按现有页定位", 否则会落到上一章的页上。 */
   let pagedContentSnapshot: string | null = null
+  /** 最近一次分页使用的尺寸/排版签名。窗口最大化或改排版时，旧页在新尺寸下
+   *  会短暂露出底部残留，必须在重建前撤下。 */
+  let pagedLayoutSignature = ''
 
   /** 最后一页的索引。一屏一页, 所以末页索引就是页数 - 1。 */
   const horizontalLastPageStart = computed(() =>
@@ -498,10 +508,19 @@ export function useHorizontalPaging(
 
   function getHorizontalPageMeasure(container: HTMLElement) {
     const lineHeightPx = config.value.fontSize * config.value.lineHeight
-    const bottomGuard = Math.max(
-      HORIZONTAL_PAGE_MIN_BOTTOM_GUARD,
-      Math.ceil(lineHeightPx * HORIZONTAL_PAGE_BOTTOM_GUARD_LINES),
+    const verticalPadding = Math.min(
+      READER_PAGE_VERTICAL_PADDING_MAX,
+      Math.max(0, Math.round(config.value.pageVerticalPadding)),
     )
+    // 上下边距为 0 是用户的明确选择，此时不能再偷偷扣一段“保护距离”，
+    // 否则正文底部永远贴不到边界。默认边距下仍保留最后一行保护，避免
+    // 分页测量偏差把末尾行裁掉。
+    const bottomGuard = verticalPadding > 0
+      ? Math.max(
+          HORIZONTAL_PAGE_MIN_BOTTOM_GUARD,
+          Math.ceil(lineHeightPx * HORIZONTAL_PAGE_BOTTOM_GUARD_LINES),
+        )
+      : 0
     // 正文按**行宽**测量(不是屏宽): 页容器两侧的 padding 已在 availableWidth 里
     // 扣掉, 所以这里直接用行宽作为测量宽度, 与 .horizontal-page-content 的实际
     // 宽度保持一致。
@@ -510,24 +529,15 @@ export function useHorizontalPaging(
       : Math.max(120, horizontalPageStep.value - HORIZONTAL_PAGE_SIDE_PADDING * 2)
     return {
       innerWidth: Math.max(120, textWidth),
-      pageHeight: Math.max(160, container.clientHeight - HORIZONTAL_PAGE_VERTICAL_PADDING * 2 - bottomGuard),
+      pageHeight: Math.max(160, container.clientHeight - verticalPadding * 2 - bottomGuard),
     }
-  }
-
-  function updateHorizontalEndState() {
-    const container = scrollContainerRef.value
-    if (!container || !isHorizontalPageMode.value) {
-      isHorizontalAtEnd.value = false
-      return
-    }
-    updateHorizontalMetrics()
-    isHorizontalAtEnd.value = horizontalPageIndex.value >= horizontalLastPageStart.value
   }
 
   async function rebuildHorizontalPages() {
     if (!isHorizontalPageMode.value) {
       horizontalPages.value = []
       pagedContentSnapshot = null
+      pagedLayoutSignature = ''
       return
     }
     await nextTick()
@@ -536,8 +546,30 @@ export function useHorizontalPaging(
 
     updateHorizontalMetrics()
 
-    const contentSnapshot = formattedContent.value
     const { innerWidth, pageHeight } = getHorizontalPageMeasure(container)
+    const contentSnapshot = formattedContent.value
+    const layoutSignature = [
+      innerWidth,
+      pageHeight,
+      config.value.fontSize,
+      config.value.fontWeight,
+      config.value.lineHeight,
+      config.value.paragraphSpacing,
+      config.value.firstLineIndent,
+      config.value.pageWidth,
+      config.value.pageVerticalPadding,
+    ].join('::')
+    // 正文换章或页尺寸变化时先把上一版页撤下，等新页构建完成再赋值。
+    // 这样最大化窗口下不会在底部闪出旧页最后一行。
+    if (
+      pagedContentSnapshot !== null
+      && (pagedContentSnapshot !== contentSnapshot || pagedLayoutSignature !== layoutSignature)
+    ) {
+      horizontalPages.value = []
+      pagedContentSnapshot = null
+      pagedLayoutSignature = ''
+      await nextTick()
+    }
     const title = (store.currentChapter?.title || '加载中...').trim()
     const titleHtml = `<h1 class="horizontal-flow-title">${escapeHtml(title)}</h1>`
     // 媒体高度上限 = 一页可用高度。分页与渲染共用同一份 HTML, 保证测量与实际排版
@@ -724,6 +756,7 @@ export function useHorizontalPaging(
     document.body.removeChild(measurer)
     horizontalPages.value = mergedPages
     pagedContentSnapshot = contentSnapshot
+    pagedLayoutSignature = layoutSignature
     // 重建后页数可能变少: 夹进有效范围, 否则索引会指向不存在的页(画面停在空白处)。
     horizontalPageIndex.value = Math.max(
       0,
@@ -731,7 +764,7 @@ export function useHorizontalPaging(
     )
 
     container.scrollTo({ left: 0, behavior: 'auto' })
-    updateHorizontalEndState()
+    updateHorizontalMetrics()
   }
 
   function alignHorizontalToNearestPage(touchMoving: boolean) {
@@ -766,12 +799,10 @@ export function useHorizontalPaging(
     horizontalPageStepStyle,
     horizontalTextWidth,
     horizontalPages,
-    isHorizontalAtEnd,
     horizontalLastPageStart,
     isHorizontalPagesStale,
     rebuildHorizontalPages,
     updateHorizontalMetrics,
-    updateHorizontalEndState,
     alignHorizontalToNearestPage,
     resetHorizontalPagePosition,
   }

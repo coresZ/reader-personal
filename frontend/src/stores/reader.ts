@@ -51,6 +51,7 @@ import {
   type LegadoBookProgress,
 } from '../api/webdav'
 import { deleteCustomFont, listCustomFonts, uploadCustomFont, type CustomFontEntry } from '../api/fonts'
+import { readSavedReadingPosition } from '../utils/readingPosition'
 
 const READER_SESSION_KEY = 'reader-last-session'
 const READER_READ_HISTORY_PREFIX = 'reader-read-history:'
@@ -92,6 +93,10 @@ interface PersistedReaderProgress {
 const READER_PROGRESS_KEY = 'reader-last-progress'
 
 /* ─── Reading config type ─── */
+export const READER_PAGE_WIDTH_MIN = 400
+export const READER_PAGE_WIDTH_MAX = 2000
+export const READER_PAGE_VERTICAL_PADDING_MAX = 200
+
 export interface ReadConfig {
   fontSize: number
   fontWeight: number
@@ -101,6 +106,8 @@ export interface ReadConfig {
   firstLineIndent: boolean
   fontColor: string
   pageWidth: number
+  /** 左右分页时每页正文的上下留白, 像素。 */
+  pageVerticalPadding: number
   readMethod: '上下滑动' | '左右翻页' | '上下滚动' | '上下滚动2'
   animateDuration: number
   /** 自动阅读滚动速度, 像素/秒。 */
@@ -133,6 +140,7 @@ const defaultConfig: ReadConfig = {
   firstLineIndent: true,
   fontColor: '',
   pageWidth: 800,
+  pageVerticalPadding: 24,
   readMethod: '上下滑动',
   animateDuration: 300,
   autoScrollSpeed: 30,
@@ -176,6 +184,18 @@ function loadConfig(): ReadConfig {
       return {
         ...defaultConfig,
         ...savedConfig,
+        pageWidth: typeof savedConfig.pageWidth === 'number'
+          ? Math.min(
+              READER_PAGE_WIDTH_MAX,
+              Math.max(READER_PAGE_WIDTH_MIN, Math.round(savedConfig.pageWidth)),
+            )
+          : defaultConfig.pageWidth,
+        pageVerticalPadding: typeof savedConfig.pageVerticalPadding === 'number'
+          ? Math.min(
+              READER_PAGE_VERTICAL_PADDING_MAX,
+              Math.max(0, Math.round(savedConfig.pageVerticalPadding)),
+            )
+          : defaultConfig.pageVerticalPadding,
         autoScrollSpeed: typeof savedConfig.autoScrollSpeed === 'number' && savedConfig.autoScrollSpeed > 0
           ? Math.min(500, Math.max(2, Math.round(savedConfig.autoScrollSpeed)))
           : Math.min(500, Math.max(2, Math.round(legacyAutoScrollSpeed))),
@@ -1868,8 +1888,12 @@ export const useReaderStore = defineStore('reader', () => {
     pendingLegadoProgress.value = null
     legadoPositionRestore.value = null
     legadoPositionRestoreCompleted.value = null
-    preloadedContent.value.clear()
-    preloadingContent.clear()
+    // 返回主页再打开同一本书时，当前会话的正文预载仍然有效。此前无条件
+    // clear() 会让已缓存的章节也重新走一遍 loadChapter 加载态。
+    if (book.value?.bookUrl !== b.bookUrl) {
+      preloadedContent.value.clear()
+      preloadingContent.clear()
+    }
     chapterPreloadGeneration += 1
     book.value = b
     snapshotOpenPosition(b)
@@ -1878,7 +1902,10 @@ export const useReaderStore = defineStore('reader', () => {
     content.value = ''
     appStore.markBookOpened(b.bookUrl)
     currentIndex.value = b.durChapterIndex || 0
-    chapterScrollProgress.value = decodeServerProgress(b.durChapterPos)
+    const localPosition = readSavedReadingPosition(b.bookUrl)
+    chapterScrollProgress.value = localPosition?.chapterIndex === currentIndex.value
+      ? localPosition.progress
+      : decodeServerProgress(b.durChapterPos)
     loadReadChapterHistory(b)
     progressDirty.value = false
     lastServerProgressKey.value = ''
@@ -1915,7 +1942,11 @@ export const useReaderStore = defineStore('reader', () => {
         : 0
       currentIndex.value = initialIndex
       if (!chapters.value.length) throw new Error('目录为空，无法加载正文')
-      await loadChapter(initialIndex)
+      await loadChapter(
+        initialIndex,
+        false,
+        localPosition?.chapterIndex === initialIndex ? localPosition.progress : undefined,
+      )
       if (requestId !== bookLoadRequestId || book.value?.bookUrl !== b.bookUrl) return
       if (syncProgress) {
         await restoreCurrentBookProgressFromLegado(undefined, b.bookUrl, requestId)
@@ -1938,8 +1969,8 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   function setActiveChapterState(index: number, chapterContent: string, progress = 0) {
-    currentIndex.value = index
     content.value = chapterContent
+    currentIndex.value = index
     chapterScrollProgress.value = Math.max(0, Math.min(1, progress))
     if (book.value) {
       book.value.durChapterIndex = index
@@ -1978,15 +2009,17 @@ export const useReaderStore = defineStore('reader', () => {
     await persistProgress(payload.index, chapterScrollProgress.value)
   }
 
-  function flushProgressToServerKeepalive(force = false) {
+  function flushProgressToServerKeepalive(force = false): Promise<void> {
     const payload = currentServerProgressPayload()
-    if (!payload) return
+    if (!payload) return Promise.resolve()
     const nextKey = `${payload.bookUrl}::${payload.index}::${payload.position}`
-    if (!force && !progressDirty.value && lastServerProgressKey.value === nextKey) return
+    if (!force && !progressDirty.value && lastServerProgressKey.value === nextKey) return Promise.resolve()
 
-    void invokeRaw('save_book_progress', { req: payload }).catch(() => undefined)
     progressDirty.value = false
     lastServerProgressKey.value = nextKey
+    return invokeRaw('save_book_progress', { req: payload })
+      .then(() => undefined)
+      .catch(() => undefined)
   }
 
   /**
@@ -2108,7 +2141,11 @@ export const useReaderStore = defineStore('reader', () => {
     }
   }
 
-  async function loadChapter(index: number, forceRefresh = false) {
+  async function loadChapter(
+    index: number,
+    forceRefresh = false,
+    initialProgressOverride?: number,
+  ) {
     if (!book.value || !chapters.value[index]) return
 
     if (legadoPositionRestoreCompleted.value?.index !== index) {
@@ -2164,7 +2201,9 @@ export const useReaderStore = defineStore('reader', () => {
         ? Math.max(0, Math.min(1, pendingRemoteProgress.position
           / Math.max(1, chapterContent.replace(/<[^>]+>/g, '').length)))
         : null
-      const initialProgress = cloudProgress ?? (isOpeningSavedChapter ? previousSavedProgress : 0)
+      const initialProgress = initialProgressOverride
+        ?? cloudProgress
+        ?? (isOpeningSavedChapter ? previousSavedProgress : 0)
 
       cachePreloadedContent(index, chapterContent)
       if (cloudProgress != null && book.value) {

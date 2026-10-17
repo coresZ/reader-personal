@@ -156,7 +156,17 @@
 
           <!-- Chapters -->
           <div class="chapter-section" v-if="chapters.length > 0">
-            <h3>目录 ({{ chapters.length }})</h3>
+            <div class="chapter-heading">
+              <h3>目录 ({{ chapters.length }})</h3>
+              <span
+                v-if="shownCatalogSourceName || chapterSourceName"
+                class="chapter-source-status"
+                role="status"
+                :title="shownCatalogSourceName || chapterSourceName"
+              >
+                {{ shownCatalogSourceName || chapterSourceName }}
+              </span>
+            </div>
             <div class="chapter-list">
               <div
                 v-for="(chapter, i) in displayChapters"
@@ -177,9 +187,29 @@
               显示全部 {{ chapters.length }} 章
             </button>
           </div>
-          <div v-else-if="chaptersLoading" class="chapter-loading">
-            <div class="loading-spinner"></div>
-            加载目录中...
+          <div v-else-if="chaptersLoading" class="chapter-loading-state" role="status">
+            <div class="chapter-heading">
+              <h3>正在加载目录</h3>
+              <span v-if="chapterSourceName" class="chapter-source-status" :title="chapterSourceName">
+                {{ chapterSourceName }}
+              </span>
+            </div>
+            <div class="chapter-loading">
+              <div class="loading-spinner"></div>
+              正在获取章节列表…
+            </div>
+          </div>
+          <div v-else-if="chapterError" class="chapter-loading-state" role="alert">
+            <div class="chapter-heading">
+              <h3>目录加载失败</h3>
+              <span v-if="chapterSourceName" class="chapter-source-status error" :title="chapterSourceName">
+                {{ chapterSourceName }}
+              </span>
+            </div>
+            <div class="chapter-error-message">
+              <span>暂时无法获取该源目录，请重试或切换书源。</span>
+              <button type="button" class="chapter-retry-btn" @click="retryChapters">重试</button>
+            </div>
           </div>
           </template>
 
@@ -311,6 +341,9 @@ const sourcesIncomplete = ref(false)
 const selectedSource = ref<SearchBook | null>(null)
 const sourceCatalog = ref(new Map<string, string>())
 const removingFromShelf = ref(false)
+const catalogTarget = ref('')
+const chapterError = ref('')
+const loadedCatalogIdentity = ref('')
 let detailLoadId = 0
 let chapterLoadId = 0
 let sourceSSE: SseLike | null = null
@@ -370,10 +403,23 @@ const displayBook = computed(() => {
 })
 
 const displayOriginName = computed(() => {
+  const source = selectedSource.value
+  if (source) return sourceNameByOrigin(source.origin)
   if (!props.book) return ''
   return sourceCatalog.value.get(sourceKey(props.book.origin))
     || (props.book as Book).originName
     || props.book.origin
+})
+
+const chapterSourceName = computed(() => {
+  const source = selectedSource.value
+  return source ? sourceNameByOrigin(source.origin) : ''
+})
+
+const shownCatalogSourceName = computed(() => {
+  const identity = loadedCatalogIdentity.value
+  if (!identity) return ''
+  return sourceNameByOrigin(catalogIdentityOrigin(identity))
 })
 
 function sourceNameByOrigin(origin: string): string {
@@ -396,6 +442,30 @@ function sourceKey(origin: string): string {
 
 function candidateKey(candidate: SearchBook): string {
   return sourceCandidateKey(candidate)
+}
+
+/**
+ * 目录身份的键必须与 `candidateKey()` **同源**。
+ *
+ * 早先这里用 `${sourceKey(origin)}::${bookUrl}` 自造格式, 而比较时用的是
+ * `candidateKey()` 的 JSON 格式, 两者永不相等 —— `setSourceCandidates` 里
+ * "保住已加载目录的那个源"的分支恒为 false, 后续 SSE 批次(每批都会重新调用)
+ * 就把用户手选的源重置回本书原源。结果是目录来自 B 源、选中项与 `activeBook()`
+ * 都是 A 源, 读正文时拿 B 的章节号去 A 源取, 正文错位。
+ */
+function catalogIdentityKey(origin: string, bookUrl: string): string {
+  return sourceCandidateKey({ origin, bookUrl })
+}
+
+/** 从目录身份键里取回书源 origin; 键格式统一由 `catalogIdentityKey` 产生。 */
+function catalogIdentityOrigin(identity: string): string {
+  if (!identity) return ''
+  try {
+    const parsed = JSON.parse(identity) as unknown
+    return Array.isArray(parsed) && typeof parsed[0] === 'string' ? parsed[0] : ''
+  } catch {
+    return ''
+  }
 }
 
 function sourceCatalogSignature(): string {
@@ -436,6 +506,9 @@ function resetDetailState() {
   selectedSource.value = null
   sourceCatalog.value = new Map()
   sourcesLoading.value = false
+  catalogTarget.value = ''
+  chapterError.value = ''
+  loadedCatalogIdentity.value = ''
 }
 
 function closeSourceSSE() {
@@ -555,10 +628,23 @@ function setSourceCandidates(candidates: SearchBook[]) {
     matchesSourceSwitchTitle(currentTitle, candidate.name)
     && sourceCatalog.value.has(sourceKey(candidate.origin))
   )))
-  selectedSource.value = sourceCandidates.value.find((candidate) => (
-    candidateKey(candidate) === previousSelection
-  )) || sourceCandidates.value.find((candidate) => (
+  const selectedCandidate = selectedSource.value
+  // 目录身份键与 `candidateKey()` 同源, 所以这里能真正判定"当前选中的源就是
+  // 已经加载出目录的那个源"。判定成立时必须保留用户的选择, 不能被下面的
+  // 回退分支(优先命中本书原源)覆盖 —— 否则 SSE 每追加一批候选就会把选中项
+  // 拨回原源, 目录却仍是手选源的, 二者错位。
+  selectedSource.value = (
+    selectedCandidate
+    && catalogTarget.value === candidateKey(selectedCandidate)
+    && sourceCandidates.value.some((candidate) => (
+      candidateKey(candidate) === catalogTarget.value
+    ))
+  )
+    ? selectedCandidate
+    : sourceCandidates.value.find((candidate) => (
     candidateKey(candidate) === currentKey
+  )) || sourceCandidates.value.find((candidate) => (
+    candidateKey(candidate) === previousSelection
   )) || sourceCandidates.value[0] || null
 }
 
@@ -569,6 +655,10 @@ function selectSource(candidate: SearchBook) {
     && selectedSource.value?.bookUrl === candidate.bookUrl
   ) return
   selectedSource.value = candidate
+  chapters.value = []
+  showAllChapters.value = false
+  chapterError.value = ''
+  loadedCatalogIdentity.value = ''
   void loadChaptersFor(candidate.bookUrl, candidate.origin, detailLoadId, detailKey.value)
 }
 
@@ -579,17 +669,35 @@ async function loadChaptersFor(
   bookKey = detailKey.value,
 ) {
   const requestId = ++chapterLoadId
+  const sourceIdentity = catalogIdentityKey(origin, bookUrl)
   chaptersLoading.value = true
+  catalogTarget.value = sourceIdentity
+  chapterError.value = ''
   try {
-    const nextChapters = await getChapterList({ bookUrl, bookSourceUrl: origin })
+    const nextChapters = await getChapterList({
+      bookUrl,
+      bookSourceUrl: origin,
+      tocUrl: origin === sourceKey(props.book?.origin || '')
+        ? (props.book as Book | null)?.tocUrl
+        : undefined,
+    })
     if (!isCurrentDetail(loadId, bookKey) || requestId !== chapterLoadId) return
     chapters.value = nextChapters
+    loadedCatalogIdentity.value = sourceIdentity
   } catch {
     if (!isCurrentDetail(loadId, bookKey) || requestId !== chapterLoadId) return
     chapters.value = []
+    loadedCatalogIdentity.value = ''
+    chapterError.value = '目录加载失败，请重试或切换书源'
   } finally {
     if (requestId === chapterLoadId) chaptersLoading.value = false
   }
+}
+
+function retryChapters() {
+  const source = selectedSource.value
+  if (!source || !props.book) return
+  void loadChaptersFor(source.bookUrl, source.origin, detailLoadId, detailKey.value)
 }
 
 watch([() => props.modelValue, detailKey], async ([visible, bookKey]) => {
@@ -639,11 +747,8 @@ watch([() => props.modelValue, detailKey], async ([visible, bookKey]) => {
     // 保留当前书籍自身的源，避免书源列表加载失败时详情页完全没有可选项。
     sourceCatalog.value.set(sourceKey(b.origin), (b as Book).originName || b.origin)
   }
-  const sourceTask = loadSourceCandidates(loadId, bookKey)
-  await Promise.all([
-    sourceTask,
-    loadChaptersFor(b.bookUrl, b.origin, loadId, bookKey),
-  ])
+  void loadSourceCandidates(loadId, bookKey)
+  await loadChaptersFor(b.bookUrl, b.origin, loadId, bookKey)
 }, { immediate: true })
 
 watch(() => sourceStore.availabilityVersion, async () => {
@@ -664,10 +769,8 @@ watch(() => sourceStore.availabilityVersion, async () => {
   if (!sourceCatalog.value.has(sourceKey(b.origin))) {
     sourceCatalog.value.set(sourceKey(b.origin), b.originName || b.origin)
   }
-  await Promise.all([
-    loadSourceCandidates(loadId, bookKey),
-    loadChaptersFor(b.bookUrl, b.origin, loadId, bookKey),
-  ])
+  void loadSourceCandidates(loadId, bookKey)
+  await loadChaptersFor(b.bookUrl, b.origin, loadId, bookKey)
 }, { flush: 'post' })
 
 function close() {
@@ -1230,14 +1333,67 @@ async function removeFromShelf() {
   color: var(--color-text-tertiary);
 }
 
-.chapter-section h3 {
-  font-size: var(--text-base);
-  font-weight: 600;
+.chapter-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
   margin-bottom: var(--space-3);
 }
 
+.chapter-heading h3 {
+  min-width: 0;
+  margin: 0;
+}
+
+.chapter-source-status {
+  min-width: 0;
+  max-width: 55%;
+  padding: 2px var(--space-2);
+  overflow: hidden;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-tertiary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chapter-source-status.error {
+  border-color: color-mix(in srgb, var(--color-danger) 35%, var(--color-border));
+  color: var(--color-danger);
+}
+
+.chapter-error-message {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-danger) 7%, transparent);
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+}
+
+.chapter-retry-btn {
+  padding: 2px var(--space-2);
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+  color: var(--color-danger);
+  background: transparent;
+  font-size: var(--text-xs);
+}
+
+.chapter-section h3 {
+  font-size: var(--text-base);
+  font-weight: 600;
+}
+
 .chapter-list {
-  max-height: 300px;
+  max-height: 240px;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   border: 1px solid var(--color-border-light);
@@ -1312,6 +1468,10 @@ async function removeFromShelf() {
   padding: var(--space-6);
   color: var(--color-text-tertiary);
   font-size: var(--text-sm);
+}
+
+.chapter-loading-state {
+  margin-top: var(--space-4);
 }
 
 .loading-spinner {

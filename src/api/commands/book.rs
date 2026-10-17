@@ -42,6 +42,12 @@ pub struct SearchBookRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ClearSearchCoverCacheRequest {
+    #[serde(rename = "coverUrls")]
+    cover_urls: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SearchBookMultiRequest {
     key: Option<String>,
     page: Option<i32>,
@@ -1101,12 +1107,53 @@ pub async fn delete_book_cache(
         .book_service
         .delete_book_sources_cache(&user_ns, &book_url)
         .await;
+    if let Ok(Some(shelf_book)) = state.book_service.get_shelf_book(&user_ns, &book_url).await {
+        if let Some(cover_url) = shelf_book.cover_url.as_deref() {
+            let _ = state
+                .book_service
+                .delete_cover_cache("public", cover_url)
+                .await;
+        }
+        if let Some(cover_url) = shelf_book.custom_cover_url.as_deref() {
+            let _ = state
+                .book_service
+                .delete_cover_cache("public", cover_url)
+                .await;
+        }
+    }
 
     Ok(ApiResponse::ok(serde_json::json!({
         "deleted": true,
         "contentCache": deleted_content,
         "chapterListCache": deleted_chapter_list
     })))
+}
+
+/// Search covers use the unauthenticated `public` namespace. `delete_book`
+/// handles shelf books, but search results that were never saved have no book
+/// lifecycle event, so the search UI explicitly releases its cover URLs when a
+/// search session ends.
+#[tauri::command]
+pub async fn clear_search_cover_cache(
+    state: tauri::State<'_, AppState>,
+    req: ClearSearchCoverCacheRequest,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let unique_urls: std::collections::HashSet<String> = req
+        .cover_urls
+        .into_iter()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .collect();
+    let mut deleted = 0usize;
+    for url in &unique_urls {
+        state
+            .book_service
+            .delete_cover_cache("public", url)
+            .await?;
+        crate::api::protocol::remove_cover_cache_url(url);
+        deleted += 1;
+    }
+    Ok(ApiResponse::ok(serde_json::json!({ "deleted": deleted })))
 }
 
 #[tauri::command]
@@ -1221,6 +1268,18 @@ pub async fn save_book(
         req.toc_url = Some(repair_encoded_url(toc_url));
     }
 
+    let previous_local_identity = state
+        .book_service
+        .get_shelf_book(&user_ns, &req.book_url)
+        .await?
+        .filter(|book| is_local_book(book))
+        .map(|book| {
+            (
+                book.name.trim().to_string(),
+                book.author.trim().to_string(),
+            )
+        });
+
     if let Some(candidates) = req.source_candidates.as_mut() {
         let enabled_urls = state
             .book_source_service
@@ -1267,6 +1326,25 @@ pub async fn save_book(
     );
 
     let saved = state.book_service.save_book(&user_ns, req).await?;
+    let previous_identity = previous_local_identity
+        .as_ref()
+        .map(|(name, author)| (name.as_str(), author.as_str()));
+    if local_book_rename_needs_stats_migration(previous_identity, &saved) {
+        // 书架已经写入成功, 这一步只是把历史统计改挂到新名字上。失败必须吞掉:
+        // 若在这里返回错误, 前端会显示"保存失败"而书名其实已经改了; 用户重试时
+        // 旧名已等于新名, 迁移条件不再成立 —— 历史时长就永久留在旧书名下。
+        if let Err(err) = state
+            .reading_stats_service
+            .rename_book_stats(&user_ns, &saved.book_url, &saved.name, &saved.author)
+            .await
+        {
+            tracing::warn!(
+                book_url = %saved.book_url,
+                error = %err,
+                "本地书改名后迁移阅读统计失败, 历史时长仍挂在旧书名下"
+            );
+        }
+    }
     Ok(ApiResponse::ok(
         serde_json::to_value(saved).unwrap_or_default(),
     ))
@@ -2432,7 +2510,7 @@ pub async fn get_available_book_source_sse(
     // 若登记晚于它, 该 taskId 永远不会进入取消表 —— 前端离开界面时发出的取消
     // 只能落进 pending 而无人消费(既泄漏记录, 也让这段缓存推送无法被取消)。
     let cancel_guard = SearchCancellationGuard::register(req.task_id.as_deref());
-    let sources = state.book_source_service.list_enabled(&user_ns).await?;
+    let mut sources = state.book_source_service.list_enabled(&user_ns).await?;
     let enabled_source_url_set = enabled_source_urls(&sources);
 
     let book = if let Some(ref url) = book_url {
@@ -2453,6 +2531,12 @@ pub async fn get_available_book_source_sse(
         .or_else(|| fallback_available_book(&req))
         .ok_or_else(|| AppError::BadRequest("书籍信息错误".to_string()))?,
     };
+    // The detail view already loads the current source's catalog. Searching
+    // that same source again competes with the catalog for its rate limit and
+    // can push later book opens behind stale work.
+    sources.retain(|source| {
+        source_identity_url(&source.book_source_url) != source_identity_url(&book.origin)
+    });
 
     if !refresh && last_index_start < 0 {
         if let Some(ref url) = book_url {
@@ -3054,6 +3138,25 @@ fn is_local_book(book: &Book) -> bool {
         || is_local_pdf_url(&book.book_url)
 }
 
+/// 保存本地书后是否需要把历史统计改挂到新的书名/作者上。
+///
+/// 三个条件缺一不可:
+/// - 本地书: 远程书的身份由 `book_url` 决定, 换书源时统计靠书名分组已经能合并,
+///   而本地书改名前后 `book_url` 不变, 只能靠这里主动迁移;
+/// - 书名或作者真的变了: 值没变时跑一次 UPDATE 是无意义的写入;
+/// - 是从书架里已有的条目改名而来(`previous` 为 Some): 首次加入书架没有历史行
+///   可迁移, 此时不该去动别的书的统计。
+fn local_book_rename_needs_stats_migration(
+    previous_identity: Option<(&str, &str)>,
+    saved: &Book,
+) -> bool {
+    let Some((old_name, old_author)) = previous_identity else {
+        return false;
+    };
+    is_local_book(saved)
+        && (old_name.trim() != saved.name.trim() || old_author.trim() != saved.author.trim())
+}
+
 fn is_current_source_candidate(candidate: &SearchBook, current: &Book) -> bool {
     source_identity_url(&candidate.origin) == source_identity_url(&current.origin)
         && candidate.book_url == current.book_url
@@ -3155,6 +3258,7 @@ mod tests {
         resolve_cache_start_index, retain_enabled_source_books, run_cache_tasks,
         should_use_available_source_cache, is_current_source_candidate,
         effective_available_result_limit,
+        local_book_rename_needs_stats_migration,
         take_available_source_cached_matches,
         take_available_source_sse_matches, GetAvailableBookSourceRequest,
         SearchCancellationGuard, SEARCH_CANCELLATIONS, SEARCH_CANCEL_REQUESTS,
@@ -3198,6 +3302,75 @@ mod tests {
             .collect();
         let deduped = dedup_chapters(chapters);
         assert_eq!(deduped.len(), 5);
+    }
+
+    fn local_txt_book(name: &str, author: &str) -> Book {
+        Book {
+            name: name.to_string(),
+            author: author.to_string(),
+            book_url: "local-txt:abc123".to_string(),
+            origin: "local-txt".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 书架详情页把本地书改了个名字: 必须迁移历史统计, 否则旧名字下的时长
+    /// 会和改名后的阅读记录分成两条。
+    #[test]
+    fn local_book_rename_migrates_stats() {
+        let saved = local_txt_book("新书名", "本地导入");
+        assert!(local_book_rename_needs_stats_migration(
+            Some(("旧书名", "本地导入")),
+            &saved,
+        ));
+    }
+
+    /// 只改作者也算改名: 统计展示按 (书名, 作者) 联合分组, 作者变了照样会被拆开。
+    #[test]
+    fn local_book_author_change_migrates_stats() {
+        let saved = local_txt_book("旧书名", "新作者");
+        assert!(local_book_rename_needs_stats_migration(
+            Some(("旧书名", "旧作者")),
+            &saved,
+        ));
+    }
+
+    /// 值没变(含首尾空白差异收敛后相等)时不该跑一次无谓的 UPDATE。
+    #[test]
+    fn unchanged_local_book_identity_skips_migration() {
+        let saved = local_txt_book("旧书名", "本地导入");
+        assert!(!local_book_rename_needs_stats_migration(
+            Some(("旧书名", "本地导入")),
+            &saved,
+        ));
+        assert!(!local_book_rename_needs_stats_migration(
+            Some((" 旧书名 ", " 本地导入 ")),
+            &saved,
+        ));
+    }
+
+    /// 首次加入书架没有历史行可迁移, 不能借这条路径去动别的书的统计。
+    #[test]
+    fn first_save_to_shelf_skips_migration() {
+        let saved = local_txt_book("新书名", "本地导入");
+        assert!(!local_book_rename_needs_stats_migration(None, &saved));
+    }
+
+    /// 远程书的身份由 book_url 决定, 换源时统计靠书名分组已经能合并;
+    /// 这里只处理本地书, 免得给远程书的每次编辑都加一次全表 UPDATE。
+    #[test]
+    fn remote_book_rename_skips_migration() {
+        let saved = Book {
+            name: "新书名".to_string(),
+            author: "作者".to_string(),
+            book_url: "https://source.example/book/1".to_string(),
+            origin: "https://source.example/".to_string(),
+            ..Default::default()
+        };
+        assert!(!local_book_rename_needs_stats_migration(
+            Some(("旧书名", "作者")),
+            &saved,
+        ));
     }
 
     /// `aborted` 必须能独立表达"被取消"：即使章节已全部派发完（`pending` 为空），

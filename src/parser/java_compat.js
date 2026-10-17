@@ -127,6 +127,11 @@
       for (var i = 0; i < text.length; i++) bytes.push(text.charCodeAt(i) & 255);
       return bytes;
     }
+    // Rhino 里 `new java.lang.String(x)` 是 Java 对象: `length()` / `getBytes()`
+    // 等方法都要能用; 而 reader 侧历史实现同时把它当 JS 字符串用(`s.length` 取
+    // 数字、模板拼接直接出文本)。这里用**普通对象 + 原型方法**承载: `toString` /
+    // `valueOf` / `toJSON` 让它在字符串场合与之前一致, 同时实例上的 `length` 是
+    // 可调用的函数(其 valueOf 给出长度, 所以 `s.length + 1` 这类旧写法仍然工作)。
     function JavaString(value, charset, length, encoding) {
       var text;
       if (Array.isArray(value) || ArrayBuffer.isView(value)) {
@@ -135,17 +140,84 @@
         var label = charsetLabel(charset);
         text = isLatin1(label) ? latin1Decode(bytes) : native('decode', {data: bytes, charset: label});
       } else text = value === undefined || value === null ? '' : String(value);
-      var result = new String(text);
+      var result = {};
+      Object.defineProperty(result, '__text', {value: text, enumerable: false, writable: true, configurable: true});
       Object.setPrototypeOf(result, JavaString.prototype);
+      var lengthFn = function () { return String(result.__text).length; };
+      lengthFn.valueOf = function () { return String(result.__text).length; };
+      lengthFn.toString = function () { return String(String(result.__text).length); };
+      Object.defineProperty(result, 'length', {value: lengthFn, enumerable: false, writable: false, configurable: true});
       return result;
     }
-    JavaString.prototype = Object.create(String.prototype);
+    JavaString.prototype = Object.create(Object.prototype);
     JavaString.prototype.constructor = JavaString;
+    JavaString.prototype.toString = function () { return String(this.__text); };
+    // 宿主在规则求值末尾要能把 Java String 还原成**裸文本**(不加 JSON 引号),
+    // 旧实现靠 `instanceof String` 判定; 普通对象承载后改用这个显式标记。
+    JavaString.prototype.__javaStringText = function () { return String(this.__text); };
+    JavaString.prototype.valueOf = function () { return String(this.__text); };
+    JavaString.prototype.toJSON = function () { return String(this.__text); };
     JavaString.prototype.getBytes = function (charset) {
       var label = charsetLabel(charset);
       return isLatin1(label) ? latin1Encode(String(this)) : native('encode', {text: String(this), charset: label});
     };
     JavaString.prototype.equals = function (v) { return String(this) === String(v); };
+    // Java String 的方法面: 源脚本按 Java 风格调用(`java.md5Encode(x).getBytes()`、
+    // `java.digestHex(x).length()`、`k.substring(i, i3)`)。注意 `length` 在 Java 里
+    // 是**方法**而 JS 字符串的 `length` 是属性 —— 包装对象上必须同时满足两种写法,
+    // 否则书源里的 `k.length()` 会抛 "not a function"。
+    JavaString.prototype.length = function () { return String(this).length; };
+    JavaString.prototype.isEmpty = function () { return String(this).length === 0; };
+    JavaString.prototype.charAt = function (i) { return String(this).charAt(size(i)); };
+    JavaString.prototype.indexOf = function (needle, from) {
+      return String(this).indexOf(String(needle), from === undefined ? 0 : size(from));
+    };
+    JavaString.prototype.lastIndexOf = function (needle) { return String(this).lastIndexOf(String(needle)); };
+    JavaString.prototype.substring = function (start, end) {
+      var text = String(this);
+      start = size(start);
+      return text.substring(start, end === undefined ? text.length : size(end));
+    };
+    JavaString.prototype.replace = function (from, to) {
+      // Java 的 replace 是字面量替换；旧实现返回原生字符串，书源可能写正则，两者都支持。
+      if (from instanceof RegExp) return String(this).replace(from, to);
+      return String(this).split(String(from)).join(String(to));
+    };
+    JavaString.prototype.replaceAll = JavaString.prototype.replace;
+    JavaString.prototype.split = function (sep) {
+      if (sep instanceof RegExp) return String(this).split(sep);
+      return String(this).split(String(sep));
+    };
+    JavaString.prototype.trim = function () { return String(this).trim(); };
+    JavaString.prototype.toUpperCase = function () { return String(this).toUpperCase(); };
+    JavaString.prototype.toLowerCase = function () { return String(this).toLowerCase(); };
+    JavaString.prototype.contains = function (v) { return String(this).indexOf(String(v)) >= 0; };
+    JavaString.prototype.startsWith = function (v) { return String(this).indexOf(String(v)) === 0; };
+    JavaString.prototype.endsWith = function (v) {
+      var text = String(this), tail = String(v);
+      return text.length >= tail.length && text.slice(text.length - tail.length) === tail;
+    };
+    JavaString.prototype.toCharArray = function () { return String(this).split(''); };
+    JavaString.prototype.compareTo = function (v) {
+      var a = String(this), b = String(v);
+      return a < b ? -1 : a > b ? 1 : 0;
+    };
+    // 旧实现里 java.* 字符串返回值是原生 JS 字符串, 书源会直接用 `slice` /
+    // `match` / `indexOf` 等 String 方法。包装成对象后必须补齐这些方法,
+    // 否则老书源会报 "xxx is not a function"。这里只挂载尚未定义的成员,
+    // 已定义的 Java 方法(如 substring/replace)保持 Java 语义优先。
+    // 字符串的 Symbol.iterator 不是字符串键, getOwnPropertyNames 带不过来;
+    // 老书源里有 `[...hash]` / `for (ch of str)` 这种逐字符遍历写法。
+    JavaString.prototype[Symbol.iterator] = String.prototype[Symbol.iterator];
+    Object.getOwnPropertyNames(String.prototype).forEach(function (name) {
+      if (name === 'constructor' || name === 'length') return;
+      if (JavaString.prototype[name] !== undefined) return;
+      var fn = String.prototype[name];
+      if (typeof fn !== 'function') return;
+      JavaString.prototype[name] = function () {
+        return fn.apply(String(this), arguments);
+      };
+    });
 
     var Arrays = {
       copyOf: function (value, length) { return Arrays.copyOfRange(value, 0, size(length)); },
@@ -243,9 +315,17 @@
         reset: function () { pending = []; }
       };
     }};
-    function SecretKeySpec(value, algorithm) { this.bytes = array(value); this.algorithm = String(algorithm); }
+    // Rhino 里把 Java 类当普通函数调用等价于 `new`(NativeJavaClass.call 会走
+    // construct), 书源大量写 `key = SecretKeySpec(ks, "AES")` 而不带 new。
+    function SecretKeySpec(value, algorithm) {
+      if (!(this instanceof SecretKeySpec)) return new SecretKeySpec(value, algorithm);
+      this.bytes = array(value); this.algorithm = String(algorithm);
+    }
     SecretKeySpec.prototype.getEncoded = function () { return this.bytes.slice(); };
-    function IvParameterSpec(value) { this.bytes = array(value); }
+    function IvParameterSpec(value) {
+      if (!(this instanceof IvParameterSpec)) return new IvParameterSpec(value);
+      this.bytes = array(value);
+    }
     var Cipher = {ENCRYPT_MODE:1, DECRYPT_MODE:2, getInstance:function (transformation) {
       var key, iv = [], encrypt, pending = [];
       return {

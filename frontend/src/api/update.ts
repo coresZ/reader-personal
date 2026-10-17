@@ -17,3 +17,7 @@ export function applyDesktopVersionUpdate(onProgress?: (progress: DesktopUpdateP
   onEvent.onmessage = (progress) => onProgress?.(progress)
   return invokeEnvelope<DesktopUpdateResult>('apply_desktop_update', { onEvent })
 }
+
+export function cancelDesktopVersionUpdate() {
+  return invokeEnvelope<{ cancelled: boolean }>('cancel_desktop_update', {})
+}

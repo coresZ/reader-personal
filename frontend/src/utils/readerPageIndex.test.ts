@@ -65,6 +65,22 @@ describe('readerPageIndexFromProgress', () => {
     expect(readerPageIndexFromProgress(0.5, 0)).toBe(0)
     expect(readerPageIndexFromProgress(Number.NaN, 11)).toBe(0)
   })
+
+  /** 位置恢复的正确性依赖"存进去的比例能原样换回同一页"。
+   *
+   *  保存端写的是 `horizontalPageIndex / 末页索引`, 恢复端用本函数反算。
+   *  若两端公式不一致, 重进阅读页就会落在别的页甚至第一页 —— 曾经横向恢复
+   *  走的是 scrollLeft(恒为 0), 现象就是"退出再进回到章节开头"。 */
+  it('round-trips every page index back to itself', () => {
+    for (const total of [1, 2, 3, 7, 11, 40]) {
+      const lastPage = total - 1
+      for (let index = 0; index <= lastPage; index += 1) {
+        // 保存端: syncHorizontalPageState 的写法。
+        const progress = lastPage <= 0 ? 1 : index / lastPage
+        expect(readerPageIndexFromProgress(progress, total)).toBe(index)
+      }
+    }
+  })
 })
 
 describe('readerLandingPageIndexAfterPrevChapter', () => {

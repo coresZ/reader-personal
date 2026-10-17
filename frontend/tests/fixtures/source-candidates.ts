@@ -68,6 +68,7 @@ const toBook = (hit: SearchBook): Book => ({ ...hit, latestChapterTitle: hit.las
 const initial = toBook(mode === 'reader' || params.get('current') === 'aggregate' ? maoyan : deqi)
 let shelfBooks = [initial]
 let completePending: (() => void) | undefined
+let chapterPending: (() => void) | undefined
 
 function findHit(url: string, origin?: string): SearchBook {
   const hit = hits.find((item) => item.bookUrl === url && (!origin || item.origin === origin))
@@ -117,7 +118,18 @@ mockIPC((command, payload) => {
     case 'get_chapter_list': {
       const hit = findHit(req.bookUrl, req.bookSourceUrl)
       const label = hit.lastChapter || '第' + hit.bookUrl.split('/').at(-1) + '版'
-      return ok([{ index: 0, title: label + ' · 第一章', url: hit.bookUrl + '#chapter=1' }])
+      const chapters = [{ index: 0, title: label + ' · 第一章', url: hit.bookUrl + '#chapter=1' }]
+      if (params.has('delay-initial-chapters') && req.bookSourceUrl === sourceUrls.deqi) {
+        return new Promise((resolve) => {
+          chapterPending = () => resolve(ok(chapters))
+        })
+      }
+      if (params.has('delay-chapters') && req.bookSourceUrl === sourceUrls.xiaoyuan) {
+        return new Promise((resolve) => {
+          chapterPending = () => resolve(ok(chapters))
+        })
+      }
+      return ok(chapters)
     }
     case 'get_book_info': return ok(toBook(findHit(req.url, req.bookSourceUrl)))
     case 'set_book_source': {
@@ -152,6 +164,7 @@ Object.assign(window, {
     searchResults: () => shelfStore.searchResults,
     currentBook: () => readerStore.book,
     completePending: () => completePending?.(),
+    completeChapterPending: () => chapterPending?.(),
   },
 })
 const router = createRouter({

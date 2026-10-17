@@ -251,7 +251,7 @@ fn chapter_list_strips_css_mode_prefix() {
         &source,
         r#"<ul class="dirList"><li><a href="/c1.html">第一章</a></li></ul>"#,
         "https://toc.example/book/",
-        // 无书籍上下文：`source_key` 供 `source.getKey()` 使用，本用例不需要。
+        // 无书籍上下文（`book.bookUrl`）；本用例只用选择器规则，不需要。
         None,
     );
 

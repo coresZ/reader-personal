@@ -56,6 +56,32 @@ impl HttpClient {
     }
 
     pub fn source_context(&self, user_ns: &str, source_url: &str, proxy: Option<&str>) -> anyhow::Result<SourceHttpContext> {
+        let proxy = match proxy.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) => resolve_manual_proxy(value)?,
+            None => self.active_proxy(),
+        };
+        self.source_context_with_proxy(user_ns, source_url, proxy)
+    }
+
+    /// 与 [`Self::source_context`] 相同, 但**强制直连**(忽略系统/手动代理)。
+    ///
+    /// 代理出口是共享 IP, 容易被站点 WAF 整个拦掉(返回几百字节的 403 拒绝页);
+    /// 同一台机器的直连出口常常正常。书源请求在这种情况下用它重试一次,
+    /// 避免像 shuhaoxs.com 那样「手机端能看、桌面端整页空白」。
+    pub fn source_context_direct(
+        &self,
+        user_ns: &str,
+        source_url: &str,
+    ) -> anyhow::Result<SourceHttpContext> {
+        self.source_context_with_proxy(user_ns, source_url, None)
+    }
+
+    fn source_context_with_proxy(
+        &self,
+        user_ns: &str,
+        source_url: &str,
+        proxy: Option<String>,
+    ) -> anyhow::Result<SourceHttpContext> {
         let source_url = crate::util::text::normalize_source_url(source_url);
         let key = format!("{user_ns}::{source_url}");
         let session = {
@@ -64,10 +90,6 @@ impl HttpClient {
                 let root = self.source_storage_dir.read().unwrap_or_else(|e| e.into_inner());
                 Arc::new(SourceSession::new(user_ns, &source_url, root.as_deref()))
             }).clone()
-        };
-        let proxy = match proxy.map(str::trim).filter(|v| !v.is_empty()) {
-            Some(value) => resolve_manual_proxy(value)?,
-            None => self.active_proxy(),
         };
         let client_key = format!("{key}::proxy={}", proxy.as_deref().unwrap_or(""));
         let mut clients = self.source_clients.write().unwrap_or_else(|e| e.into_inner());

@@ -118,6 +118,7 @@ pub fn analyze_url(
             response_type,
             charset,
             proxy: header_spec.proxy,
+            timeout: None,
             server_id,
             web_view,
             web_js,

@@ -35,6 +35,11 @@ pub struct RequestSpec {
     pub response_type: Option<String>,
     pub charset: Option<String>,
     pub proxy: Option<String>,
+    /// 单次尝试的覆盖超时。`None` 时沿用 client 自身的超时(书源默认 15s)。
+    /// 面板里的浏览器 `fetch`(头像/封面等第三方静态资源)用它压到 9s, 免得
+    /// 一个连不通的 CDN 一直挂着; 因为是 per-request 覆盖, 连接池仍然复用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<Duration>,
     pub server_id: Option<i64>,
     pub web_view: bool,
     pub web_js: Option<String>,
@@ -53,6 +58,7 @@ impl Default for RequestSpec {
             response_type: None,
             charset: None,
             proxy: None,
+            timeout: None,
             server_id: None,
             web_view: false,
             web_js: None,
@@ -159,6 +165,9 @@ async fn fetch_inner(
             HttpMethod::PATCH => request_client.patch(&req.url),
             HttpMethod::DELETE => request_client.delete(&req.url),
         };
+        if let Some(timeout) = req.timeout {
+            builder = builder.timeout(timeout);
+        }
 
         let mut has_content_type = false;
         for (k, v) in &req.headers {

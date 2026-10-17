@@ -57,9 +57,37 @@ pub fn build_chapter_url(book_url: &str, index: usize) -> String {
     format!("{}#{}", book_url.trim_end_matches('#'), index)
 }
 
+/// 章节区间(不含正文)。导入只需要它, 不必把整本正文按章复制一遍。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxtChapterRange {
+    pub title: String,
+    pub url: String,
+    pub index: i32,
+    pub start: usize,
+    pub end: usize,
+}
+
 pub fn parse_txt_chapters(book_url: &str, text: &str) -> Vec<ParsedTxtChapter> {
+    parse_txt_chapter_ranges(book_url, text)
+        .into_iter()
+        .map(|range| ParsedTxtChapter {
+            content: text[range.start..range.end].to_string(),
+            title: range.title,
+            url: range.url,
+            index: range.index,
+            start: range.start,
+            end: range.end,
+        })
+        .collect()
+}
+
+/// 只解析章节标题与字符区间, 不复制正文。
+///
+/// 导入路径用它: 旧实现顺手为每章 `to_string()` 一份正文却从不用(索引只存区间),
+/// 一本几十 MB 的 TXT 等于白白多复制一整本书。
+pub fn parse_txt_chapter_ranges(book_url: &str, text: &str) -> Vec<TxtChapterRange> {
     let Some(heading_re) = chapter_heading_regex() else {
-        return fallback_chapter(book_url, text);
+        return fallback_range(book_url, text);
     };
 
     let mut headings: Vec<(usize, usize, String)> = Vec::new();
@@ -85,19 +113,18 @@ pub fn parse_txt_chapters(book_url: &str, text: &str) -> Vec<ParsedTxtChapter> {
     }
 
     if headings.is_empty() {
-        return fallback_chapter(book_url, text);
+        return fallback_range(book_url, text);
     }
 
     let mut chapters = Vec::new();
     let first_start = headings[0].0;
     if text[..first_start].trim().len() > 0 {
-        chapters.push(ParsedTxtChapter {
+        chapters.push(TxtChapterRange {
             title: "序章".to_string(),
             url: build_chapter_url(book_url, 0),
             index: 0,
             start: 0,
             end: trim_chapter_end(text, first_start),
-            content: text[..trim_chapter_end(text, first_start)].to_string(),
         });
     }
 
@@ -109,13 +136,12 @@ pub fn parse_txt_chapters(book_url: &str, text: &str) -> Vec<ParsedTxtChapter> {
             .unwrap_or(text.len());
         let end = trim_chapter_end(text, next_start).max(content_start);
         let index = chapters.len() as i32;
-        chapters.push(ParsedTxtChapter {
+        chapters.push(TxtChapterRange {
             title: title.clone(),
             url: build_chapter_url(book_url, index as usize),
             index,
             start: content_start,
             end,
-            content: text[content_start..end].to_string(),
         });
         if *title_start >= text.len() {
             break;
@@ -123,7 +149,7 @@ pub fn parse_txt_chapters(book_url: &str, text: &str) -> Vec<ParsedTxtChapter> {
     }
 
     if chapters.is_empty() {
-        fallback_chapter(book_url, text)
+        fallback_range(book_url, text)
     } else {
         chapters
     }
@@ -213,7 +239,8 @@ impl LocalTxtBookService {
             md5_hex(&text)
         ));
         let book_url = format!("{}:{}", LOCAL_TXT_ORIGIN, hash);
-        let chapters = parse_txt_chapters(&book_url, &text);
+        // 只要区间: 旧实现为每章复制一份正文却从不使用(索引只存 start/end)。
+        let chapters = parse_txt_chapter_ranges(&book_url, &text);
         let book_dir = self.book_dir(user_ns, &book_url)?;
         fs::create_dir_all(&book_dir)
             .await
@@ -229,10 +256,10 @@ impl LocalTxtBookService {
             byte_len: bytes.len(),
             char_len: text.chars().count(),
             chapters: chapters
-                .iter()
+                .into_iter()
                 .map(|chapter| StoredTxtChapter {
-                    title: chapter.title.clone(),
-                    url: chapter.url.clone(),
+                    title: chapter.title,
+                    url: chapter.url,
                     index: chapter.index,
                     start: chapter.start,
                     end: chapter.end,
@@ -346,14 +373,13 @@ impl LocalTxtBookService {
     }
 }
 
-fn fallback_chapter(book_url: &str, text: &str) -> Vec<ParsedTxtChapter> {
-    vec![ParsedTxtChapter {
+fn fallback_range(book_url: &str, text: &str) -> Vec<TxtChapterRange> {
+    vec![TxtChapterRange {
         title: "正文".to_string(),
         url: build_chapter_url(book_url, 0),
         index: 0,
         start: 0,
         end: text.len(),
-        content: text.to_string(),
     }]
 }
 

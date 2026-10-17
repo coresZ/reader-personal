@@ -4,7 +4,7 @@ use crate::model::{
 };
 use crate::parser::{
     html,
-    js::{eval_js, eval_js_with_bindings, push_js_log, with_source, with_source_key},
+    js::{eval_js, eval_js_with_bindings, push_js_log, with_book_url, with_source},
     jsonpath,
     rule_analyzer::split_top_level,
 };
@@ -342,10 +342,10 @@ impl RuleEngine {
         source: &BookSource,
         body: &str,
         base_url: &str,
-        source_key: Option<&str>,
+        book_url: Option<&str>,
     ) -> (Vec<BookChapter>, Vec<String>) {
         with_source(source,|| {
-            with_source_key(source_key, || {
+            with_book_url(book_url, || {
                 let rule = source.rule_toc.clone().unwrap_or_default();
             let mut context = HashMap::new();
             let (list_rule, reverse) =
@@ -371,10 +371,10 @@ impl RuleEngine {
         source: &BookSource,
         body: &str,
         base_url: &str,
-        source_key: Option<&str>,
+        book_url: Option<&str>,
     ) -> String {
         with_source(source,|| {
-            with_source_key(source_key, || {
+            with_book_url(book_url, || {
                 let rule = source.rule_content.clone().unwrap_or_default();
                 let mut content_body = body.to_string();
 
@@ -2072,6 +2072,16 @@ fn eval_field_html_with_ctx(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
+    // legado 对空规则直接给空值: `AnalyzeRule.getString` 开头 `if (TextUtils.isEmpty(ruleStr)) return ""`,
+    // `AnalyzeByJSoup.getString` 也 `if (ruleStr.isEmpty()) return null`.
+    // 空规则若继续往下走, `extract_js` 得到的 `pure` 为空, 会落到
+    // "纯 JS 规则"分支返回**当前元素的 outerHtml** — 某书源
+    // `ruleExplore.kind` / `updateTime` 就是空串, 结果是整段 `<li>` 被当成
+    // 字段值, 详情页"标签"里于是显示 HTML 源码.
+    if rule.trim().is_empty() {
+        return None;
+    }
+
     // legado 字段级链式: `&&`(拼接) / `||`(首个非空) / `%%`(按索引交织)
     //
     // 拆分层级必须与 legado 一致：**先拆 `##`**（rule / replaceRegex /
@@ -2142,6 +2152,10 @@ fn eval_field_html_single_with_ctx(
 ) -> Option<String> {
     // Handle mode forcing prefixes
     let rule = rule.trim();
+    // 同上: 空规则在 legado 里就是空值, 不能落进"纯 JS 规则"分支拿到 outerHtml.
+    if rule.is_empty() {
+        return None;
+    }
     // 先分离规则中任意位置的 @put 段
     let (stripped, puts) = split_inline_put_rules(rule);
     for (key, val_rule) in puts {
@@ -2219,6 +2233,10 @@ fn eval_field_html_doc_with_ctx(
 ) -> Option<String> {
     // Handle mode forcing prefixes
     let rule = rule.trim();
+    // 同上: 空规则 = 空值(legado AnalyzeRule.getString 首行即返回 "").
+    if rule.is_empty() {
+        return None;
+    }
     if rule.starts_with("@css:") {
         let pure = &rule[5..];
         return eval_field_html_doc_with_ctx(pure, doc, base_url, ctx);
@@ -3228,6 +3246,35 @@ mod tests {
     use crate::model::book_source::BookSource;
     use crate::model::rule::{BookInfoRule, ContentRule, SearchRule, TocRule};
 
+    /// 空字段规则必须给空值。某书源 `ruleExplore.kind` / `updateTime` 是空串,
+    /// 早先会落到"纯 JS 规则"分支返回**当前元素的 outerHtml**, 于是整段 `<li>`
+    /// 被当成字段值, 详情页标签显示 HTML 源码。对齐 legado
+    /// (`AnalyzeRule.getString` 首行 `TextUtils.isEmpty(ruleStr) -> ""`).
+    #[test]
+    fn test_empty_field_rule_yields_none_not_element_html() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            book_source_name: "Test".to_string(),
+            book_source_url: "https://source.example".to_string(),
+            rule_explore: Some(SearchRule {
+                book_list: Some("class.list@tag.li".to_string()),
+                name: Some("class.name@tag.a@text".to_string()),
+                kind: Some(String::new()),
+                update_time: Some(String::new()),
+                intro: Some("class.intro@text".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"<html><body><div class="list"><ul><li><div class="name"><a href="/b/1.html">书名</a></div><div class="intro">简介</div></li></ul></div></body></html>"#;
+        let books = engine.explore_books(&source, body, "https://source.example/rank.html");
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].name, "书名");
+        assert_eq!(books[0].intro.as_deref(), Some("简介"));
+        assert_eq!(books[0].kind, None, "空规则不能返回元素 HTML");
+        assert_eq!(books[0].update_time, None, "空规则不能返回元素 HTML");
+    }
+
     #[test]
     fn test_detect_mode() {
         let engine = RuleEngine::new().unwrap();
@@ -3467,6 +3514,7 @@ mod tests {
                         .to_string(),
                 ),
                 chapter_name: Some("@js:result=result.split('|')[2]".to_string()),
+                // legado: source.getKey() 返回**书源地址**（不是书籍地址）。
                 chapter_url: Some("@js:var bid=source.getKey().match(/\\d+/)[0];result='https://m.example.com/chapter/'+bid+'/'+result.split('|')[0]+'/'".to_string()),
                 is_vip: Some("@js:result=result.split('|')[1].replace(/V/,'true').replace(/F/,'false')".to_string()),
                 ..Default::default()
@@ -3474,7 +3522,7 @@ mod tests {
             ..Default::default()
         };
 
-        // source_key 传入书籍 bookUrl, 使 source.getKey().match(/\d+/) 能取到 book id
+        // 书源地址里的 1001 就是 source.getKey() 取到的 id（legado 语义：书源主键）
         let (chapters, _) = engine.chapter_list(
             &source,
             "<html></html>",

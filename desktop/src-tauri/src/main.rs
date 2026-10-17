@@ -7,6 +7,7 @@
 mod portable;
 mod win;
 
+use reader_rust::api::commands::window::CLOSE_REQUEST_HANDLED;
 use reader_rust::api::protocol::handle_reader_scheme;
 use reader_rust::app::bootstrap;
 use reader_rust::app::config::AppConfig;
@@ -57,6 +58,13 @@ fn host_allowed_in_app(url_host: Option<&str>) -> bool {
 /// `on_page_load` 永远不触发, 窗口会一直隐藏着 —— 那比白屏更糟, 用户会以为
 /// 应用根本没启动。超过这个时间无论如何都显示窗口。
 const REVEAL_FALLBACK: Duration = Duration::from_secs(3);
+
+/// 关闭请求交给前端后的宽限期。
+///
+/// 前端会先 flush 阅读位置(自身有 1.5s 上限)再 hide/destroy, 这里留出余量;
+/// 超过仍未见前端回执 `acknowledge_close_request`, 说明 `close-requested` 没人
+/// 处理(监听未注册、IPC 卡死), 由看门狗结束窗口 —— 关不掉窗口比少存一次进度更糟。
+const CLOSE_FRONTEND_GRACE: Duration = Duration::from_secs(3);
 
 /// 首屏显示状态。
 ///
@@ -275,14 +283,13 @@ fn start(app: &mut App) -> anyhow::Result<()> {
 
     // Some Linux desktop environments do not provide a status notifier. The
     // app must still start there, and closing the window must really exit.
-    let tray_available = match setup_tray(app) {
-        Ok(()) => true,
-        Err(err) => {
-            eprintln!("阅读：系统托盘不可用：{err:#}");
-            win::warn("当前桌面环境无法创建系统托盘，关闭窗口时将直接退出应用。");
-            false
-        }
-    };
+    //
+    // 托盘是否可用只影响"关闭时隐藏还是退出"的**默认**行为(没有托盘就没有
+    // 可隐藏的目标), 关闭请求本身的拦截已与它无关 —— 见下方那段说明。
+    if let Err(err) = setup_tray(app) {
+        eprintln!("阅读：系统托盘不可用：{err:#}");
+        win::warn("当前桌面环境无法创建系统托盘，关闭窗口时将直接退出应用。");
+    }
 
     // 关闭时补写一次几何, 并跳过节流。
     //
@@ -291,8 +298,7 @@ fn start(app: &mut App) -> anyhow::Result<()> {
     // `destroy()`, 两者都不会再触发写盘, 于是"拖完随即关闭"保存的是拖动过程中
     // 的中间位置(偏差可达节流窗口内的拖动距离), 表现为位置记录时对时错。
     //
-    // 这里不拦截关闭本身, 因此与托盘无关: 托盘不可用时关闭会直接销毁窗口,
-    // 同样需要这次补写(此后 ExitRequested 已经取不到窗口)。
+    // 这个监听器只补写几何, **不拦截**关闭本身; 真正拦截关闭的是下面那个监听器。
     {
         let app_handle = app.handle().clone();
         let tracked = window.clone();
@@ -303,14 +309,44 @@ fn start(app: &mut App) -> anyhow::Result<()> {
         });
     }
 
-    if tray_available {
-        // The frontend resolves each intercepted close request using the
-        // persisted preference: hide to tray or exit.
+    // 关闭请求先交给前端: 它要在窗口消失前把阅读位置落到书架(对应 legado 在
+    // `ReadBookActivity.onPause` 里的 saveRead)。
+    //
+    // 这里**不能**只在托盘可用时拦截: 托盘不可用(部分 Linux 桌面环境)时, 关闭会
+    // 直接销毁窗口, 前端收不到任何通知, `beforeunload` 与 Vue 的 onUnmounted 都不
+    // 保证执行 —— 在阅读页关窗就会丢掉当前阅读位置。拦截后由前端根据「关闭到
+    // 托盘 / 直接退出」的偏好决定 hide 还是 destroy, 两条路径都能先保存再动手。
+    //
+    // 但"拦截"必须有两层兜底, 否则窗口会关不掉:
+    // 1. 窗口还没显示出来时(首帧未渲染, 或加载失败后由 3s 兜底超时显示)前端可能
+    //    还没注册 `close-requested` 监听, 这时**不拦截**, 保持原有的直接关闭;
+    // 2. 窗口已显示但监听尚未注册 / IPC 卡住时, 用一个看门狗在宽限期后替前端结束
+    //    窗口。判断依据是"这一次关闭请求有没有被前端回执接管"(见
+    //    `CLOSE_REQUEST_HANDLED`), 而不是轮询窗口可见性 —— 后者会把"隐藏到托盘后
+    //    又立刻从托盘打开"误判成"前端没响应", 进而把用户刚打开的窗口销毁。
+    {
         let app_handle = app.handle().clone();
+        let page_ready = Arc::clone(&reveal_state);
+        let window_for_event = window.clone();
         window.on_window_event(move |event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
+                if !page_ready.revealed.load(Ordering::SeqCst) {
+                    // 窗口尚未显示: 前端可能还没装好监听, 放行让关闭按默认行为走。
+                    return;
+                }
                 api.prevent_close();
+                CLOSE_REQUEST_HANDLED.store(false, Ordering::SeqCst);
                 let _ = app_handle.emit("close-requested", ());
+                let fallback = window_for_event.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(CLOSE_FRONTEND_GRACE);
+                    if CLOSE_REQUEST_HANDLED.swap(true, Ordering::SeqCst) {
+                        // 前端已回执(窗口已隐藏或已销毁), 看门狗退让。
+                        return;
+                    }
+                    // 没有任何一方响应: 宁可丢一次进度, 也不能让窗口关不掉。
+                    let _ = fallback.destroy();
+                });
             }
         });
     }

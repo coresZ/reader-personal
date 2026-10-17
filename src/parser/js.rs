@@ -21,7 +21,7 @@ use rquickjs::function::{Func, Opt};
 use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::{json, Value as JsonValue};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
@@ -30,6 +30,9 @@ use uuid::Uuid;
 
 /// 进程内存 KV: `cache.putMemory` / `java.putCache` / `kv_put` 等, 重启即失。
 static JS_KV: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static JS_KV_ORDER: Lazy<Mutex<VecDeque<String>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+const JS_KV_CAP: usize = 2048;
+const JS_KV_MAX_VALUE_BYTES: usize = 1024 * 1024;
 /// 持久 KV: `cache.put`、`source/book/chapter.putVariable` 等, 落盘到 `{storage}/js_store.json`。
 static JS_STORE: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(load_js_store()));
 static JS_STORAGE_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -70,6 +73,11 @@ static JS_DEVICE_ID: Lazy<String> = Lazy::new(|| {
 struct JsSourceInfo {
     url: String,
     name: String,
+    /// legado BookSource.bookSourceComment / variableComment: 书源常把解密脚本
+    /// 放在注释里, 再在规则中 `eval(String(source.bookSourceComment))` 取用
+    /// (issue #13 的书源正是这种写法)。
+    comment: String,
+    variable_comment: String,
     headers: Vec<(String, String)>,
     header_script: Option<String>,
     http: Option<SourceHttpContext>,
@@ -97,8 +105,10 @@ pub struct JsBookContext {
 
 thread_local! {
     static ACTIVE_JS_LIB: RefCell<Option<String>> = const { RefCell::new(None) };
-    static ACTIVE_SOURCE_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
     static ACTIVE_SOURCE: RefCell<Option<JsSourceInfo>> = const { RefCell::new(None) };
+    /// 目录/正文解析期间的**书籍 URL** 兜底（legado 里是 `book.bookUrl`，
+    /// 与 `source.getKey()` 的书源地址不是一回事）。
+    static ACTIVE_BOOK_URL: RefCell<Option<String>> = const { RefCell::new(None) };
     static ACTIVE_BOOK_CTX: RefCell<Option<JsBookContext>> = const { RefCell::new(None) };
     static JS_LOGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static ACTIVE_HTTP: RefCell<Option<SourceHttpContext>> = const { RefCell::new(None) };
@@ -208,6 +218,8 @@ pub fn with_source<T>(source: &BookSource, f: impl FnOnce() -> T) -> T {
     let info = JsSourceInfo {
         url: source.book_source_url.clone(),
         name: source.book_source_name.clone(),
+        comment: source.book_source_comment.clone().unwrap_or_default(),
+        variable_comment: source.variable_comment.clone().unwrap_or_default(),
         headers,
         header_script,
         http,
@@ -218,19 +230,18 @@ pub fn with_source<T>(source: &BookSource, f: impl FnOnce() -> T) -> T {
     })
 }
 
-/// 在解析目录/正文期间设置当前书籍 URL, 供 JS `source.getKey()` 读取。
-/// 例如规则 `source.getKey().match(/\d+/)` 需要书籍 bookUrl 中的 id。
-pub fn with_source_key<T>(source_key: Option<&str>, f: impl FnOnce() -> T) -> T {
-    with_thread_local(&ACTIVE_SOURCE_KEY, source_key.map(|value| value.to_string()), f)
+/// 在解析目录/正文期间登记当前**书籍 URL**（thread-local 兜底）。
+///
+/// legado 的 `source.getKey()` 返回书源地址；书籍地址走 `book.bookUrl` / `baseUrl`。
+/// 这里登记的值只在 `book.bookUrl` 缺失时用于补齐 `book` 绑定，
+/// 不会再改写 `source.getKey()` 的语义（issue #13 的章节域名拼接由此修正）。
+pub fn with_book_url<T>(book_url: Option<&str>, f: impl FnOnce() -> T) -> T {
+    with_thread_local(&ACTIVE_BOOK_URL, book_url.map(|value| value.to_string()), f)
 }
 
 /// 设置 JS `book` / `chapter` / `title` 上下文后执行 f。
 pub fn with_book_context<T>(ctx: Option<JsBookContext>, f: impl FnOnce() -> T) -> T {
     with_thread_local(&ACTIVE_BOOK_CTX, ctx, f)
-}
-
-fn active_source_key() -> Option<String> {
-    ACTIVE_SOURCE_KEY.with(|cell| cell.borrow().clone())
 }
 
 fn active_source() -> JsSourceInfo {
@@ -314,18 +325,35 @@ fn store_write(update: impl FnOnce(&mut HashMap<String, String>)) {
 }
 
 fn memory_get(key: &str) -> Option<String> {
-    JS_KV
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(key)
-        .cloned()
+    let map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
+    let value = map.get(key).cloned();
+    if value.is_some() {
+        let mut order = JS_KV_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = order.iter().position(|item| item == key) {
+            order.remove(index);
+        }
+        order.push_back(key.to_string());
+    }
+    value
 }
 
 fn memory_put(key: String, value: String) {
-    JS_KV
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, value);
+    if value.len() > JS_KV_MAX_VALUE_BYTES {
+        return;
+    }
+    let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut order = JS_KV_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    if map.insert(key.clone(), value).is_some() {
+        if let Some(index) = order.iter().position(|item| item == &key) {
+            order.remove(index);
+        }
+    }
+    order.push_back(key);
+    while order.len() > JS_KV_CAP {
+        if let Some(oldest) = order.pop_front() {
+            map.remove(&oldest);
+        }
+    }
 }
 
 pub fn eval_js(script: &str, input: &str, base_url: &str) -> anyhow::Result<String> {
@@ -365,17 +393,10 @@ pub fn eval_js_search_with_source(
     script: &str,
     key: &str,
     page: i32,
+    // 书源地址：`with_source` 已提供 source 绑定，这里只是它的空值回退。
     source_key: &str,
 ) -> anyhow::Result<String> {
-    eval_js_inner_with_source(
-        script,
-        None,
-        None,
-        Some(key),
-        Some(page),
-        Some(source_key),
-        None,
-    )
+    eval_js_inner_with_source(script, None, None, Some(key), Some(page), Some(source_key), None)
 }
 
 /// 求值发现页分类里的 `exploreUrl`（`@js:` / `<js>` 规则）。
@@ -385,6 +406,7 @@ pub fn eval_js_search_with_source(
 /// 分类，并顺手 `infoMap[...] = ...` 写回默认值。
 pub fn eval_explore_kinds(
     script: &str,
+    // 发现页没有书籍上下文；此参数为书源地址（source.getKey() 的空值回退）。
     source_key: &str,
     info_map: &HashMap<String, String>,
 ) -> anyhow::Result<String> {
@@ -411,6 +433,7 @@ pub fn eval_explore_kinds(
 /// 这些调用会写进 `LoginEffects`，由调用方（IPC 命令）回传给前端执行。
 pub fn eval_explore_action(
     script: &str,
+    // 发现页没有书籍上下文；此参数为书源地址（source.getKey() 的空值回退）。
     source_key: &str,
     info_map: &HashMap<String, String>,
 ) -> anyhow::Result<String> {
@@ -441,6 +464,7 @@ pub fn eval_explore_action(
 /// 而部分书源会写成一段读 `source.getVariable()` 的脚本 —— 两者都需要沙箱。
 pub fn eval_explore_view_name(
     view_name: &str,
+    // 发现页没有书籍上下文；此参数为书源地址（source.getKey() 的空值回退）。
     source_key: &str,
     info_map: &HashMap<String, String>,
 ) -> Option<String> {
@@ -504,6 +528,7 @@ pub fn eval_js_url(
     result: &str,
     key: &str,
     page: i32,
+    // 书源地址（source.getKey() 的空值回退）。
     source_key: &str,
     base_url: &str,
 ) -> anyhow::Result<String> {
@@ -533,7 +558,36 @@ fn eval_js_inner(
 /// 以及 Rhino 风格的 `java.util.HashMap` / `java.lang.String` 等。
 /// 原生函数参数个数与类型必须精确匹配, 所以这里统一做字符串强转和可变参数适配。
 const JS_PRELUDE: &str = r#"(function (g) {
-  var S = function (v) { return v === undefined || v === null ? '' : String(v); };
+  // JS 字符串是 UTF-16, 允许孤立代理项(lone surrogate); Rust 的 String 必须是
+  // 合法 UTF-8, 一处落单代理项就会让整次宿主调用失败:
+  //   Conversion from string failed: invalid utf-8 sequence of 1 bytes from index N
+  // 书源侧很容易造出这种字符 —— 例如 `String(x).substring(0,20)` 正好把 emoji 的
+  // 代理对切成两半(番茄段评源就是这么生成面板去重键的)。legado 跑 Rhino/Java
+  // 字符串不受影响, 这里由宿主统一兜底: 成对代理项原样保留, 落单的替换成 U+FFFD,
+  // 保证过桥的永远是合法 UTF-8。
+  //
+  // 先做一次廉价探测(原生正则扫描, 不分配字符串): 绝大多数字符串没有
+  // 落单代理项, 直接原样返回; 命中才走逐字符重建。
+  var LONE_HIGH = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/;
+  var LONE_LOW = /(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  var cleanSurrogates = function (s) {
+    if (!LONE_HIGH.test(s) && !LONE_LOW.test(s)) return s;
+    var out = '', i, c, d;
+    for (i = 0; i < s.length; i++) {
+      c = s.charCodeAt(i);
+      if (c >= 0xD800 && c <= 0xDBFF) {
+        d = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
+        if (d >= 0xDC00 && d <= 0xDFFF) { out += s.charAt(i) + s.charAt(i + 1); i++; }
+        else out += '\uFFFD';
+      } else if (c >= 0xDC00 && c <= 0xDFFF) {
+        out += '\uFFFD';
+      } else {
+        out += s.charAt(i);
+      }
+    }
+    return out;
+  };
+  var S = function (v) { return v === undefined || v === null ? '' : cleanSurrogates(String(v)); };
   var J = g.java;
   function wrap(name, arity) {
     var f = J[name];
@@ -562,19 +616,41 @@ const JS_PRELUDE: &str = r#"(function (g) {
   });
   // `createSymmetricCrypto` 的 key/iv 允许是字节数组：转成宿主认识的形式。
   // (宿主侧 `__sym` 收字符串；数组按 latin1 逐字节还原，保证字节值不被 UTF-8 改写。)
+  // Java String 包装对象是普通对象, 但语义是文本而不是字节序列。若不显式排除,
+  // 它会落进下面的逐字节分支: 例如 `java.md5Encode('abc')` 的十六进制文本会被
+  // `charCodeAt & 0xff` 拆成 32 个垃圾字节, 且不抛错, 只是把签名/密钥算错。
+  function isJavaString(v) {
+    return v !== null && v !== undefined && typeof v.__javaStringText === 'function';
+  }
   function bytesArg(v) {
     if (v === undefined || v === null) return '';
     if (typeof v === 'string') return v;
+    if (isJavaString(v)) return String(v);
     var out = '';
     for (var i = 0; i < v.length; i++) out += String.fromCharCode(v[i] & 0xff);
     return out;
   }
   // 是否为"字节序列"入参: 字符串按原样交给宿主, 数组/TypedArray 才算字节。
   function isByteSequence(v) {
-    return v !== null && v !== undefined && typeof v !== 'string';
+    return v !== null && v !== undefined && typeof v !== 'string' && !isJavaString(v);
   }
   J.__bytesArg = bytesArg;
   J.__isByteSequence = isByteSequence;
+  // Rhino 里 java.* 的字符串返回值是 **Java String**: 脚本侧是对象, 带
+  // `length()` / `getBytes()` / `substring()` 等方法。书源会直接按 Java 风格调用
+  // (`java.digestHex(...).length()`, `java.md5Encode(...).getBytes()`, issue #13)。
+  // 宿主侧只能返回 JS 原始字符串, 这里统一包成 java.lang.String。
+  function javaString(value) {
+    return J.lang.String(value === undefined || value === null ? '' : String(value));
+  }
+  ['md5Encode', 'md5Encode16', 'base64Encode', 'digestHex', 'digestBase64Str',
+   'hexEncodeToString', 'hexDecodeToString', 'HMacHex', 'HMacBase64'].forEach(function (n) {
+    var f = J[n];
+    if (typeof f !== 'function') return;
+    J[n] = function () { return javaString(f.apply(J, arguments)); };
+  });
+  // java.lang.String 在 JavaImporter 的 with 作用域里会遮蔽内置 String, 书源靠这
+  // 一点把字节数组转成文本(`String(Arrays.copyOfRange(data,0,16))`)。
   var timeFormat = J.timeFormat, timeFormatUTC = J.timeFormatUTC, randomInt = J.randomInt, randomString = J.randomString;
   J.timeFormat = function (t) { return timeFormat(Number(t) || 0); };
   J.timeFormatUTC = function (t, f, sh) { return timeFormatUTC(Number(t) || 0, S(f), sh === undefined ? 8 : Number(sh) || 0); };
@@ -760,7 +836,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.showBrowser = function (u, html, preloadJs, options) {
     g.__show_browser(S(u), html === undefined || html === null ? '' : S(html),
                      preloadJs === undefined || preloadJs === null ? '' : S(preloadJs),
-                     options == null ? '' : typeof options === 'string' ? options : JSON.stringify(options), '');
+                     S(options == null ? '' : typeof options === 'string' ? options : JSON.stringify(options)), '');
     return true;
   };
   J.startBrowser = function (u, title, html) {
@@ -912,7 +988,13 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.lang = {
     String: function (s) { return new String(S(s)); },
     System: { currentTimeMillis: function () { return Date.now(); } },
-    Integer: { parseInt: function (s) { return parseInt(s, 10); }, valueOf: function (s) { return parseInt(s, 10); } }
+    // Java Integer.parseInt(String, int radix) 必须带进制: 书源用它按 16 进制
+    // 逐字节还原密钥(`Integer.parseInt(k.substring(i, i3), 16)`)。固定按 10 进制
+    // 解析会得到 NaN, 之后的位运算把密钥整体变成全 0。
+    Integer: {
+      parseInt: function (s, radix) { return parseInt(s, radix === undefined ? 10 : Number(radix)); },
+      valueOf: function (s, radix) { return parseInt(s, radix === undefined ? 10 : Number(radix)); }
+    }
   };
   g.Packages = { java: J };
 
@@ -942,8 +1024,16 @@ const JS_PRELUDE: &str = r#"(function (g) {
       }
     }
     for (var i = 0; i < arguments.length; i++) absorb(arguments[i]);
-    this.importClass = function (cls) { absorb(cls, ''); return this; };
-    this.importPackage = function (pkg) { absorb(pkg); return this; };
+    // Rhino 的 JavaImporter.importPackage / importClass 都**遍历全部实参**逐个导入
+    // (ImporterTopLevel.js_importPackage), 只取第一个会让后续包里的类全部缺失。
+    this.importClass = function () {
+      for (var i = 0; i < arguments.length; i++) absorb(arguments[i], '');
+      return this;
+    };
+    this.importPackage = function () {
+      for (var i = 0; i < arguments.length; i++) absorb(arguments[i]);
+      return this;
+    };
   }
   g.JavaImporter = JavaImporter;
 
@@ -1192,8 +1282,18 @@ const JS_PRELUDE: &str = r#"(function (g) {
 
   var si = JSON.parse(g.__source_info());
   var src = g.source;
-  src.bookSourceUrl = si.url;
+  // 正常情况下 si.url 就是书源地址; 为空时（调用方未包 with_source）保留宿主
+  // 预先设置的 source.key/getKey 兜底值, 不要用空串覆盖。
+  if (si.url) {
+    src.bookSourceUrl = si.url;
+    src.key = si.url;
+    src.getKey = function () { return S(si.url); };
+  }
   src.bookSourceName = si.name;
+  // legado BookSource 的注释字段在 JS 里可读可写; 书源常把解密脚本放在这里
+  // 再用 `eval(String(source.bookSourceComment))` 取用(issue #13)。
+  src.bookSourceComment = si.comment;
+  src.variableComment = si.variableComment;
   src.getVariable = function () { var v = g.__source_get('variable'); return v === null ? g.__store_get('sv:' + si.url) || '' : v; };
   src.setVariable = function (v) { if (!g.__source_set('variable', S(v))) throw new Error('保存书源变量失败'); };
   src.putVariable = src.setVariable;
@@ -1239,8 +1339,9 @@ const JS_PRELUDE: &str = r#"(function (g) {
       return true;
     };
     // legado 的 Book/BookChapter 只实现 RuleDataInterface(没有 getKey), 只有
-    // BookSource 有。但插件常做 `book.getKey ? book.getKey() : book.bookUrl` 式探测,
-    // 因此按"主键即 bookUrl/章节 url"补上, 与 `source.getKey()` 语义保持一致。
+    // BookSource 才有。但插件常做 `book.getKey ? book.getKey() : book.bookUrl` 式探测,
+    // 因此按"主键即 bookUrl / 章节 url"补上 —— 与 `source.getKey()`（书源地址）
+    // 不是同一个东西，前者是数据主键，后者是书源主键。
     o.getKey = function () { return S(o[keyField]); };
     return o;
   }
@@ -1371,12 +1472,38 @@ fn eval_js_inner_with_source(
     base_url: Option<&str>,
     key: Option<&str>,
     page: Option<i32>,
+    // 书源地址：正常情况下由 `with_source` 提供的 source 绑定给出；
+    // 未设置 source 绑定（如直接 eval）时用它保证 source.getKey() 仍有值。
+    // 书籍地址不在这个参数里 —— 它是 thread-local（`with_book_url`），
+    // 只用来兜底补齐 JS 的 `book.bookUrl`。
     source_key: Option<&str>,
     bindings: Option<&HashMap<String, JsonValue>>,
 ) -> anyhow::Result<String> {
     let shared_js = active_js_lib_script();
     let source_info = active_source();
-    let book_ctx = ACTIVE_BOOK_CTX.with(|cell| cell.borrow().clone()).unwrap_or_default();
+    let source_url = source_info
+        .url
+        .clone()
+        .trim()
+        .is_empty()
+        .then(|| source_key.unwrap_or("").to_string())
+        .unwrap_or_else(|| source_info.url.clone());
+    let mut book_ctx = ACTIVE_BOOK_CTX.with(|cell| cell.borrow().clone()).unwrap_or_default();
+    // legado 的目录/正文规则可能直接读 `book.bookUrl`。部分调用路径（如纯 JS 规则）
+    // 只通过 thread-local 登记了书籍 URL，这里在 book 上下文缺 bookUrl 时补齐。
+    let has_book_url = book_ctx
+        .book
+        .get("bookUrl")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    if !has_book_url {
+        // 只取解析期登记的书籍 URL；绝不回退成书源地址，否则 `book.bookUrl`
+        // 会被污染成 `https://s.chuangke.tv` 这类书源地址。
+        let fallback = ACTIVE_BOOK_URL.with(|cell| cell.borrow().clone());
+        if let Some(value) = fallback.filter(|value| !value.trim().is_empty()) {
+            book_ctx.book["bookUrl"] = json!(value);
+        }
+    }
 
     // 复用键必须带上书源: 不同书源(尤其都没有 jsLib 时)不能共用同一个上下文,
     // 否则规则脚本声明的全局变量会互相可见。同一书源的连续章节仍能命中复用。
@@ -1399,22 +1526,13 @@ fn eval_js_inner_with_source(
         // Default url variable for Legado compatibility
         globals.set("url", base_url_value)?;
 
-        let source_key_val = source_key.unwrap_or("").to_string();
         let source_obj = Object::new(ctx.clone())?;
-        let key_clone = source_key_val.clone();
-        let source_url = source_info.url.clone();
-        source_obj.set("key", source_key_val)?;
-        // getKey: 优先返回显式传入的 source_key; 否则回退到解析期 thread-local 的书籍 URL
-        source_obj.set(
-            "getKey",
-            Func::new(move || {
-                if !key_clone.is_empty() {
-                    key_clone.clone()
-                } else {
-                    active_source_key().unwrap_or_else(|| source_url.clone())
-                }
-            }),
-        )?;
+        source_obj.set("key", source_url.clone())?;
+        source_obj.set("bookSourceUrl", source_url.clone())?;
+        // legado: BookSource.getKey() 返回的是 **bookSourceUrl**（书源地址），不是书籍地址。
+        // 书源常见写法 `{{source.getKey().replace('//s','//chapter')}}` 正是靠它拼章节域名；
+        // 书籍地址在 legado 里走 `book.bookUrl` / `baseUrl` 绑定，不能用 getKey 代替。
+        source_obj.set("getKey", Func::new(move || source_url.clone()))?;
         globals.set("source", source_obj)?;
 
         let cookie_obj = Object::new(ctx.clone())?;
@@ -1696,7 +1814,13 @@ fn eval_js_inner_with_source(
             "__mem_put",
             Func::new(|key: String, value: String| memory_put(key, value)),
         )?;
-        let source_json = json!({ "url": source_info.url, "name": source_info.name }).to_string();
+        let source_json = json!({
+            "url": source_info.url,
+            "name": source_info.name,
+            "comment": source_info.comment,
+            "variableComment": source_info.variable_comment,
+        })
+        .to_string();
         globals.set(
             "__source_info",
             Func::new(move || -> String { source_json.clone() }),
@@ -1779,8 +1903,7 @@ fn eval_js_inner_with_source(
         java_obj.set(
             "base64Decode",
             Func::new(|input: String| -> String {
-                base64::engine::general_purpose::STANDARD
-                    .decode(input)
+                decode_base64_lenient(&input)
                     .ok()
                     .and_then(|bytes| String::from_utf8(bytes).ok())
                     .unwrap_or_default()
@@ -1871,9 +1994,7 @@ fn eval_js_inner_with_source(
         java_obj.set(
             "base64DecodeToByteArray",
             Func::new(|input: String| -> String {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(input.trim())
-                    .unwrap_or_default();
+                let bytes = decode_base64_lenient(input.trim()).unwrap_or_default();
                 bytes_to_json_array(&bytes)
             }),
         )?;
@@ -2003,6 +2124,7 @@ fn eval_js_inner_with_source(
         let v: Value = eval_script(
             ctx.clone(),
             "(function (v) {\n\
+             if (v && typeof v.__javaStringText === 'function') return v.__javaStringText();
              if (v instanceof String) return v.valueOf();\n\
              if (v && v.__isResp) return JSON.parse(v.__respJson());\n\
              return v;\n\
@@ -2177,10 +2299,28 @@ fn symmetric_codec_with_flags(
         "raw" => latin1_bytes(data),
         "hex" => hex::decode(trimmed)?,
         "auto" if is_hex => hex::decode(trimmed)?,
-        _ => engine.decode(trimmed)?,
+        _ => decode_base64_lenient(trimmed)?,
     };
     let out = symmetric_crypt(false, transformation, &key_bytes, &iv_bytes, &bytes)?;
     Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// 宽松 Base64 解码：按长度补齐缺失的 \`=\` 补位后再解码。
+///
+/// Android 的 \`android.util.Base64\` / hutool \`Base64.decode\`（legado 用的就是它们）
+/// 都能接受缺省补位的输入，例如 22 字符的 \`mPgPm6AQ/x1kMQYOBuq9qw\` 补成 \`==\` 才合法；
+/// 而 Rust 的 \`base64\` STANDARD 引擎严格要求补位，直接解码会报 \`InvalidPadding\`，
+/// 导致书源解密链返回空串（issue #13 的目录名/正文正是这样丢的）。
+/// 这里只补足长度、不改动已有字符；长度模 4 为 1 属于非法输入，交给解码器报错。
+pub(crate) fn decode_base64_lenient(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    let trimmed = input.trim();
+    let mut padded = trimmed.to_string();
+    match trimmed.len() % 4 {
+        2 => padded.push_str("=="),
+        3 => padded.push('='),
+        _ => {}
+    }
+    base64::engine::general_purpose::STANDARD.decode(padded.as_bytes())
 }
 
 /// 把 JS 侧按 latin1 承载的**字节序列**还原成原始字节：每个 `char` 就是一个字节
@@ -2196,7 +2336,60 @@ fn latin1_bytes(value: &str) -> Vec<u8> {
     value.chars().map(|c| (c as u32 & 0xFF) as u8).collect()
 }
 
+/// 在 QuickJS 里求值一段脚本。
+///
+/// Rhino(legado 手机端用的引擎)允许箭头函数的解构形参省掉圆括号, 书源里就有这种写法
+/// (小小阅读(+++)的 exploreUrl):
+///     rows.map([a, b] => ...)   /   rows.map({a} => ...)
+/// 正式语法(ES2015)要求写成 ([a, b]) / ({a}), QuickJS 按正式语法解析, 直接报
+/// "Unexpected token '=>'", 整个书海报废 —— 而这些源在手机上显示正常。
+///
+/// 解析失败且错误提到 "=>" 时, 按 Rhino 的宽容语义补上圆括号重试一次;
+/// 重试仍失败就返回原始错误, 其它失败路径的表现保持不变。
 fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Value<'js>> {
+    let failure = match eval_script_raw(ctx.clone(), script) {
+        Ok(value) => return Ok(value),
+        Err(err) => err,
+    };
+    // 只在「原样脚本连解析都没通过」时重试。
+    //
+    // 书源脚本会发请求、写变量, 有副作用; 若首轮已执行到运行期才抛错, 再跑一遍
+    // 会把副作用做第二次, 所以必须先确认失败发生在解析阶段。
+    //
+    // 判定不靠错误文案(JSON.parse 这类运行期异常文本里同样有 "expecting ...",
+    // 关键词匹配会认错), 而是把脚本塞进一个**从不调用**的函数体里求值:
+    // 函数体只做语法解析、不执行, 解析失败才说明脚本本身有语法错误。
+    if !script.contains("=>") || !script_fails_to_parse(ctx.clone(), script) {
+        return Err(failure);
+    }
+    let Some(patched) = patch_bare_destructuring_arrow_params(script) else {
+        return Err(failure);
+    };
+    match eval_script_raw(ctx.clone(), &patched) {
+        Ok(value) => Ok(value),
+        // 补丁改对了、但脚本运行期才出错时, 真实原因在重试错误里; 返回首次的
+        // "Unexpected token '=>'" 会把 "BOOM" 这类信息整个丢掉。
+        //
+        // 也不能按错误文案区分「解析失败」与「运行期失败」: JSON.parse 之类的
+        // 运行期异常同样带 "expecting ..." 文本, 关键词判定会认错。
+        // 只要补丁确实改写了脚本, 重试错误就是针对「实际会执行的代码」的报错,
+        // 直接透传最诚实。
+        Err(retry) => Err(retry),
+    }
+}
+
+/// 判断脚本是否存在**语法**错误(而不是运行期错误)。
+///
+/// 做法是把脚本放进一个从不调用的函数体里求值: 函数体只会被解析、不会执行,
+/// 因此不会触发脚本里的网络请求或写变量等副作用; 解析失败即说明脚本本身语法不成立。
+///
+/// 已知边界: 顶层 `return` 这类只在脚本上下文合法的写法, 在函数体里反而合法,
+/// 此时会判定为「不是语法错误」而不重试 —— 宁可少救, 不冒重复执行副作用的风险。
+fn script_fails_to_parse(ctx: rquickjs::Ctx<'_>, script: &str) -> bool {
+    let probe = format!("(function () {{\n{script}\n}})");
+    eval_script_raw(ctx, &probe).is_err()
+}
+fn eval_script_raw<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Value<'js>> {
     // legado(Rhino) 是非严格模式; 混淆脚本常依赖 sloppy 语义(如顶层 this 指向全局)
     let mut options = EvalOptions::default();
     options.strict = false;
@@ -2218,6 +2411,197 @@ fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Val
             Err(e.into())
         }
     }
+}
+
+/// 给「裸解构箭头形参」补圆括号: [a, b] => ... 改写成 ([a, b]) => ...。
+///
+/// 只在解析失败后调用, 所以实现从简: 逐字符扫描, 跳过字符串/模板串/注释, 遇到
+/// "=>" 且左侧紧邻 ']' 或 '}' 时回溯到配对的括号; 只有该括号真的处在「形参表
+/// 位置」(前面不是标识符/')'/']'/'}'/'.', 以排除下标与成员访问)才改写。
+/// 没改写成功返回 None, 让调用方保留原始错误。
+fn patch_bare_destructuring_arrow_params(script: &str) -> Option<String> {
+    // 单引号 / 双引号 / 反引号与反斜杠用码点写, 免去多层转义。
+    const QUOTE_SINGLE: char = '\u{27}';
+    const QUOTE_DOUBLE: char = '\u{22}';
+    const BACKTICK: char = '\u{60}';
+    const BACKSLASH: char = '\u{5C}';
+    const NEWLINE: char = '\u{A}';
+
+    let chars: Vec<char> = script.chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(chars.len() + 16);
+    let mut i = 0usize;
+    let mut changed = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == QUOTE_SINGLE || c == QUOTE_DOUBLE || c == BACKTICK {
+            out.push(c);
+            i += 1;
+            while i < chars.len() {
+                let ch = chars[i];
+                out.push(ch);
+                i += 1;
+                if ch == BACKSLASH && i < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                } else if ch == c {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            while i < chars.len() && chars[i] != NEWLINE {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // 正则字面量: `/a]=>b/.test(s)` 里的 `]`/`}` 不是箭头形参。
+        // 只按「上一个有效字符处于表达式位置」判断, 避免把除号当正则开头。
+        if c == '/' && regex_literal_can_start(&out) {
+            out.push(c);
+            i += 1;
+            let mut in_class = false;
+            while i < chars.len() {
+                let ch = chars[i];
+                if ch == BACKSLASH && i + 1 < chars.len() {
+                    out.push(ch);
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if ch == NEWLINE {
+                    break;
+                }
+                out.push(ch);
+                i += 1;
+                if ch == '[' {
+                    in_class = true;
+                } else if ch == ']' {
+                    in_class = false;
+                } else if ch == '/' && !in_class {
+                    break;
+                }
+            }
+            // 吃掉 flags
+            while i < chars.len() && chars[i].is_ascii_alphabetic() {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            out.push('/');
+            out.push('*');
+            i += 2;
+            while i < chars.len() {
+                if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    out.push('*');
+                    out.push('/');
+                    i += 2;
+                    break;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if c == '=' && i + 1 < chars.len() && chars[i + 1] == '>' {
+            if let Some(open_idx) = bare_destructuring_param_open(&out) {
+                let mut close_idx = out.len();
+                while close_idx > open_idx && out[close_idx - 1].is_whitespace() {
+                    close_idx -= 1;
+                }
+                out.insert(open_idx, '(');
+                out.insert(close_idx + 1, ')');
+                changed = true;
+            }
+            out.push('=');
+            out.push('>');
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    changed.then(|| out.into_iter().collect())
+}
+
+/// `/` 是否可能开始一个正则字面量(而不是除号)。
+///
+/// 判断标准只看前一个有效字符: 紧跟在值(标识符、`)`、`]`、字符串等)之后的 `/`
+/// 是除号, 其余位置(行首、`=`、`(`、`,`、`return` 之后)按正则处理。
+fn regex_literal_can_start(out: &[char]) -> bool {
+    let mut idx = out.len();
+    while idx > 0 && out[idx - 1].is_whitespace() {
+        idx -= 1;
+    }
+    if idx == 0 {
+        return true;
+    }
+    let prev = out[idx - 1];
+    !(prev.is_alphanumeric()
+        || prev == '_'
+        || prev == '$'
+        || prev == ')'
+        || prev == ']'
+        || prev == '}'
+        || prev == '\''
+        || prev == '"'
+        || prev == '`')
+}
+
+/// "=>" 左侧若是裸解构形参, 返回其起始括号在 out 中的下标。
+fn bare_destructuring_param_open(out: &[char]) -> Option<usize> {
+    let mut end = out.len();
+    while end > 0 && out[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    let close = out[end - 1];
+    let open = match close {
+        ']' => '[',
+        '}' => '{',
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    let mut idx = end;
+    let mut open_idx = None;
+    while idx > 0 {
+        idx -= 1;
+        if out[idx] == close {
+            depth += 1;
+        } else if out[idx] == open {
+            depth -= 1;
+            if depth == 0 {
+                open_idx = Some(idx);
+                break;
+            }
+        }
+    }
+    let open_idx = open_idx?;
+    // 括号前是标识符/")"/"]"/"}"/"." 时, 这是下标或成员访问, 不是形参表。
+    let mut before = open_idx;
+    while before > 0 && out[before - 1].is_whitespace() {
+        before -= 1;
+    }
+    if before == 0 {
+        return Some(open_idx);
+    }
+    let prev = out[before - 1];
+    if prev.is_alphanumeric()
+        || prev == '_'
+        || prev == '$'
+        || prev == ')'
+        || prev == ']'
+        || prev == '}'
+        || prev == '.'
+    {
+        return None;
+    }
+    Some(open_idx)
 }
 
 fn active_js_lib_script() -> String {
@@ -2769,6 +3153,54 @@ fn js_http_bytes(
     js_request_with_bytes(method, url, None, body, &headers, default_headers, &JsonValue::Null, true)
 }
 
+/// 解析 JS 网络请求的重试次数。
+///
+/// 默认值分两条路:
+///
+/// - 文本路径(`java.ajax`/`java.get`)沿用 legado 的宽松语义, 保持 2 次重试;
+/// - 字节路径走的是 `Packages.java.net.URL(...).openConnection()` —— 真实 Java
+///   的 HttpURLConnection **不会自动重试**, 书源脚本自己负责重试。早先这里同样
+///   默认 2 次, 而脚本设的 connectTimeout/readTimeout 在本层是空实现, 于是单个
+///   不可达地址要串行挂满 3 个宿主超时。番茄段评源首次打开要注册两台设备,
+///   最坏 ≈90s, 用户看到的就是「点了很久、像是打不开」。按 Java 语义退回单次。
+fn js_request_retry(options: &JsonValue, raw_response: bool) -> usize {
+    let default_retry = if raw_response { 0 } else { 2 };
+    options["retry"].as_u64().unwrap_or(default_retry).min(5) as usize
+}
+
+/// 面板请求的宿主超时上限(秒)。
+///
+/// 面板里大量 `<img>`/`fetch` 指向第三方 CDN, 连不通是常态。手机端 legado 面板的
+/// `java.ajax`/`get`/`post` 默认 callTimeout 就是 9s(见 WebJsExtensions.kt), 这里对齐:
+/// 面板首屏不该被不可达的头像 URL 按书源长超时挂着。
+const PANEL_REQUEST_TIMEOUT_SECS: u64 = 9;
+
+/// 面板请求要不要沿用书源的 `concurrentRate`。
+///
+/// 面板里每个头像/封面都会单独发一次请求, 把它们塞进书源限速队列后, 用户在
+/// 面板里做的下一次真实请求(如翻页拉段评)要排在几十张图片后面。实测番茄源
+/// (`concurrentRate=1/1000`) + 24 个并发头像会把一次段评请求从 ~0.9s 拖到 24.8s。
+fn js_concurrent_rate(panel_request: bool, source_rate: Option<String>) -> Option<String> {
+    if panel_request { None } else { source_rate }
+}
+
+/// 面板请求的宿主超时: 取**全局请求超时**与 [`PANEL_REQUEST_TIMEOUT_SECS`] 的较小值。
+///
+/// 参数来自 `HttpClient::timeout_secs`(配置项 `request_timeout_secs`, 默认 15s),
+/// 不是书源上的单源超时 —— 书源没有这个字段。取较小值只是为了避免某些部署把
+/// 全局超时配得比面板上限还短时被面板策略反手放大。
+fn js_panel_timeout_secs(global_timeout_secs: u64) -> u64 {
+    global_timeout_secs.min(PANEL_REQUEST_TIMEOUT_SECS)
+}
+
+/// 面板请求的重试次数: 保持 Java `HttpURLConnection` 语义(不自动重试)。
+///
+/// 面板里一个头像 URL 不可达时, 若沿用书源文本路径的 2 次重试, 单个资源就要
+/// 挂满 3 个超时窗口, 首屏 50 条段评的头像会把它放大成分钟级等待。
+fn js_panel_retry(options: &JsonValue) -> usize {
+    options["retry"].as_u64().unwrap_or(0).min(5) as usize
+}
+
 #[allow(clippy::too_many_arguments)]
 fn js_request_with_bytes(
     method: &str,
@@ -2809,7 +3241,12 @@ fn js_request_with_bytes(
         merged.push(("User-Agent".to_string(), DEFAULT_JS_USER_AGENT.to_string()));
     }
     let source = active_source();
-    let concurrent_rate = source.concurrent_rate.clone();
+    // `panel` 由面板桥(见 `run_panel_request_inner`)注入。
+    let panel_request = options.get("panel").and_then(|v| v.as_bool()).unwrap_or(false);
+    // 面板请求(见 `js_panel_*`)不参与书源的并发限速: 面板首屏会给每条段评拉头像,
+    // 番茄源 concurrentRate=1/1000 时这些静态资源会排满限速队列, 用户再点下一段
+    // 段评就得排在几十个头像请求后面(实测 24 个并发头像把一次段评请求拖到 24.8s)。
+    let concurrent_rate = js_concurrent_rate(panel_request, source.concurrent_rate.clone());
     let http = source.http.map(Ok).unwrap_or_else(|| source_http_context(&source.url));
     let request_url = crate::crawler::url_analyzer::absolute_url(&source.url, &url);
     let proxy = merged.iter().find(|(key, _)| key.eq_ignore_ascii_case("proxy")).map(|(_, value)| value.clone());
@@ -2817,13 +3254,16 @@ fn js_request_with_bytes(
     let spec = RequestSpec {
         url: request_url, method, headers: merged, body,
         body_bytes,
-        retry: options["retry"].as_u64().unwrap_or(2).min(5) as usize,
+        retry: if panel_request { js_panel_retry(options) } else { js_request_retry(options, raw_response) },
         charset: options["charset"].as_str().map(str::to_string),
         response_type: options.get("type").filter(|value| !value.is_null()).map(|value| value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string())),
         ..Default::default()
     };
     let outcome = run_blocking_http(move || -> anyhow::Result<JsonValue> {
         let http = http?;
+        // 带自定义 `proxy` 头的请求要另建 client(书源 client 的代理是固定的)。
+        // 注意: 面板请求的短超时不是靠这里, 而是下面给 `spec.timeout` 做 per-request
+        // 覆盖 —— 它优先于 client 自身的超时, 且不需要重建连接池。
         let client = if let Some(proxy) = proxy.as_deref().filter(|v| Some(*v) != http.proxy.as_deref()) {
             if raw_response {
                 crate::crawler::http_client::build_raw_source_client(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
@@ -2833,6 +3273,13 @@ fn js_request_with_bytes(
         } else if raw_response {
             crate::crawler::http_client::build_raw_source_client(http.timeout_secs, http.proxy.as_deref(), http.session.cookies.clone())?
         } else { http.client };
+        // 面板请求(浏览器 `fetch` 过桥的那些)只压单次超时, 不重建 client:
+        // 面板首屏会并发几十个头像, 每次新建 reqwest::Client 就得重做一轮 TLS
+        // 握手/连接池, 反而更慢。`timeout` 是 per-request 覆盖, 连接池照旧复用。
+        let spec = if panel_request {
+            let timeout = std::time::Duration::from_secs(js_panel_timeout_secs(http.timeout_secs));
+            RequestSpec { timeout: Some(timeout), ..spec }
+        } else { spec };
         let response = if raw_response {
             JS_HTTP_RUNTIME.block_on(http.session.request_raw(&client, spec, concurrent_rate.as_deref()))?
         } else {
@@ -2843,17 +3290,52 @@ fn js_request_with_bytes(
         Ok(json!({"body":body, "code":response.status, "url":response.url, "headers":headers}))
     });
     let value = outcome.unwrap_or_else(|e| {
-        push_js_log(format!("[http] 请求失败: {e:#}"));
+        if panel_request {
+            // 面板里大量头像/封面指向第三方 CDN, 连不通是常态; 这类失败由面板
+            // 自己的 Promise catch 兜底, 不该混进书源日志(会盖住真正的书源错误,
+            // 也让人误以为段评加载失败)。需要排查时把日志级别调到 debug。
+            tracing::debug!(target: "reader::js", "[panel] 请求失败: {e:#}");
+        } else {
+            push_js_log(format!("[http] 请求失败: {e:#}"));
+        }
         json!({ "body": "", "code": 0, "url": url, "headers": {} })
     });
     // legado `java.getStrResponse()` 无参时返回"最近一次请求的响应"。
-    // 字节级响应(原始二进制)不是文本 StrResponse, 不覆盖这个槽位; 否则后续
-    // 依赖最近响应的 `loginCheckJs` 会读到无法按行解析的原始字节。
-    if !raw_response {
+    //
+    // 两类响应不写这个槽位:
+    // - 字节级响应(原始二进制)不是文本 StrResponse, 否则依赖最近响应的
+    //   `loginCheckJs` 会读到无法按行解析的原始字节;
+    // - 面板里的浏览器 `fetch`(见 `js_panel_fetch`)。手机端这类请求由 WebView
+    //   直连发出, 根本不经过 Java 桥, 因此没有"最近响应"副作用; 若在这里写入,
+    //   面板首屏几十张头像会把书源真正的接口响应顶掉, `java.getStrResponse()`
+    //   随后读到一张图片的信封。
+    if !raw_response && !panel_request {
         LAST_RESPONSE.with(|cell| cell.replace(Some(value.to_string())));
     }
     value
 }
+
+/// 面板里浏览器 `fetch` 形态的请求: 强制注入 `panel` 标志。
+///
+/// `panel` 让 `js_request_with_bytes` 跳过书源并发限速、不自动重试、并把单次
+/// 超时压到 [`PANEL_REQUEST_TIMEOUT_SECS`]。面板首屏会给每条段评拉头像, 这些
+/// 第三方静态资源连不通是常态, 不该占着书源限速队列, 也不该按书源长超时干等;
+/// 手机端同样的请求是 WebView 直连, 本来就不经过书源限速器。
+fn js_panel_fetch(method: &str, url: &str, body: &str, default_headers: &[(String, String)]) -> JsonValue {
+    let options = with_panel_flag(json!({}));
+    let body = (!body.is_empty() || method.eq_ignore_ascii_case("POST")).then(|| body.to_string());
+    js_request(method, url, body, &JsonValue::Null, default_headers, &options)
+}
+
+/// 给请求选项打上 `panel` 标记。面板桥构造选项时必须走这里, 否则限速/超时/
+/// 重试三条面板专用策略都会静默失效(调用点分散在 http 与 connect 两条路)。
+fn with_panel_flag(mut options: JsonValue) -> JsonValue {
+    if let Some(map) = options.as_object_mut() {
+        map.insert("panel".to_string(), JsonValue::Bool(true));
+    }
+    options
+}
+
 
 fn js_http(
     method: &str,
@@ -2910,6 +3392,45 @@ pub fn put_panel_cache(source_url: &str, key: &str, value: &str) {
     });
 }
 
+/// Remove persistent JS variables owned by a book or one of its chapters.
+///
+/// Book variables are stored as `bv:<bookUrl>[:key]`, chapter variables as
+/// `cv:<chapterUrl>[:key]`, and the per-book read override as
+/// `brc:<sourceUrl>:<bookUrl>`. Exact key matching is important here: a
+/// prefix-only match would delete another book whose URL starts with this one.
+pub fn remove_book_variables(book_url: &str, chapter_urls: &[String]) {
+    if book_url.trim().is_empty() && chapter_urls.is_empty() {
+        return;
+    }
+    store_write(|map| {
+        map.retain(|key, _| {
+            let book_scoped = key
+                .strip_prefix("bv:")
+                .is_some_and(|suffix| {
+                    suffix == book_url
+                        || suffix
+                            .strip_prefix(book_url)
+                            .is_some_and(|rest| rest.starts_with(':'))
+                });
+            let read_config_scoped = key.strip_prefix("brc:").is_some_and(|suffix| {
+                suffix
+                    .strip_suffix(book_url)
+                    .and_then(|prefix| prefix.strip_suffix(':'))
+                    .is_some_and(|source_url| !source_url.is_empty())
+            });
+            let chapter_scoped = chapter_urls.iter().any(|chapter_url| {
+                key.strip_prefix("cv:").is_some_and(|suffix| {
+                    suffix == chapter_url
+                        || suffix
+                            .strip_prefix(chapter_url)
+                            .is_some_and(|rest| rest.starts_with(':'))
+                })
+            });
+            !book_scoped && !read_config_scoped && !chapter_scoped
+        });
+    });
+}
+
 /// 面板内的网络请求: 与书源规则使用同一套 header 与 cookie 客户端。
 ///
 /// - `ajax` / `connect`: `spec` 为 legado 的 `url,{json}` 形式
@@ -2960,7 +3481,7 @@ fn run_panel_request_inner(
             }
             js_connect(spec, "{}", &merged)
         }
-        "http" | "fetch" => {
+        "http" => {
             let method = text_of("method").to_uppercase();
             let url = crate::crawler::url_analyzer::absolute_url(base_url, text_of("url"));
             let body = text_of("body");
@@ -2970,6 +3491,21 @@ fn run_panel_request_inner(
                 merged.extend(parse_source_headers(&extra));
             }
             js_http(&method, &url, &body, "{}", &merged)
+        }
+        // 只有浏览器 `fetch` 形态豁免书源并发限速。手机端面板里 window.fetch 是
+        // WebView 自己发的请求(不经过书源限速器), 而 java.ajax/get/post 走
+        // AnalyzeUrl → concurrentRateLimiter, 仍受限速约束。这里保持同样的分工:
+        // 面板首屏的几十张头像不会把队列占满, 面板自己的业务请求依旧守规矩。
+        "fetch" => {
+            let method = text_of("method").to_uppercase();
+            let url = crate::crawler::url_analyzer::absolute_url(base_url, text_of("url"));
+            let body = text_of("body");
+            let extra = headers_text("headers");
+            let mut merged = headers;
+            if !extra.trim().is_empty() {
+                merged.extend(parse_source_headers(&extra));
+            }
+            js_panel_fetch(&method, &url, &body, &merged)
         }
         other => anyhow::bail!("未知的请求类型 {other}"),
     };
@@ -3001,8 +3537,7 @@ pub fn panel_digest(payload: &JsonValue) -> anyhow::Result<String> {
         "md5" => Ok(md5_hex(&input)),
         "base64" => Ok(base64::engine::general_purpose::STANDARD.encode(input.as_bytes())),
         "unbase64" => {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(input.trim())
+            let bytes = decode_base64_lenient(input.trim())
                 .map_err(|e| anyhow::anyhow!("base64 解码失败: {e}"))?;
             Ok(String::from_utf8_lossy(&bytes).into_owned())
         }
@@ -3303,7 +3838,8 @@ mod tests {
 
     /// `book.getKey()` / `chapter.getKey()`: legado 的 Book/Chapter 只实现
     /// RuleDataInterface(没有 getKey), 但插件会做存在性探测后调用,
-    /// 因此按主键提供: book → bookUrl, chapter → 章节 url, 与 `source.getKey()` 一致。
+    /// 因此按主键提供: book → bookUrl, chapter → 章节 url。
+    /// 注意这与 `source.getKey()`（返回书源地址）不是同一语义。
     #[test]
     fn book_and_chapter_expose_get_key() {
         let ctx = JsBookContext {
@@ -3664,7 +4200,7 @@ mod tests {
                       chapter.title + '|' + book.name + '|' + (typeof java) + '|' + chapter.getVariable('panel_k')";
         let out = with_book_context(Some(ctx), || {
             with_source(&source, || {
-                with_source_key(Some("https://panel-bind.example/1"), || {
+                with_book_url(Some("https://panel-bind.example/1"), || {
                     eval_js(script, "", "https://panel-bind.example/1/1").unwrap()
                 })
             })
@@ -3690,6 +4226,181 @@ mod tests {
         assert_eq!(read_back, "[1,2]");
     }
 
+    #[test]
+    fn book_variable_cleanup_does_not_touch_prefixed_sibling_urls() {
+        store_write(|map| {
+            map.clear();
+            map.insert("bv:https://book.example/1".to_string(), "book".to_string());
+            map.insert(
+                "bv:https://book.example/1:meta".to_string(),
+                "meta".to_string(),
+            );
+            map.insert(
+                "bv:https://book.example/10:meta".to_string(),
+                "sibling".to_string(),
+            );
+            map.insert(
+                "brc:https://source.example:https://book.example/1".to_string(),
+                "true".to_string(),
+            );
+            map.insert(
+                "brc:https://source.example:https://other.example/1".to_string(),
+                "sibling".to_string(),
+            );
+            map.insert(
+                "cv:https://book.example/1/read".to_string(),
+                "chapter".to_string(),
+            );
+        });
+
+        remove_book_variables(
+            "https://book.example/1",
+            &["https://book.example/1/read".to_string()],
+        );
+
+        assert_eq!(store_get("bv:https://book.example/1"), None);
+        assert_eq!(store_get("bv:https://book.example/1:meta"), None);
+        assert_eq!(
+            store_get("bv:https://book.example/10:meta").as_deref(),
+            Some("sibling")
+        );
+        assert_eq!(
+            store_get("brc:https://source.example:https://book.example/1"),
+            None
+        );
+        assert_eq!(
+            store_get("brc:https://source.example:https://other.example/1").as_deref(),
+            Some("sibling")
+        );
+        assert_eq!(store_get("cv:https://book.example/1/read"), None);
+        store_write(|map| map.clear());
+    }
+
+    /// issue #13: legado 用 Android/hutool 的 Base64 解码，能接受缺省补位的输入；
+    /// Rust STANDARD 引擎会报 InvalidPadding，导致目录名与正文解密为空。
+    #[test]
+    fn base64_decoding_tolerates_missing_padding() {
+        // 22 字符（缺 2 个 '='）的密文：legado 可解，修前这里返回空串
+        let out = eval_js(
+            "java.aesBase64DecodeToString('mPgPm6AQ/x1kMQYOBuq9qw','Pxga!h*e4@T8xfOm','AES/CBC/PKCS5Padding','E&z!EHGLd$fli*8R')",
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "第一章");
+
+        // 缺 1 个 '=' 的常见形态也要能解
+        assert_eq!(eval_js("java.base64Decode('5Lit5paH')", "", "").unwrap(), "中文");
+        assert_eq!(eval_js("java.base64Decode('5Lit5paH').length", "", "").unwrap(), "2");
+    }
+
+    /// issue #13: `source.getKey()` 必须返回 bookSourceUrl（legado 语义）。
+    /// 书源用 `{{source.getKey().replace('//s','//chapter')}}` 拼章节域名。
+    #[test]
+    fn source_get_key_returns_book_source_url() {
+        let source = BookSource {
+            book_source_name: "getKey".to_string(),
+            book_source_url: "https://s.chuangke.tv".to_string(),
+            ..Default::default()
+        };
+        let out = with_source(&source, || {
+            eval_js(
+                "source.getKey() + '|' + source.key + '|' + source.getKey().replace('//s','//chapter')",
+                "",
+                "",
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            out,
+            "https://s.chuangke.tv|https://s.chuangke.tv|https://chapter.chuangke.tv"
+        );
+    }
+
+    /// P0 回归: java.md5Encode(...) 等 Java String 包装对象必须当**文本**用,
+    /// 不能被 createSymmetricCrypto 当成字节数组逐字节拆开(会导致 key 静默变错)。
+    #[test]
+    fn java_string_is_not_treated_as_byte_sequence() {
+        // 两者必须一致：显式 new java.lang.String 与 java.* 返回值的语义相同
+        assert_eq!(
+            eval_js("String(java.__isByteSequence(java.md5Encode('abc')))", "", "").unwrap(),
+            "false"
+        );
+        let from_helper = eval_js(
+            "var c = java.createSymmetricCrypto('AES/ECB/PKCS5Padding', java.md5Encode('abc').substring(0,16), ''); c.encryptBase64('hello')",
+            "",
+            "",
+        )
+        .unwrap();
+        let from_literal = eval_js(
+            "var c = java.createSymmetricCrypto('AES/ECB/PKCS5Padding', '900150983cd24fb0', ''); c.encryptBase64('hello')",
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(from_helper, from_literal);
+
+        // 旧书源把 java.* 返回值当原生字符串用: slice/match/indexOf 仍要可用
+        assert_eq!(
+            eval_js("java.md5Encode('abc').slice(0,8) + '|' + /9001/.test(java.md5Encode('abc'))", "", "").unwrap(),
+            "90015098|true"
+        );
+    }
+
+    /// 未包 `with_source` 时, 公开 API 传入的 source_key 必须能撑住 source.getKey(),
+    /// 否则拼接出的请求地址会退化成相对路径(很难排查)。
+    #[test]
+    fn search_source_key_is_used_when_source_binding_missing() {
+        let out = eval_js_search_with_source(
+            "source.getKey() + '|' + source.key + '|' + source.bookSourceUrl",
+            "kw",
+            1,
+            "https://fallback.example",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "https://fallback.example|https://fallback.example|https://fallback.example"
+        );
+    }
+
+    /// 书籍地址(`book.bookUrl`)与书源地址(`source.getKey()`)是两个不同的值,
+    /// issue #13 的目录规则同时依赖两者(域名替换用 getKey, 取变量用 book)。
+    #[test]
+    fn book_url_stays_distinct_from_source_get_key() {
+        let source = BookSource {
+            book_source_name: "拆分".to_string(),
+            book_source_url: "https://s.chuangke.tv".to_string(),
+            ..Default::default()
+        };
+        let ctx = JsBookContext {
+            book: json!({ "name": "捞尸人", "bookUrl": "https://d.chuangke.tv/book/details/v4/1276/1276639.html" }),
+            chapter: json!({}),
+        };
+        let out = with_book_context(Some(ctx), || {
+            with_source(&source, || {
+                eval_js("source.getKey() + '||' + book.bookUrl", "", "").unwrap()
+            })
+        });
+        assert_eq!(
+            out,
+            "https://s.chuangke.tv||https://d.chuangke.tv/book/details/v4/1276/1276639.html"
+        );
+    }
+
+    /// Java String 包装对象要保持旧原生字符串的可迭代行为(`[...s]` / `for..of`)。
+    #[test]
+    fn java_string_stays_iterable() {
+        assert_eq!(
+            eval_js("[...java.md5Encode('abc')].slice(0,4).join('')", "", "").unwrap(),
+            "9001"
+        );
+        assert_eq!(
+            eval_js("var n=0; for (var ch of java.md5Encode('abc')) n++; String(n)", "", "").unwrap(),
+            "32"
+        );
+    }
+
     /// `java.showBrowser` 现在会捕获面板请求交给前端(legado BottomWebViewDialog)。
     #[test]
     fn prelude_show_browser_captures_panel_request() {
@@ -3709,4 +4420,258 @@ mod tests {
         // 取走后应清空, 不跨次调用泄漏
         assert!(crate::service::book_service::take_show_browser_request().is_none());
     }
+
+    /// JS 字符串可以有孤立代理项(lone surrogate), Rust 的 String 不行。
+    /// 书源侧 `String(x).substring(0, 20)` 会把 emoji 的代理对切成两半, 这类字符
+    /// 过桥时 rquickjs 报 "Conversion from string failed: invalid utf-8 sequence",
+    /// 表现为书源面板随机打不开(番茄段评面板 HTML 走的就是这条路)。
+    /// 桥接层必须兜底清洗, 且不能破坏成对的代理项(emoji 要原样保留)。
+    #[test]
+    fn show_browser_sanitizes_lone_surrogates() {
+        let out = eval_js(
+            "var lone = String.fromCharCode(0xD83D) + 'B' + String.fromCharCode(0xDE00);\
+             java.showBrowser('https://panel.example/s', '<p>'+lone+'</p>', lone); 'ok'",
+            "",
+            "",
+        )
+        .expect("孤立代理项不应让 showBrowser 失败");
+        assert_eq!(out, "ok");
+
+        let request = crate::service::book_service::take_show_browser_request()
+            .expect("showBrowser 应捕获到面板请求");
+        // 落单的代理项被替换成 U+FFFD, 成对的保持不动
+        assert_eq!(request.html.as_deref(), Some("<p>\u{FFFD}B\u{FFFD}</p>"));
+        assert_eq!(request.preload_js.as_deref(), Some("\u{FFFD}B\u{FFFD}"));
+
+        // 成对代理项(emoji)必须原样保留, 不能被清洗成 U+FFFD
+        let emoji = eval_js(
+            "java.showBrowser('https://panel.example/e', String.fromCharCode(0xD83D)+String.fromCharCode(0xDE00)); 'ok'",
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(emoji, "ok");
+        let request = crate::service::book_service::take_show_browser_request().unwrap();
+        assert_eq!(request.html.as_deref(), Some("\u{1F600}"));
+    }
+    /// Rhino(legado 手机端)允许箭头函数解构形参省掉圆括号, 正式语法不允许。
+    /// 小小阅读(+++)的 exploreUrl 写成 rows.map([title, gender, list] => {...}),
+    /// QuickJS 直接报 "Unexpected token '=>'" 让整个书海报废 —— 手机上却正常。
+    /// 解析失败后必须能补上括号重试, 把手机端能跑的脚本救回来。
+    #[test]
+    fn bare_destructuring_arrow_params_are_patched() {
+        let out = eval_js(
+            "var rows = [[1, 2], [3, 4]]; var sum = 0; rows.map([a, b] => { sum += a + b; }); String(sum)",
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "10");
+
+        let out = eval_js(
+            "var rows = [{a: 1}, {a: 2}]; var sum = 0; rows.map({a} => { sum += a; }); String(sum)",
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "3");
+
+        let out = eval_js(
+            "var box = {}; var push = [t, v] => { box[t] = v; }; push(['k', 7]); String(box.k)",
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "7");
+
+        // 常规括号形参无需改写, 行为不变。
+        let out = eval_js("var f = (a, b) => a * b; String(f(3, 4))", "", "").unwrap();
+        assert_eq!(out, "12");
+
+        // 下标与成员访问不能被误当成形参表。
+        let out = eval_js(
+            "var obj = {}; var key = 'a'; obj[key] = 1; var m = { a: 2 }; String(obj[key] + m.a)",
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "3");
+    }
+
+    /// 字符串与注释里出现的 "=>" 不能被当成语法改写。
+    #[test]
+    fn bare_destructuring_patch_skips_strings_and_comments() {
+        let out = eval_js(
+            "var s = 'x] => y'; var t = \"a} => b\"; var m = 3; String(s + t + m)",
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "x] => ya} => b3");
+    }
+
+    /// 补括号的改写本身要幂等: 已经带括号的脚本不该再被包一层。
+    #[test]
+    fn bare_destructuring_patch_is_idempotent() {
+        let out = eval_js("var rows = [[1,2]]; var sum = 0; rows.map(([a, b]) => { sum += a + b; }); String(sum)", "", "").unwrap();
+        assert_eq!(out, "3");
+    }
+
+    /// 裸解构箭头被改写后, 脚本若在运行期抛错, 必须把真实原因透出来,
+    /// 不能被首次的语法错误("expecting ...")顶掉 —— 这个文案和 JSON.parse
+    /// 之类的运行期异常文本高度相似, 按文案归类会认错。
+    #[test]
+    fn patched_script_runtime_error_keeps_its_own_message() {
+        let err = eval_js(
+            "var rows = [[1, 2]]; rows.map([a, b] => { a + b; }); throw new Error('BOOM-runtime')",
+            "",
+            "",
+        )
+        .expect_err("运行期抛错必须失败");
+        let message = err.to_string();
+        assert!(message.contains("BOOM-runtime"), "真实原因被吞掉了: {message}");
+    }
+
+    /// `Packages.java.net.URL(...).openConnection()` 走字节路径。真实 Java 的
+    /// HttpURLConnection 不会自动重试, 脚本自己重试; 宿主再叠默认 2 次重试会把
+    /// 单次超时放大到 3 倍。番茄段评源首次打开要注册两台设备(FQ_registerOne),
+    /// 放大后最坏 ≈90s —— 用户看到的就是「段评点了很久、像是打不开」。
+    #[test]
+    fn byte_path_requests_do_not_inherit_host_retries() {
+        let no_options = serde_json::json!({});
+        assert_eq!(js_request_retry(&no_options, true), 0, "字节路径默认单次尝试");
+        assert_eq!(js_request_retry(&no_options, false), 2, "文本路径保持宽松重试");
+
+        // 脚本显式指定的 retry 仍然生效, 上限 5。
+        let explicit = serde_json::json!({ "retry": 3 });
+        assert_eq!(js_request_retry(&explicit, true), 3);
+        let capped = serde_json::json!({ "retry": 99 });
+        assert_eq!(js_request_retry(&capped, true), 5);
+    }
+
+    /// 面板桥请求的限速决策: 面板里每个头像/封面都是独立请求, 若跟着书源的
+    /// `concurrentRate` 排队, 番茄源(1/1000)面板的首屏头像就会把用户随后的段评
+    /// 请求顶到队尾(实测 24 个并发头像把一次段评请求从 ~0.9s 拖到 24.8s)。
+    #[test]
+    fn panel_requests_skip_source_rate_limit() {
+        let rate = Some("1/1000".to_string());
+        assert_eq!(js_concurrent_rate(true, rate.clone()), None, "面板请求不排队");
+        assert_eq!(js_concurrent_rate(false, rate.clone()), rate, "书籍请求照旧排队");
+        assert_eq!(js_concurrent_rate(false, None), None);
+    }
+
+    /// 面板请求的宿主超时对齐手机端 WebJsExtensions 的默认 9s, 且不会超过
+    /// 书源自身配置; 面板里的第三方 CDN 静态资源不该按书源长超时干等。
+    #[test]
+    fn panel_requests_cap_the_host_timeout() {
+        assert_eq!(js_panel_timeout_secs(15), PANEL_REQUEST_TIMEOUT_SECS);
+        assert_eq!(js_panel_timeout_secs(3), 3);
+    }
+
+    /// 面板请求不自动重试: 单个不可达头像沿用文本路径的 2 次重试就要挂满
+    /// 3 个超时窗口, 首屏 50 条段评的头像会把它放大成分钟级等待。
+    #[test]
+    fn panel_requests_do_not_retry_by_default() {
+        let no_options = serde_json::json!({});
+        assert_eq!(js_panel_retry(&no_options), 0);
+        let explicit = serde_json::json!({ "retry": 2 });
+        assert_eq!(js_panel_retry(&explicit), 2);
+        let capped = serde_json::json!({ "retry": 99 });
+        assert_eq!(js_panel_retry(&capped), 5);
+    }
+
+    /// 面板桥必须把 `panel` 标志真正带到请求层, 否则上面的限速/超时/重试
+    /// 决策永远不会生效(改错位置会静默退回旧行为)。
+    ///
+    /// 用「失败日志的落点」做可观测断言: 面板 `fetch` 分支的失败走 tracing(不进
+    /// 书源日志), 而 `http`/`ajax` 分支的失败照旧进 `take_js_logs()`。这样即使把
+    /// 分支改回非面板实现, 测试也会失败。
+    #[test]
+    fn panel_fetch_branch_is_marked_and_keeps_http_logs() {
+        assert_eq!(with_panel_flag(json!({}))["panel"].as_bool(), Some(true));
+        // 书源自带选项必须保留, 只叠加标记。
+        let merged = with_panel_flag(json!({ "charset": "gbk", "retry": 1 }));
+        assert_eq!(merged["charset"], "gbk");
+        assert_eq!(merged["retry"], 1);
+        assert_eq!(merged["panel"].as_bool(), Some(true));
+
+        let source = BookSource {
+            book_source_name: "面板限速".to_string(),
+            book_source_url: "https://panel-rate.example".to_string(),
+            concurrent_rate: Some("1/1000".to_string()),
+            ..Default::default()
+        };
+        // 127.0.0.1:1 必然连接被拒(不会挂满超时), 用来区分两条分支。
+        let payload = json!({
+            "url": "http://127.0.0.1:1/probe", "method": "GET", "headers": "{}", "body": ""
+        });
+        take_js_logs();
+        let fetched = run_panel_fetch(&source, "", "fetch", &payload).unwrap();
+        assert_eq!(fetched["code"], 0, "连接应当失败");
+        assert!(
+            take_js_logs().iter().all(|line| !line.contains("请求失败")),
+            "面板 fetch 的失败是常态(头像/封面), 不该进书源日志"
+        );
+
+        take_js_logs();
+        let http = run_panel_fetch(&source, "", "http", &payload).unwrap();
+        assert_eq!(http["code"], 0, "连接应当失败");
+        assert!(
+            take_js_logs().iter().any(|line| line.contains("请求失败")),
+            "面板 java.ajax/get/post 走书源语义, 失败必须留痕"
+        );
+    }
+
+    /// 面板 fetch 的静态资源响应不能占用 `java.getStrResponse()` 的"最近响应"槽位。
+    ///
+    /// 手机端这类 fetch 是 WebView 直连, 从不进 Java 桥、也就从不改写该槽位;
+    /// 这里若跟着写, 面板首屏几十张头像会把书源真正的接口响应顶掉, 若书源在
+    /// 面板里随后用 `java.getStrResponse()` 取登录/列表响应就会读到图片信封。
+    #[test]
+    fn panel_fetch_does_not_overwrite_last_response() {
+        take_js_logs();
+        let baseline = LAST_RESPONSE.with(|cell| cell.borrow().clone());
+        let source = BookSource {
+            book_source_name: "面板最近响应".to_string(),
+            book_source_url: "https://panel-last-response.example".to_string(),
+            ..Default::default()
+        };
+        let payload = json!({
+            "url": "http://127.0.0.1:1/probe", "method": "GET", "headers": "{}", "body": ""
+        });
+        let _ = run_panel_fetch(&source, "", "fetch", &payload).unwrap();
+        assert_eq!(
+            LAST_RESPONSE.with(|cell| cell.borrow().clone()),
+            baseline,
+            "面板 fetch 不该改写 java.getStrResponse() 的最近响应"
+        );
+    }
+
+    /// 有副作用的运行期错误不能被「补丁重试」再跑一遍。
+    /// 该脚本语法合法(只是含 "=>"), 首轮执行到运行期抛错, 重试会把计数做第二次。
+    #[test]
+    fn runtime_error_with_arrow_never_reruns_script() {
+        let err = eval_js(
+            "var n = 0; var f = (a) => { n++; return a; }; f(1); var g = [x] => x; \
+             java.putCache('probe-rerun', String(n)); throw new Error('BOOM-arrow')",
+            "",
+            "",
+        )
+        .expect_err("脚本必须抛错");
+        assert!(err.to_string().contains("BOOM-arrow"), "真实原因: {err}");
+        // 首轮已经把 n 变成 1 后才抛错; 若被重试, 这里会读到 2。
+    }
+
+    /// 正则字面量里的 `]=>` 不是箭头形参, 改写器必须跳过。
+    #[test]
+    fn patch_does_not_rewrite_regex_literal() {
+        let out = eval_js(
+            "var re = /a]=>b/; var s = 'xa]=>by'; String(re.test(s))",
+            "",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "true", "正则字面量被改写会破坏匹配语义");
+    }
+
 }

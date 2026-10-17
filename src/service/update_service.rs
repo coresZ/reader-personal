@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use reqwest::header::{ACCEPT, USER_AGENT};
@@ -15,6 +16,15 @@ const APP_NAMESPACE: &str = "_app";
 const UPDATE_CACHE_NAME: &str = "version-update-cache";
 const UPDATE_PREFERENCES_NAME: &str = "version-update-preferences";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/hadc188/reader/releases/latest";
+/// GitHub API 的镜像前缀。检查版本本身也可能遇到 api.github.com 被阻断或限流，
+/// 因此不能只给下载阶段加镜像。候选按可用性排序，返回内容仍走同一套 JSON 解析
+/// 与版本号校验。
+/// 注意: `ghfast.top` 对 `api.github.com` 返回 403，不能用于版本检查；它仍可
+/// 用于 Release 文件下载，所以两条候选列表是分开的。
+const RELEASE_API_MIRROR_PREFIXES: &[&str] = &["https://gh-proxy.com/"];
+fn release_api_mirror_url(prefix: &str) -> String {
+    format!("{prefix}{LATEST_RELEASE_URL}")
+}
 /// 成功检查的缓存有效期。设置抽屉打开时用它展示缓存结果。
 const UPDATE_CACHE_TTL_MS: i64 = 60 * 60 * 1000;
 /// 上次检查失败后的重试间隔: 网络波动不应长时间掩盖新版本。
@@ -148,7 +158,18 @@ impl UpdateService {
     }
 
     async fn fetch_latest_release(&self) -> Result<GithubRelease, String> {
-        let error = match self.fetch_release_with(self.http.client()).await {
+        // 镜像优先: GitHub API 直连在国内网络下容易被阻断或限流，
+        // 先走镜像能显著减少“检查更新失败 / 转圈很久”的情况。
+        for prefix in RELEASE_API_MIRROR_PREFIXES {
+            let release_url = release_api_mirror_url(prefix);
+            let release = self.fetch_release_url(&release_url, self.http.client()).await;
+            if let Ok(release) = release {
+                return Ok(release);
+            }
+        }
+
+        // 镜像不可用时再走应用代理，最后尝试备用直连。
+        let mut last_error = match self.fetch_release_with(self.http.client()).await {
             Ok(release) => return Ok(release),
             Err(error) => error,
         };
@@ -156,17 +177,27 @@ impl UpdateService {
         // 限流; 失败时再直连尝试一次, 两边网络环境互补。
         if self.http.active_proxy().is_some() {
             if let Ok(direct) = self.http.client_direct() {
-                if let Ok(release) = self.fetch_release_with(direct).await {
-                    return Ok(release);
+                match self.fetch_release_with(direct).await {
+                    Ok(release) => return Ok(release),
+                    Err(error) => last_error = error,
                 }
             }
         }
-        Err(error)
+
+        Err(last_error)
     }
 
     async fn fetch_release_with(&self, client: reqwest::Client) -> Result<GithubRelease, String> {
+        self.fetch_release_url(LATEST_RELEASE_URL, client).await
+    }
+
+    async fn fetch_release_url(
+        &self,
+        release_url: &str,
+        client: reqwest::Client,
+    ) -> Result<GithubRelease, String> {
         let response = client
-            .get(LATEST_RELEASE_URL)
+            .get(release_url)
             .header(ACCEPT, "application/vnd.github+json")
             .header(
                 USER_AGENT,
@@ -189,6 +220,7 @@ impl UpdateService {
         &self,
         asset: &GithubAsset,
         path: &Path,
+        cancelled: &AtomicBool,
         mut on_progress: F,
     ) -> Result<u64, AppError>
     where
@@ -203,18 +235,20 @@ impl UpdateService {
             return Err(AppError::BadRequest("更新地址不是受信任的 GitHub 地址".to_string()));
         }
 
-        // 直连优先; 无代理环境下直连失败时依次尝试镜像加速。
-        let mut candidates: Vec<String> = vec![asset.browser_download_url.clone()];
-        candidates.extend(
-            DOWNLOAD_MIRROR_PREFIXES
-                .iter()
-                .map(|prefix| format!("{prefix}{}", asset.browser_download_url)),
-        );
+        // 镜像优先: 国内直连 GitHub Release 往往很慢; 镜像失败后再回退原始地址。
+        let mut candidates: Vec<String> = DOWNLOAD_MIRROR_PREFIXES
+            .iter()
+            .map(|prefix| format!("{prefix}{}", asset.browser_download_url))
+            .collect();
+        candidates.push(asset.browser_download_url.clone());
 
         let mut last_error: Option<AppError> = None;
         for candidate in &candidates {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(AppError::BadRequest("更新已取消".to_string()));
+            }
             match self
-                .download_from_url(candidate, asset.size, path, &mut on_progress)
+                .download_from_url(candidate, asset.size, path, cancelled, &mut on_progress)
                 .await
             {
                 Ok(downloaded) => return Ok(downloaded),
@@ -232,6 +266,7 @@ impl UpdateService {
         url: &str,
         asset_size: u64,
         path: &Path,
+        cancelled: &AtomicBool,
         on_progress: &mut F,
     ) -> Result<u64, AppError>
     where
@@ -284,6 +319,9 @@ impl UpdateService {
             .await
             .map_err(|error| AppError::BadRequest(format!("读取更新文件失败: {error}")))?
         {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(AppError::BadRequest("更新已取消".to_string()));
+            }
             downloaded = downloaded.saturating_add(chunk.len() as u64);
             if downloaded > MAX_ASSET_BYTES {
                 return Err(AppError::BadRequest("更新文件过大，已停止下载".to_string()));
@@ -446,7 +484,15 @@ pub fn is_newer_version(candidate: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::GithubAsset;
+    use super::{release_api_mirror_url, GithubAsset};
+
+    #[test]
+    fn release_api_mirror_url_wraps_the_github_api_endpoint() {
+        assert_eq!(
+            release_api_mirror_url("https://gh-proxy.com/"),
+            "https://gh-proxy.com/https://api.github.com/repos/hadc188/reader/releases/latest",
+        );
+    }
 
     #[test]
     fn github_asset_uses_github_input_and_frontend_output_names() {

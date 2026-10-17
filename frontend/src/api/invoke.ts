@@ -48,6 +48,7 @@ const COMMAND_BY_PATH: Record<string, string> = {
   // 注意: getBookContent 需要额外的 Channel 参数(加载阶段), 不能走这里 ——
   // 见 api/bookshelf.ts 的 getBookContent 直接 invoke 实现。
   '/reader3/deleteBookCache': 'delete_book_cache',
+  '/reader3/clearSearchCoverCache': 'clear_search_cover_cache',
   '/reader3/getCachedChapterUrls': 'get_cached_chapter_urls',
   '/reader3/getAvailableBookSource': 'get_available_book_source',
   '/reader3/getRssSources': 'get_rss_sources',

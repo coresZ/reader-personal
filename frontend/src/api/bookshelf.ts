@@ -99,6 +99,12 @@ export function deleteBookCache(bookUrl: string) {
   return post('/deleteBookCache', { bookUrl }).then((r) => r.data)
 }
 
+/** Release disk/in-memory cover cache created by a search session. */
+export function clearSearchCoverCache(coverUrls: string[]) {
+  if (!coverUrls.length) return Promise.resolve({ deleted: 0 })
+  return post<{ deleted: number }>('/clearSearchCoverCache', { coverUrls }).then((r) => r.data)
+}
+
 export function getCachedChapterUrls(bookUrl: string, chapterUrls: string[]) {
   return post<string[]>('/getCachedChapterUrls', { bookUrl, chapterUrls }).then((r) => r.data)
 }

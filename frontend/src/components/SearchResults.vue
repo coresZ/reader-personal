@@ -126,6 +126,7 @@ import { useSourceStore } from '../stores/source'
 import { searchBookMultiSSE } from '../api/search'
 import type { SseLike } from '../api/sse'
 import { saveBook } from '../api/bookshelf'
+import { createCoverCacheSession } from '../utils/coverCacheSession'
 import { isBookOnShelf } from '../utils/bookEdit'
 import {
   initializeSearchResult,
@@ -156,6 +157,7 @@ const {
 
 let eventSource: SseLike | null = null
 let searchGeneration = 0
+const coverCacheSession = createCoverCacheSession()
 const resultsContainerRef = ref<HTMLElement | null>(null)
 const showBookDetail = ref(false)
 const selectedBook = ref<Book | SearchBook | null>(null)
@@ -317,6 +319,11 @@ function closeEventSource() {
   }
 }
 
+/** Release the previous search's covers without blocking the new search. */
+function releaseSearchCovers() {
+  coverCacheSession.release(shelfStore.books)
+}
+
 function ensureSearchSelection() {
   if (searchScope.value === 'group') {
     const selectedGroupStillValid = selectedGroup.value && sourceGroups.value.includes(selectedGroup.value)
@@ -334,6 +341,7 @@ function ensureSearchSelection() {
 
 function doSearch(key: string) {
   closeEventSource()
+  releaseSearchCovers()
   const generation = ++searchGeneration
   // 新搜索从第一页开始: 沿用上一次的页码会落在空页上(新结果更少时)。
   currentPage.value = 1
@@ -373,6 +381,7 @@ function doSearch(key: string) {
       const data = event.data as { data?: SearchBook[] }
       if (data.data && Array.isArray(data.data)) {
         const byKey = new Map(shelfStore.searchResults.map((r) => [searchMergeKey(r), r]))
+        coverCacheSession.collect(data.data)
         for (const b of data.data) {
           if (!isSearchResultRelevant(b, key)) continue
           const mergeKey = searchMergeKey(b)
@@ -446,6 +455,7 @@ onMounted(async () => {
 onUnmounted(() => {
   searchGeneration += 1
   closeEventSource()
+  releaseSearchCovers()
 })
 
 // Clicking a search result (card body or cover) always opens the detail modal.

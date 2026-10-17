@@ -381,6 +381,34 @@ function formatDate(ts?: number) {
   padding: 4px 0 8px;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
+  /* 目录列表的滚动条常显且加宽, 方便直接抓住拖动定位。 */
+  scrollbar-width: auto;
+  scrollbar-color: color-mix(in srgb, currentColor 42%, transparent) transparent;
+  scrollbar-gutter: stable;
+}
+
+.list-container::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
+}
+
+.list-container::-webkit-scrollbar-track {
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  border-radius: 999px;
+}
+
+/* 用 3px 透明边框把视觉宽度收成 8px, 同时保留 14px 的抓取区域。 */
+.list-container::-webkit-scrollbar-thumb {
+  min-height: 48px;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 42%, transparent);
+  background-clip: content-box;
+}
+
+.list-container::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, currentColor 62%, transparent);
+  background-clip: content-box;
 }
 
 .chapter-toolbar {
@@ -725,6 +753,12 @@ function formatDate(ts?: number) {
 
 .reader-catalog.mini .list-container {
   padding: 2px 0 6px;
+  /* 小窗里滚动条收窄一档, 但仍保留可抓取的宽度。 */
+  scrollbar-width: thin;
+}
+
+.reader-catalog.mini .list-container::-webkit-scrollbar {
+  width: 11px;
 }
 
 .reader-catalog.mini .list-item {

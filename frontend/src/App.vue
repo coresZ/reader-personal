@@ -125,6 +125,26 @@ onMounted(() => {
 
 let closeUnlisten: (() => void) | undefined
 let handlingCloseRequest = false
+
+/** 关闭窗口前的收尾: 把阅读位置落到书架。
+ *
+ *  legado 在 `ReadBookActivity.onPause` 里必然执行 `ReadBook.saveRead()`, 关闭/切走
+ *  的那一刻位置就已写库。本项目的等价时机只有这里: `destroy()` 会立即销毁
+ *  WebView, `beforeunload` 与 Vue 的 `onUnmounted` 都不保证执行, 异步 IPC 也会被
+ *  终止。所以必须在销毁窗口**之前**主动 flush 一次。
+ *
+ *  阅读页用 keepalive 版本(一次 IPC 往返即返回, 不等 WebDAV 上传); 其它页面用
+ *  普通版本 —— 阅读器状态在离开阅读页后仍保留在 store 里, 从这里补一次能救回
+ *  "边界情况下路由离开钩子没跑完"的进度。两者都受 `resolveWindowClose` 的
+ *  1.5s 上限约束, 不会把关窗拖成卡顿。 */
+async function persistBeforeClose() {
+  if (route.name === 'reader') {
+    await readerStore.flushProgressToServerKeepalive(true)
+    return
+  }
+  await readerStore.flushProgressToServer(true)
+}
+
 onMounted(() => {
   if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return
   listen<unknown>('close-requested', async () => {
@@ -132,7 +152,15 @@ onMounted(() => {
     handlingCloseRequest = true
     try {
       const { getCurrentWindow } = await import('@tauri-apps/api/window')
-      await resolveWindowClose(getCurrentWindow(), appStore.closeToTray)
+      const { invoke } = await import('@tauri-apps/api/core')
+      await resolveWindowClose(
+        getCurrentWindow(),
+        appStore.closeToTray,
+        persistBeforeClose,
+        // 回执让外壳的关窗看门狗退让。没有它, 选择"关闭到托盘"后从托盘重新
+        // 打开窗口会撞上看门狗的宽限期, 窗口被当作"没人响应"直接销毁。
+        () => invoke('acknowledge_close_request'),
+      )
     } finally {
       handlingCloseRequest = false
     }

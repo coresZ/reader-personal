@@ -224,6 +224,7 @@ import { exploreKindLabel, exploreKindType, type ExploreKind } from '../api/expl
 import { searchMergeKey } from '../utils/searchRank'
 import { isBookOnShelf } from '../utils/bookEdit'
 import { useBookshelfStore } from '../stores/bookshelf'
+import { createCoverCacheSession } from '../utils/coverCacheSession'
 
 const store = useExploreStore()
 const readerStore = useReaderStore()
@@ -235,6 +236,7 @@ const scrollContainer = ref<HTMLElement>()
 const openingBookUrl = ref('')
 const selectedBook = ref<Book | SearchBook | null>(null)
 const showDetail = ref(false)
+const coverCacheSession = createCoverCacheSession()
 
 /** 文本框输入防抖计时器（key 为控件标题）。 */
 const textTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -275,11 +277,19 @@ onMounted(async () => {
 
 // 离开发现页时清掉未触发的输入防抖，避免计时器在别的路由里补齐执行。
 onBeforeUnmount(clearTextTimers)
+onBeforeUnmount(() => coverCacheSession.release(shelfStore.books))
+
+watch(
+  () => store.books.length,
+  () => coverCacheSession.collect(store.books),
+  { deep: false },
+)
 
 function onSourceChange(event: Event) {
   // 切源时丢弃未触发的输入防抖: 它们的 action 属于上一个源，落定后会被
   // runAction 打到新源上（旧 kind 对新源无意义）。
   clearTextTimers()
+  coverCacheSession.release(shelfStore.books)
   void store.setSource((event.target as HTMLSelectElement).value)
 }
 
@@ -300,6 +310,7 @@ function handleScroll() {
 }
 
 function handleCategoryClick(category: ExploreKind) {
+  coverCacheSession.release(shelfStore.books)
   void store.setCategory(category.url ?? '')
 }
 

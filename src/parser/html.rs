@@ -633,7 +633,15 @@ pub fn select_text_from_element(el: &ElementRef, rule: &str) -> Option<String> {
         .find_map(|current| extract_text(&current, "text"))
 }
 
-/// Select all matching elements and collect their text, joined by newlines
+/// Select all matching elements and collect their text, joined by newlines.
+///
+/// 多级链式(`class.pic.0@tag.img@src`)必须**逐级下钻**: 早先这里把 `@` 后的
+/// 整段当成"一个提取器", 多级规则全部取不到值 —— 某书源详情页
+/// `coverUrl = {{@@class.pic.0@tag.img@src}}` 因此恒为空, 详情页没有封面
+/// (列表页的 coverUrl 走 element 级求值, 不受影响)。
+///
+/// 无提取器的单段规则(`class.content`)保持原有 `textNodes` 语义: 文本节点按
+/// **换行**拼接, 正文段落靠它保留换行, 不能退化成空格拼接。
 pub fn select_all_text(doc: &Html, rule: &str) -> Option<String> {
     let parts = split_top_level(rule, &["@"]).parts;
     if parts.is_empty() {
@@ -642,7 +650,6 @@ pub fn select_all_text(doc: &Html, rule: &str) -> Option<String> {
 
     let first_part = parts[0].trim();
     // 空选择器 = 当前元素自身，但仅当后面跟着提取器时（`@href` / `@text`）。
-    // 理由同 `select_list`：完全空的规则不该凭空产出元素内容。
     let roots: Vec<ElementRef<'_>> = if first_part.is_empty() && parts.len() > 1 {
         fragment_root(doc).into_iter().collect()
     } else {
@@ -652,47 +659,67 @@ pub fn select_all_text(doc: &Html, rule: &str) -> Option<String> {
         return None;
     }
 
-    if parts.len() > 1 {
-        let mut all_texts = Vec::new();
-        let sub_rule = parts[1..].join("@");
-
+    if parts.len() == 1 {
+        let mut texts = Vec::new();
         for root in roots {
-            let last_part = sub_rule.trim();
-            if let Some(text) = extract_text(&root, last_part) {
+            if let Some(text) = extract_text(&root, "textNodes") {
                 if !text.is_empty() {
-                    all_texts.push(text);
-                }
-                continue;
-            }
-
-            let parsed = parse_selector_with_index(sub_rule.trim());
-            for el in collect_matches_from_element(root, &parsed) {
-                if let Some(text) = extract_text(&el, "text") {
-                    if !text.is_empty() {
-                        all_texts.push(text);
-                    }
+                    texts.push(text);
                 }
             }
         }
-
-        if all_texts.is_empty() {
+        if texts.is_empty() {
             return None;
         }
-        return Some(all_texts.join("\n"));
+        return Some(texts.join("\n"));
     }
 
-    let mut texts = Vec::new();
+    let rest: Vec<String> = parts[1..].iter().map(|p| p.trim().to_string()).collect();
+    let mut all_texts = Vec::new();
     for root in roots {
-        if let Some(text) = extract_text(&root, "textNodes") {
+        collect_chain_texts(root, &rest, &mut all_texts);
+    }
+    if all_texts.is_empty() {
+        return None;
+    }
+    Some(all_texts.join("\n"))
+}
+
+/// 逐级下钻 `sel@sel@...@末段`。末段先按提取器解释(`text` / `href` / `src` …),
+/// 解释不通再当选择器取其文本 —— 与原实现的两段语义一致, 只是中间层可以有多级。
+fn collect_chain_texts(el: ElementRef<'_>, parts: &[String], out: &mut Vec<String>) {
+    let Some(last) = parts.last() else { return };
+    let mut current = vec![el];
+    for part in &parts[..parts.len() - 1] {
+        if part.is_empty() {
+            continue;
+        }
+        let parsed = parse_selector_with_index(part);
+        let mut next = Vec::new();
+        for node in current {
+            next.extend(collect_matches_from_element(node, &parsed));
+        }
+        if next.is_empty() {
+            return;
+        }
+        current = next;
+    }
+    for node in current {
+        if let Some(text) = extract_text(&node, last) {
             if !text.is_empty() {
-                texts.push(text);
+                out.push(text);
+            }
+            continue;
+        }
+        let parsed = parse_selector_with_index(last);
+        for matched in collect_matches_from_element(node, &parsed) {
+            if let Some(text) = extract_text(&matched, "text") {
+                if !text.is_empty() {
+                    out.push(text);
+                }
             }
         }
     }
-    if texts.is_empty() {
-        return None;
-    }
-    Some(texts.join("\n"))
 }
 
 pub fn select_text(doc: &Html, rule: &str) -> Option<String> {
@@ -1031,6 +1058,32 @@ pub fn select_xpath(html: &str, xpath: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 多级链式(`class.pic.0@tag.img@src`)必须逐级下钻后取末段提取器。
+    /// 某书源详情页 `coverUrl` 模板就是这么写的; 早先的 select_all_text 把
+    /// `@` 之后的整段当成"单个提取器", 多级规则恒为空 → 详情页无封面。
+    #[test]
+    fn test_select_all_text_multi_level_chain() {
+        let doc = parse_document(r#"<html><body><div class="pic"><a href="/b/1.html"><img src="/bookimg/9.jpg"></a></div></body></html>"#);
+        assert_eq!(
+            select_all_text(&doc, "class.pic.0@tag.img@src").as_deref(),
+            Some("/bookimg/9.jpg")
+        );
+        assert_eq!(
+            select_all_text(&doc, "class.pic@tag.a@tag.img@src").as_deref(),
+            Some("/bookimg/9.jpg")
+        );
+    }
+
+    /// 无提取器的单段规则保持 `textNodes` 语义: 文本节点按换行拼接
+    /// (正文段落靠它保留换行)。
+    #[test]
+    fn test_select_all_text_single_rule_keeps_text_nodes_newlines() {
+        let doc = parse_document("<html><body><div class=\"content\">第一段<br>第二段</div></body></html>");
+        let text = select_all_text(&doc, "class.content").unwrap_or_default();
+        assert!(text.contains("第一段"), "got {text:?}");
+        assert!(text.contains("第二段"), "got {text:?}");
+    }
 
     #[test]
     fn test_legado_to_css() {

@@ -25,7 +25,8 @@ pub fn run(operation: &str, payload: &Value) -> anyhow::Result<Value> {
             Ok(json!(encoding.decode(&bytes(&payload["data"])?).0.into_owned()))
         }
         "base64Encode" => Ok(json!(base64::engine::general_purpose::STANDARD.encode(bytes(&payload["data"])?))),
-        "base64Decode" => Ok(output(base64::engine::general_purpose::STANDARD.decode(text("text"))?)),
+        // 与 java.base64Decode 一样按 Android/hutool 语义容忍缺省补位。
+        "base64Decode" => Ok(output(super::js::decode_base64_lenient(text("text"))?)),
         "digest" => {
             let data = bytes(&payload["data"])?;
             let algorithm = text("algorithm").replace('-', "").to_ascii_uppercase();

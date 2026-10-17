@@ -42,6 +42,54 @@ test('detail can read another link from the currently selected aggregate source'
     .map((call: any) => call.req.bookUrl))).toContain(baiduUrl)
 })
 
+test('detail clears stale chapters and identifies the source while the new catalog loads', async ({ page }) => {
+  await page.goto(fixture + '?delay-chapters=1')
+  await expect(page.locator('.detail-modal .chapter-title')).toHaveText('最新章节 · 第一章')
+  await expect(page.locator('.detail-modal .chapter-source-status')).toHaveText('书源一')
+
+  await page.locator('.detail-modal .source-item').filter({ hasText: '书源二' }).first().click()
+  await expect(page.locator('.detail-modal .chapter-heading')).toContainText('正在加载目录')
+  await expect(page.locator('.detail-modal .chapter-source-status')).toHaveText('书源二')
+  await expect(page.locator('.detail-modal .chapter-section')).toHaveCount(0)
+  await expect(page.locator('.detail-modal .chapter-loading')).toContainText('正在获取章节列表')
+
+  await page.evaluate(() => (window as any).__candidateHarness.completeChapterPending())
+  await expect(page.locator('.detail-modal .chapter-title')).toHaveText('第1版 · 第一章')
+  await expect(page.locator('.detail-modal .chapter-source-status')).toHaveText('书源二')
+  await expect(page.locator('.chapter-source-status')).not.toContainText('正在加载')
+})
+
+test('a source picked by the user survives later candidate batches', async ({ page }) => {
+  // 分两页到达候选: 用户在第一页选源, 第二页到达时会重新合并候选列表。
+  await page.goto(fixture + '?pages=2&hold')
+  await expect(page.locator('.detail-modal .source-item')).toHaveCount(6)
+  const xiaoyuan = page.locator('.detail-modal .source-item').filter({ hasText: '书源二' })
+  await xiaoyuan.nth(2).click()
+  await expect(xiaoyuan.nth(2)).toHaveClass(/selected/)
+  await expect(page.locator('.detail-modal .chapter-title')).toHaveText('第3版 · 第一章')
+
+  // 合并新候选不能把选中项拨回本书原源: 否则目录仍是手选源的, 选中项却是原源,
+  // 读正文时会用错误书源的章节号。选中态与已加载目录必须始终同源。
+  await page.evaluate(() => (window as any).__candidateHarness.completePending())
+  await expect(page.locator('.detail-modal .source-item')).toHaveCount(8)
+  await expect(xiaoyuan.nth(2)).toHaveClass(/selected/)
+  await expect(page.locator('.detail-modal .chapter-title')).toHaveText('第3版 · 第一章')
+
+  await page.getByRole('button', { name: '开始阅读', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => (window as any).__candidateHarness.currentBook()?.bookUrl))
+    .toBe('https://xiaoyuan.example.invalid/book/3')
+})
+
+test('candidate sources load while the initial slow catalog is pending', async ({ page }) => {
+  await page.goto(fixture + '?delay-initial-chapters=1')
+  await expect(page.locator('.detail-modal .chapter-heading')).toContainText('正在加载目录')
+  await expect(page.locator('.detail-modal .source-item')).toHaveCount(8)
+  await expect(page.locator('.detail-modal .source-item').filter({ hasText: '书源一' })).toHaveCount(1)
+
+  await page.evaluate(() => (window as any).__candidateHarness.completeChapterPending())
+  await expect(page.locator('.detail-modal .chapter-title')).toHaveText('最新章节 · 第一章')
+})
+
 test('reader keeps and switches to another link from its current source', async ({ page }) => {
   await page.goto(fixture + '?mode=reader')
   await expect(page.locator('.reader-source .source-item:not(.current)')).toHaveCount(7)

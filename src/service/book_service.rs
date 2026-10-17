@@ -11,7 +11,7 @@ use crate::model::{
     search::SearchBook,
 };
 use crate::parser::js::{
-    eval_js_with_bindings, take_js_logs, with_book_context, with_source, with_source_key,
+    eval_js_with_bindings, take_js_logs, with_book_context, with_book_url, with_source,
     JsBookContext,
 };
 use crate::parser::rule_engine::RuleEngine;
@@ -20,12 +20,15 @@ use crate::service::local_pdf_book::{is_local_pdf_origin, is_local_pdf_url};
 use crate::util::hash::md5_hex;
 use crate::util::text::{normalize_source_url, repair_encoded_url};
 use serde_json::json;
+use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, Instant};
 
 /// 书源 JS 调用 `java.showBrowser(url, html)` 时捕获的请求, 供前端弹出面板。
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -256,7 +259,7 @@ pub async fn handle_source_panel_bridge(
             let output = tokio::task::spawn_blocking(move || {
                 let execute = || crate::parser::js::with_book_context(Some(book_ctx), || {
                     crate::parser::js::with_source(&source, || {
-                        crate::parser::js::with_source_key(Some(&entry.book_url), || {
+                        crate::parser::js::with_book_url(Some(&entry.book_url), || {
                             take_js_logs();
                             clear_show_browser_request();
                             crate::parser::js::take_login_effects();
@@ -372,6 +375,77 @@ fn is_cancelled(signal: Option<&CancelSignal>) -> bool {
     signal.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// 阅读页统一渲染章节标题；正文若自带 `<h1>` 等标题块会重复显示。
+/// 只剥离开头第一个明确标题元素，保留图片和普通正文。
+fn strip_leading_content_title(content: &str) -> String {
+    let trimmed_start = content.trim_start_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '\u{feff}' | '\u{200b}' | '\u{200c}' | '\u{200d}')
+    });
+    let trimmed_start = trimmed_start
+        .strip_prefix("&nbsp;")
+        .map(str::trim_start)
+        .unwrap_or(trimmed_start);
+    let Some(opening_end) = trimmed_start.find('>') else {
+        return content.to_string();
+    };
+    let opening = &trimmed_start[..=opening_end];
+    let tag = opening
+        .trim_start_matches('<')
+        .split(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_heading = matches!(tag.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
+    let lower_opening = opening.to_ascii_lowercase();
+    let is_title_class = tag == "p"
+        && (lower_opening.contains("chapter-title")
+            || lower_opening.contains("chapter_title")
+            || lower_opening.contains("class=\"title")
+            || lower_opening.contains("class='title"));
+    // `.con@html` returns the container's outer HTML, so the first node is
+    // usually `<div class="con">` and the chapter heading lives inside it.
+    if matches!(tag.as_str(), "div" | "section" | "article") {
+        let close_tag = format!("</{tag}>");
+        let lower = trimmed_start.to_ascii_lowercase();
+        let Some(close_offset) = lower[opening_end + 1..].find(&close_tag) else {
+            return content.to_string();
+        };
+        let inner_end = opening_end + 1 + close_offset;
+        let inner = &trimmed_start[opening_end + 1..inner_end];
+        let stripped_inner = strip_leading_content_title(inner);
+        if stripped_inner == inner {
+            return content.to_string();
+        }
+        return format!(
+            "{}{}{}",
+            &trimmed_start[..opening_end + 1],
+            stripped_inner,
+            &trimmed_start[inner_end..]
+        );
+    }
+    let close_tag = format!("</{tag}>");
+    let lower = trimmed_start.to_ascii_lowercase();
+    let Some(close_offset) = lower[opening_end + 1..].find(&close_tag) else {
+        return content.to_string();
+    };
+    let end = opening_end + 1 + close_offset + close_tag.len();
+    let inner_html = &trimmed_start[opening_end + 1..opening_end + 1 + close_offset];
+    static TITLE_TAG_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let title_tag_re = TITLE_TAG_RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("title tag regex"));
+    let inner_text = title_tag_re.replace_all(inner_html, "").into_owned();
+    let inner_text = inner_text.trim();
+    static CHAPTER_HEADING_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let chapter_heading_re = CHAPTER_HEADING_RE
+        .get_or_init(|| Regex::new(r"^第[0-9一二三四五六七八九十百千零〇两]+[章节回卷]").expect("chapter heading regex"));
+    let chapter_heading = tag == "p"
+        && inner_text.chars().count() <= 80
+        && chapter_heading_re.is_match(inner_text);
+    if !is_heading && !is_title_class && !chapter_heading {
+        return content.to_string();
+    }
+    trimmed_start[end..].trim_start().to_string()
+}
+
 /// 取消错误标记: 让调用方能把它与「站点请求失败」区分开。
 ///
 /// 测试书源必须区分这两者 —— 把用户主动中止当成检测失败会把可用书源误标为失效。
@@ -393,6 +467,24 @@ struct RateState {
     in_flight: bool,
     last_start: Option<Instant>,
     window_starts: Vec<Instant>,
+}
+
+struct RateSlotRelease {
+    service: BookService,
+    source: BookSource,
+}
+
+impl Drop for RateSlotRelease {
+    fn drop(&mut self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let service = self.service.clone();
+        let source = self.source.clone();
+        handle.spawn(async move {
+            service.finish_rate(&source).await;
+        });
+    }
 }
 
 /// 发现页控件 `action` 的执行结果。
@@ -520,6 +612,30 @@ fn detect_anti_crawler(
         warnings.push("响应非 HTML 且过小, 可能被代理/网关拦截".to_string());
     }
     warnings
+}
+
+/// 判断响应是否像「代理出口被站点 WAF 拦下」的拒绝页。
+///
+/// 判据保守: 只在状态码明确是代理/网关拒绝(403/407/451), 且正文小得不像任何
+/// 真实页面时才成立。正常情况下直连重试的开销是零 —— 不满足条件直接返回原响应。
+fn response_looks_proxy_blocked(response: &FetchResponse) -> bool {
+    if !matches!(response.status, 403 | 407 | 451) {
+        return false;
+    }
+    // 拒绝页通常只有几百字节(纯文本 403 页); 真实页面即使精简也不少于此。
+    response.body.len() < 4096
+}
+
+/// 封面请求是否需要改用直连重试。
+///
+/// 只在**确实走了代理**、且要么请求直接失败(超时/连接被拒)、要么拿到
+/// 403/407/451 这类 WAF 拒绝码时才重试一次。其它状态码(含 404/500)不重试:
+/// 那不是"代理被拦", 重发只会把封面加载时间翻倍。
+///
+/// 与正文链路的 [`response_looks_proxy_blocked`] 同一思路, 但封面在读取响应体
+/// 之前就要决定是否重试, 因此这里只看状态码, 不做体积判断。
+fn cover_needs_direct_retry(proxy_active: bool, status: Option<u16>) -> bool {
+    proxy_active && matches!(status, None | Some(403) | Some(407) | Some(451))
 }
 
 /// Build a DebugTrace from a fetched response, attaching anti-crawler warnings
@@ -844,14 +960,14 @@ impl BookService {
         // `wait_for_rate` 返回**是否占用了 rate slot**, 据此精确决定要不要归还 ——
         // 只对"自己占到的 slot"调 finish_rate, 避免把别的在途请求的 slot 误释放
         // (那会让限速形同虚设)。
-        let holds_slot;
+        let owns_serial_slot;
         if let Some(flag) = cancel {
             let waited = self.wait_for_rate(source);
             tokio::pin!(waited);
             loop {
                 tokio::select! {
                     acquired = &mut waited => {
-                        holds_slot = acquired;
+                        owns_serial_slot = acquired;
                         break;
                     }
                     _ = sleep(Duration::from_millis(100)) => {
@@ -863,33 +979,37 @@ impl BookService {
                 }
             }
         } else {
-            holds_slot = self.wait_for_rate(source).await;
+            owns_serial_slot = self.wait_for_rate(source).await;
         }
         if is_cancelled(cancel) {
-            if holds_slot {
+            if owns_serial_slot {
                 self.finish_rate(source).await;
             }
             return Err(anyhow::anyhow!(CANCELLED_ERR));
         }
+        // JoinSet::abort_all can drop this future while it owns a serial
+        // source slot. Return the slot from Drop as well, otherwise the source
+        // remains in_flight forever and later catalogs wait indefinitely.
+        let _rate_release = owns_serial_slot.then(|| RateSlotRelease {
+            service: self.clone(),
+            source: source.clone(),
+        });
         let request_context = match self.http
             .source_context(user_ns, &source.book_source_url, spec.proxy.as_deref())
         {
             Ok(context) => context,
             Err(err) => {
-                // 必须归还 in_flight: 用 `?` 直接返回会让这个源永久停在
-                // in_flight, 之后所有请求都在 wait_for_serial_rate 里死等。
-                if holds_slot {
-                    self.finish_rate(source).await;
-                }
                 return Err(anyhow::anyhow!(err.to_string()));
             }
         };
 
+        // 是否经代理发出: 直连重试只在这种情况下才有意义。
+        let used_proxy = request_context.proxy.is_some();
         let result = match cancel {
             Some(flag) => {
                 // 100ms 轮询而不是"监听一次": 取消标志是 AtomicBool, 没有可等待的
                 // 唤醒机制, 用间隔轮询即可 —— 取消响应延迟上限就是这 100ms。
-                let fetch = request_context.session.request(&request_context.client, spec, source.concurrent_rate.as_deref());
+                let fetch = request_context.session.request(&request_context.client, spec.clone(), source.concurrent_rate.as_deref());
                 tokio::pin!(fetch);
                 loop {
                     tokio::select! {
@@ -897,21 +1017,58 @@ impl BookService {
                         _ = sleep(Duration::from_millis(100)) => {
                             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                                 // fetch 在此处被 drop → 连接关闭。
-                                if holds_slot {
-                                    self.finish_rate(source).await;
-                                }
                                 return Err(anyhow::anyhow!(CANCELLED_ERR));
                             }
                         }
                     }
                 }
             }
-            None => request_context.session.request(&request_context.client, spec, source.concurrent_rate.as_deref()).await,
+            None => request_context.session.request(&request_context.client, spec.clone(), source.concurrent_rate.as_deref()).await,
         };
-        if holds_slot {
-            self.finish_rate(source).await;
-        }
+        let result = match result {
+            Ok(response) => Ok(self.retry_direct_when_proxy_blocked(user_ns, source, used_proxy, spec.clone(), response, cancel).await),
+            Err(err) => Err(err),
+        };
         result
+    }
+
+    /// 代理出口被站点 WAF 拒(403/407 等小体积拒绝页)时, 用直连客户端重试一次。
+    ///
+    /// 代理 IP 是共享的, 被整段拉黑的情况很常见: 同一个 URL 经代理是 403 拒绝页,
+    /// 直连却是完整正文(某书源的探索页就是这样, 手机端因此能看、桌面端空白)。
+    /// 只在「确实走了代理」且响应可疑时触发, 直连结果替换原响应交由调用方照常解析。
+    async fn retry_direct_when_proxy_blocked(
+        &self,
+        user_ns: &str,
+        source: &BookSource,
+        used_proxy: bool,
+        spec: RequestSpec,
+        response: FetchResponse,
+        cancel: Option<&CancelSignal>,
+    ) -> FetchResponse {
+        if !used_proxy || !response_looks_proxy_blocked(&response) {
+            return response;
+        }
+        if is_cancelled(cancel) {
+            return response;
+        }
+        let Ok(context) = self.http.source_context_direct(user_ns, &source.book_source_url) else {
+            return response;
+        };
+        match context.session.request(&context.client, spec, source.concurrent_rate.as_deref()).await {
+            Ok(direct) => {
+                tracing::info!(
+                    url = %direct.url,
+                    status = direct.status,
+                    "proxy response looked blocked; used direct retry"
+                );
+                direct
+            }
+            Err(err) => {
+                tracing::warn!(url = %response.url, error = %err, "direct retry after proxy block failed");
+                response
+            }
+        }
     }
 
     /// 等待限速窗口并**占用 rate slot**(返回时 `in_flight == true` 表示已占)。
@@ -926,9 +1083,9 @@ impl BookService {
             return false;
         }
         if let Some((limit, window_ms)) = parse_window_rate(rate) {
-            return self
-                .wait_for_window_rate(&source.book_source_url, limit, window_ms)
+            self.wait_for_window_rate(&source.book_source_url, limit, window_ms)
                 .await;
+            return false;
         }
         let Ok(delay_ms) = rate.parse::<u64>() else {
             return false;
@@ -997,6 +1154,18 @@ impl BookService {
         let mut states = self.rate_states.write().await;
         if let Some(state) = states.get_mut(&source.book_source_url) {
             state.in_flight = false;
+            // 只在**没有任何残留状态**时回收条目。
+            //
+            // 串行限速(`concurrentRate: "1000"`)靠 `last_start` 计算下一次允许的
+            // 起点, 而它从不写 `window_starts` —— 早先只判 `window_starts.is_empty()`
+            // 就把条目删掉, `last_start` 随之丢失, 下一次 `wait_for_serial_rate`
+            // 命中 `entry().or_default()` 直接放行, 配置的间隔实际为 0(限速形同虚设)。
+            // 窗口模式则相反: 它只用 `window_starts`, `last_start` 恒为 None, 且
+            // `wait_for_rate` 对它固定返回"未占用 slot", 因此 `finish_rate` 走不到
+            // 这里 —— 那条件只为串行路径保留。
+            if state.window_starts.is_empty() && state.last_start.is_none() {
+                states.remove(&source.book_source_url);
+            }
         }
     }
 
@@ -1877,7 +2046,7 @@ impl BookService {
             let base_url = chapter_url.clone();
             let output = crate::parser::js::with_http_context(context, || with_book_context(book_ctx, || {
                 with_source(&source, || {
-                    with_source_key(Some(&source_key), || {
+                    with_book_url(Some(&source_key), || {
                         crate::parser::js::eval_js(&script, &result_text, &base_url)
                     })
                 })
@@ -1996,7 +2165,7 @@ impl BookService {
         if skip_js_lib {
             if let Some(hit) = cached.clone() {
                 tracing::debug!("get_content returning cached content, len={}", hit.len());
-                return Ok(hit);
+                return Ok(strip_leading_content_title(&hit));
             }
         }
         tracing::debug!("get_content cache miss, fetching from network");
@@ -2082,6 +2251,9 @@ impl BookService {
         }
 
         tracing::debug!("get_content final content len={}", all_content.len());
+        // 阅读页会统一渲染章节标题；书源正文若自带开头标题会重复显示。
+        // 与 Legado 的“去除重复标题”对应，只剥离开头第一个标题块。
+        all_content = strip_leading_content_title(&all_content);
         if !all_content.is_empty() {
             notify(ContentLoadStage::Caching);
             let _ = self
@@ -2479,6 +2651,14 @@ impl BookService {
             .collect())
     }
 
+    /// Remove persistent JS variables owned by a book and its known chapters.
+    /// Chapter keys can only be addressed by URL, so callers pass whatever
+    /// chapter list they already have instead of triggering a network fetch
+    /// during deletion.
+    pub fn clear_book_variables(&self, book_url: &str, chapter_urls: &[String]) {
+        crate::parser::js::remove_book_variables(book_url, chapter_urls);
+    }
+
     pub async fn cache_chapter(
         &self,
         user_ns: &str,
@@ -2517,22 +2697,46 @@ impl BookService {
     }
 
     pub async fn get_cover(&self, user_ns: &str, url: &str) -> Result<(Vec<u8>, String), AppError> {
-        let ext = file_ext_from_url(url).unwrap_or_else(|| "png".to_string());
-        let name = md5_hex(url);
-        let path = self
+        let cover_dir = self
             .storage_dir
             .join("cache")
             .join(user_ns)
-            .join("cover")
-            .join(format!("{}.{}", name, ext));
-        if path.exists() {
-            let data = fs::read(&path)
+            .join("cover");
+        let mapping_path = cover_dir.join("urls").join(format!("{}.json", md5_hex(url)));
+        if let Ok(mapped) = fs::read_to_string(&mapping_path).await {
+            let entry: serde_json::Value =
+                serde_json::from_str(&mapped).unwrap_or(serde_json::Value::Null);
+            if let (Some(file), Some(content_type)) = (
+                entry.get("file").and_then(serde_json::Value::as_str),
+                entry
+                    .get("contentType")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                if let Ok(data) = fs::read(cover_dir.join(file)).await {
+                    return Ok((data, content_type.to_string()));
+                }
+            }
+        }
+
+        // Compatibility with the previous URL-addressed layout. A hit is
+        // promoted into the content-addressed layout before returning.
+        let ext = file_ext_from_url(url).unwrap_or_else(|| "png".to_string());
+        let legacy_path = cover_dir.join(format!("{}.{}", md5_hex(url), ext));
+        if legacy_path.exists() {
+            let data = fs::read(&legacy_path)
                 .await
                 .map_err(|e| AppError::Internal(e.into()))?;
             let content_type = content_type_from_ext(&ext);
+            if self
+                .store_cover_mapping(url, &data, &content_type, &cover_dir)
+                .await
+                .is_ok()
+            {
+                let _ = fs::remove_file(&legacy_path).await;
+            }
             return Ok((data, content_type));
         }
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = mapping_path.parent() {
             fs::create_dir_all(parent)
                 .await
                 .map_err(|e| AppError::Internal(e.into()))?;
@@ -2545,18 +2749,39 @@ impl BookService {
             Some(format!("{}://{}", scheme, host))
         });
 
-        let mut req = self.http.client().get(url);
+        let build_request = |client: &reqwest::Client| {
+            let mut req = client.get(url);
+            // Add necessary headers to bypass anti-hotlinking
+            req = req
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8");
+            if let Some(ref referer) = referer {
+                req = req.header("Referer", referer);
+            }
+            req
+        };
 
-        // Add necessary headers to bypass anti-hotlinking
-        req = req
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8");
-
-        if let Some(ref referer) = referer {
-            req = req.header("Referer", referer);
+        let mut res = build_request(&self.http.client()).send().await;
+        // 封面请求此前只走系统代理。共享代理 IP 被站点 WAF 整段拦下时(该源
+        // 某书源的排行榜页就是代理 403 / 直连 200), 正文链路有直连回退
+        // 而封面没有, 于是列表能出来、封面全部 404。与 `retry_direct_when_proxy_blocked`
+        // 同理: 发送失败(超时/连接被拒)或返回 403/407/451 这类 WAF 拒绝码时,
+        // 用直连客户端重发一次, 成功才替换原响应。
+        let retry_status = match &res {
+            Ok(response) => Some(response.status().as_u16()),
+            Err(_) => None,
+        };
+        if cover_needs_direct_retry(self.http.active_proxy().is_some(), retry_status) {
+            if let Ok(direct) = self.http.client_direct() {
+                if let Ok(direct_res) = build_request(&direct).send().await {
+                    if direct_res.status().is_success() {
+                        tracing::info!(url = %url, "proxy cover request blocked; used direct retry");
+                        res = Ok(direct_res);
+                    }
+                }
+            }
         }
-
-        let res = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
+        let res = res.map_err(|e| AppError::Internal(e.into()))?;
         if !res.status().is_success() {
             return Err(AppError::NotFound("cover not found".to_string()));
         }
@@ -2571,8 +2796,104 @@ impl BookService {
             .await
             .map_err(|e| AppError::Internal(e.into()))?
             .to_vec();
-        let _ = fs::write(&path, &bytes).await;
+        if let Err(err) = self
+            .store_cover_mapping(url, &bytes, &content_type, &cover_dir)
+            .await
+        {
+            tracing::warn!("写入封面缓存失败: {err:?}");
+        }
         Ok((bytes, content_type))
+    }
+
+    async fn store_cover_mapping(
+        &self,
+        url: &str,
+        bytes: &[u8],
+        content_type: &str,
+        cover_dir: &Path,
+    ) -> std::io::Result<()> {
+        let digest = hex::encode(Sha256::digest(bytes));
+        let extension = file_ext_from_url(url).unwrap_or_else(|| "image".to_string());
+        let file_name = format!("{digest}.{extension}");
+        fs::create_dir_all(cover_dir.join("urls")).await?;
+        let content_path = cover_dir.join(&file_name);
+        if !content_path.exists() {
+            fs::write(&content_path, bytes).await?;
+        }
+        let mapping = serde_json::json!({
+            "file": file_name,
+            "contentType": content_type,
+        });
+        let mapping_path = cover_dir.join("urls").join(format!("{}.json", md5_hex(url)));
+        fs::write(
+            mapping_path,
+            serde_json::to_vec(&mapping).unwrap_or_default(),
+        )
+        .await
+    }
+
+    /// Remove a cover's URL mapping and the content file when no other URL
+    /// still references the same bytes.
+    pub async fn delete_cover_cache(&self, user_ns: &str, url: &str) -> Result<(), AppError> {
+        if url.trim().is_empty() {
+            return Ok(());
+        }
+        let cover_dir = self
+            .storage_dir
+            .join("cache")
+            .join(user_ns)
+            .join("cover");
+        let mapping_path = cover_dir.join("urls").join(format!("{}.json", md5_hex(url)));
+        let mapped = fs::read_to_string(&mapping_path).await.ok();
+        let _ = fs::remove_file(&mapping_path).await;
+
+        if let Some(mapped) = mapped {
+            let entry: serde_json::Value =
+                serde_json::from_str(&mapped).unwrap_or(serde_json::Value::Null);
+            if let Some(file) = entry.get("file").and_then(serde_json::Value::as_str) {
+                if !mappings_reference_file(&cover_dir, file).await {
+                    let _ = fs::remove_file(cover_dir.join(file)).await;
+                }
+            }
+        }
+
+        // Remove the old URL-addressed file as well during migration.
+        let ext = file_ext_from_url(url).unwrap_or_else(|| "png".to_string());
+        let _ = fs::remove_file(cover_dir.join(format!("{}.{}", md5_hex(url), ext))).await;
+        Ok(())
+    }
+
+    /// Safety net for crashes or forced exits that bypass the search-session
+    /// cleanup.
+    ///
+    /// 崩溃场景下「映射 + 内容文件」都会留下, 只按内容文件找孤儿是收不到的
+    /// —— 映射还在, 内容文件就被判定为「仍被引用」。所以这里先按年龄回收
+    /// `urls/` 里过期的映射本身, 再回收因此变成孤儿的内容文件。
+    ///
+    /// 内容文件是内容寻址且可能被多个 URL 共享, 只有在映射扫描确认无人引用
+    /// 之后才删除。
+    pub async fn clean_stale_search_covers(&self, max_age: Duration) -> Result<usize, AppError> {
+        let cover_dir = self
+            .storage_dir
+            .join("cache")
+            .join("public")
+            .join("cover");
+        if !cover_dir.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0usize;
+        removed += self.prune_stale_cover_mappings(&cover_dir, max_age).await?;
+        removed += remove_orphan_cover_files(&cover_dir, max_age).await?;
+        Ok(removed)
+    }
+
+    /// 回收 `urls/` 下超过 `max_age` 未更新的映射文件。
+    async fn prune_stale_cover_mappings(
+        &self,
+        cover_dir: &Path,
+        max_age: Duration,
+    ) -> Result<usize, AppError> {
+        prune_stale_cover_mappings(cover_dir, max_age).await
     }
 
     pub async fn load_book_sources_cache(
@@ -2782,6 +3103,12 @@ impl BookService {
     }
 
     async fn clear_book_related_cache(&self, user_ns: &str, book: &Book) -> Result<(), AppError> {
+        let mut chapter_urls = Vec::new();
+        if let Some(toc_url) = book.toc_url.as_deref().filter(|url| !url.is_empty()) {
+            if let Ok(Some(chapters)) = self.load_chapter_list_cache(user_ns, toc_url).await {
+                chapter_urls.extend(chapters.into_iter().map(|chapter| chapter.url));
+            }
+        }
         if !book.book_url.is_empty() {
             let _ = self.delete_book_cache(user_ns, &book.book_url).await;
             let _ = self
@@ -2791,11 +3118,20 @@ impl BookService {
                 .delete_chapter_list_cache(user_ns, &book.book_url)
                 .await;
         }
+        if let Some(cover_url) = book.cover_url.as_deref() {
+            let _ = self.delete_cover_cache("public", cover_url).await;
+        }
+        if let Some(cover_url) = book.custom_cover_url.as_deref() {
+            if book.cover_url.as_deref() != Some(cover_url) {
+                let _ = self.delete_cover_cache("public", cover_url).await;
+            }
+        }
         if let Some(toc_url) = &book.toc_url {
             if !toc_url.is_empty() {
                 let _ = self.delete_chapter_list_cache(user_ns, toc_url).await;
             }
         }
+        self.clear_book_variables(&book.book_url, &chapter_urls);
         Ok(())
     }
 }
@@ -3093,6 +3429,9 @@ fn parse_window_rate(rate: &str) -> Option<(usize, u64)> {
     let (limit, window) = rate.split_once('/')?;
     let limit = limit.trim().parse().ok()?;
     let window = window.trim().parse().ok()?;
+    if limit == 0 || window == 0 {
+        return None;
+    }
     Some((limit, window))
 }
 
@@ -3414,6 +3753,106 @@ fn content_type_from_ext(ext: &str) -> String {
     .to_string()
 }
 
+/// 按 mtime 回收 `urls/` 下过期的封面映射文件。
+async fn prune_stale_cover_mappings(cover_dir: &Path, max_age: Duration) -> Result<usize, AppError> {
+    let urls_dir = cover_dir.join("urls");
+    let mut entries = match fs::read_dir(&urls_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(AppError::Internal(err.into())),
+    };
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    while let Some(entry) = entries.next_entry().await.map_err(|e| AppError::Internal(e.into()))? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        if stale && fs::remove_file(path).await.is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// 回收没有任何映射引用的内容文件; 同样只看超过 `max_age` 未更新的文件。
+async fn remove_orphan_cover_files(cover_dir: &Path, max_age: Duration) -> Result<usize, AppError> {
+    let mut entries = match fs::read_dir(cover_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(AppError::Internal(err.into())),
+    };
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    while let Some(entry) = entries.next_entry().await.map_err(|e| AppError::Internal(e.into()))? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        if !stale {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if mappings_reference_file(cover_dir, file_name).await {
+            continue;
+        }
+        if fs::remove_file(path).await.is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+async fn mappings_reference_file(cover_dir: &Path, file_name: &str) -> bool {
+    let urls_dir = cover_dir.join("urls");
+    let mut entries = match fs::read_dir(&urls_dir).await {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        if let Ok(mapped) = fs::read_to_string(entry.path()).await {
+            if serde_json::from_str::<serde_json::Value>(&mapped)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("file")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some(file_name)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3436,6 +3875,96 @@ mod tests {
             warnings.iter().any(|w| w.contains("反爬")),
             "应提示反爬, 实际: {warnings:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn same_cover_bytes_share_one_content_file() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-dedup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let cover_dir = storage_dir.join("cache").join("public").join("cover");
+        let bytes = b"same-image-bytes";
+
+        service
+            .store_cover_mapping(
+                "https://img.example/a.png",
+                bytes,
+                "image/png",
+                &cover_dir,
+            )
+            .await
+            .unwrap();
+        service
+            .store_cover_mapping(
+                "https://img.example/b.png",
+                bytes,
+                "image/png",
+                &cover_dir,
+            )
+            .await
+            .unwrap();
+
+        let content_files = std::fs::read_dir(&cover_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .count();
+        assert_eq!(content_files, 1);
+        service
+            .delete_cover_cache("public", "https://img.example/a.png")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&cover_dir).unwrap().count(), 2);
+        service
+            .delete_cover_cache("public", "https://img.example/b.png")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&cover_dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    #[tokio::test]
+    async fn stale_cover_cleanup_keeps_referenced_content() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-stale-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let cover_dir = storage_dir.join("cache").join("public").join("cover");
+        service
+            .store_cover_mapping(
+                "https://img.example/keep.png",
+                b"keep-bytes",
+                "image/png",
+                &cover_dir,
+            )
+            .await
+            .unwrap();
+        let content_file = std::fs::read_dir(&cover_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.path().is_file())
+            .unwrap()
+            .path();
+        let removed = service
+            .clean_stale_search_covers(Duration::from_secs(30 * 60))
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+        assert!(content_file.exists());
+        let _ = std::fs::remove_dir_all(storage_dir);
     }
 
     #[test]
@@ -3827,4 +4356,199 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&storage_dir).await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn serial_rate_notice_returns_slot() {
+        let storage_dir =
+            std::env::temp_dir().join(format!("reader-rust-rate-notice-{}", std::process::id()));
+        let service = BookService::new(
+            HttpClient::new(5, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let source = BookSource {
+            book_source_url: "https://source.example/".to_string(),
+            ..Default::default()
+        };
+
+        let notice = RateSlotRelease {
+            service: service.clone(),
+            source: source.clone(),
+        };
+        drop(notice);
+        tokio::task::yield_now().await;
+
+        let states = service.rate_states.read().await;
+        assert!(!states
+            .get(&source.book_source_url)
+            .is_some_and(|state| state.in_flight));
+        drop(states);
+        let _ = tokio::fs::remove_dir_all(&storage_dir).await;
+    }
+
+    /// 串行限速(`concurrentRate: "1000"`)必须在请求结束后**保留** `last_start`,
+    /// 否则下一章请求会立刻放行, 配置的间隔形同虚设(反爬风险)。
+    #[tokio::test]
+    async fn serial_rate_survives_finish_rate() {
+        let storage_dir =
+            std::env::temp_dir().join(format!("reader-rust-serial-rate-{}", std::process::id()));
+        let service = BookService::new(
+            HttpClient::new(5, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let source = BookSource {
+            book_source_url: "https://source.example/serial".to_string(),
+            concurrent_rate: Some("60000".to_string()),
+            ..Default::default()
+        };
+
+        // 第一次占用 slot 后归还: last_start 必须留下。
+        assert!(service.wait_for_rate(&source).await, "首次请求应直接获得 slot");
+        service.finish_rate(&source).await;
+
+        let states = service.rate_states.read().await;
+        let state = states
+            .get(&source.book_source_url)
+            .expect("串行限速状态必须保留, 否则限速间隔丢失");
+        assert!(!state.in_flight, "归还后不应仍占着 slot");
+        assert!(state.last_start.is_some(), "last_start 必须保留");
+        drop(states);
+
+        // 第二次请求在 60s 间隔内不许放行(20ms 超时即视为仍在等待)。
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(20),
+            service.wait_for_rate(&source),
+        )
+        .await;
+        assert!(blocked.is_err(), "间隔未到就必须等待, 不能立刻放行");
+
+        let _ = tokio::fs::remove_dir_all(&storage_dir).await;
+    }
+    /// 封面直连回退只在"确实走代理"且"WAF 拒绝/请求失败"时触发。
+    /// 其它状态码(404/500/200)绝不能重发, 否则每次封面加载都多花一倍时间。
+    #[test]
+    fn cover_direct_retry_only_triggers_for_proxy_blocked_or_failed_requests() {
+        // 走了代理 + 失败/拒绝码 → 重试
+        assert!(cover_needs_direct_retry(true, None));
+        assert!(cover_needs_direct_retry(true, Some(403)));
+        assert!(cover_needs_direct_retry(true, Some(407)));
+        assert!(cover_needs_direct_retry(true, Some(451)));
+
+        // 走代理但成功/其它错误码 → 不重试
+        assert!(!cover_needs_direct_retry(true, Some(200)));
+        assert!(!cover_needs_direct_retry(true, Some(404)));
+        assert!(!cover_needs_direct_retry(true, Some(500)));
+
+        // 没有代理 → 永不重试(直连重试没有意义)
+        assert!(!cover_needs_direct_retry(false, None));
+        assert!(!cover_needs_direct_retry(false, Some(403)));
+        assert!(!cover_needs_direct_retry(false, Some(200)));
+    }
+    /// 代理出口被站点 WAF 拦掉时返回的是几百字节的 403/407/451 拒绝页;
+    /// 真实页面(以及其它状态码)不能触发直连重试, 否则会给每个正常请求加一次翻倍开销。
+    #[test]
+    fn proxy_block_detection_only_matches_small_rejection_pages() {
+        let response = |status: u16, len: usize| FetchResponse {
+            url: "https://example.com/rank.html".to_string(),
+            status,
+            body: "x".repeat(len),
+            raw_body: Vec::new(),
+            content_type: Some("text/html".to_string()),
+            headers: Vec::new(),
+            is_successful: false,
+        };
+
+        // 本机实测: 某书源经代理返回 403 + 298 字节拒绝页, 直连是 41KB 正文。
+        assert!(response_looks_proxy_blocked(&response(403, 298)));
+        assert!(response_looks_proxy_blocked(&response(407, 200)));
+        assert!(response_looks_proxy_blocked(&response(451, 300)));
+
+        // 大体积 403(带完整错误页/正文)不重试; 其它状态码一律不重试。
+        assert!(!response_looks_proxy_blocked(&response(403, 8192)));
+        assert!(!response_looks_proxy_blocked(&response(200, 298)));
+        assert!(!response_looks_proxy_blocked(&response(404, 298)));
+        assert!(!response_looks_proxy_blocked(&response(500, 128)));
+    }
+
+    /// 崩溃/强退场景: 映射与内容文件都还在, 前端没机会清理。
+    /// 只按「内容文件是否被引用」判断是收不到的(映射还在), 必须同时按年龄
+    /// 回收 urls/ 下的过期映射, 再把因此变孤儿的内容文件删掉。
+    #[tokio::test]
+    async fn stale_cover_cleanup_removes_abandoned_mapping_and_content() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-abandoned-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let cover_dir = storage_dir.join("cache").join("public").join("cover");
+        service
+            .store_cover_mapping(
+                "https://img.example/abandoned.png",
+                b"abandoned-bytes",
+                "image/png",
+                &cover_dir,
+            )
+            .await
+            .unwrap();
+        let content_file = std::fs::read_dir(&cover_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.path().is_file())
+            .unwrap()
+            .path();
+        let mapping_file = std::fs::read_dir(cover_dir.join("urls"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .next()
+            .unwrap()
+            .path();
+
+        // 零阈值等价于「超过任意保留时间」，用于验证映射和孤儿内容
+        // 都会被这条清理路径回收。
+        let removed = service
+            .clean_stale_search_covers(Duration::from_secs(0))
+            .await
+            .unwrap();
+        assert_eq!(removed, 2, "过期映射与孤儿内容都要被回收");
+        assert!(!mapping_file.exists(), "过期映射必须被回收");
+        assert!(!content_file.exists(), "孤儿内容文件必须被回收");
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn strips_a_leading_heading_from_source_content() {
+        assert_eq!(
+            strip_leading_content_title("<h1>第二十七章 荒古禁</h1><p>正文</p>"),
+            "<p>正文</p>",
+        );
+        assert_eq!(
+            strip_leading_content_title("<p>第二十七章 荒古禁</p><p>正文</p>"),
+            "<p>正文</p>",
+        );
+        assert_eq!(
+            strip_leading_content_title("&nbsp;<p>第七十二章心中的希望</p><p>正文</p>"),
+            "<p>正文</p>",
+        );
+        assert_eq!(
+            strip_leading_content_title(
+                "<div class=\"con\"><p>第七十二章心中的希望</p><p>正文</p></div>",
+            ),
+            "<div class=\"con\"><p>正文</p></div>",
+        );
+    }
+
+    #[test]
+    fn keeps_ordinary_source_content() {
+        let content = "<p>他抬头看向远处的星空。</p><p>正文</p>";
+        assert_eq!(strip_leading_content_title(content), content);
+    }
+
 }

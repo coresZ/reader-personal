@@ -34,6 +34,15 @@
               <button class="update-btn" type="button" @click="openReleasePage">查看发行页</button>
               <button class="update-btn primary" type="button" :disabled="appStore.desktopUpdateLoading" @click="retry">重试更新</button>
             </template>
+            <button
+              v-else
+              class="update-btn"
+              type="button"
+              :disabled="cancelling"
+              @click="cancel"
+            >
+              {{ cancelling ? '正在取消' : '取消下载' }}
+            </button>
             <button v-if="!appStore.desktopUpdateLoading || isFailed" class="update-btn" type="button" @click="close">
               关闭
             </button>
@@ -74,6 +83,7 @@ const headline = computed(() => {
 
 // 简易测速: 相邻两次进度回调的增量 ÷ 时间。
 const speedText = ref('')
+const cancelling = ref(false)
 let lastSpeedSample: { at: number; bytes: number } | null = null
 
 watch(() => progress.value?.downloaded, (downloaded) => {
@@ -114,6 +124,16 @@ function close() {
 
 function retry() {
   void appStore.applyDesktopUpdate()
+}
+
+async function cancel() {
+  if (cancelling.value) return
+  cancelling.value = true
+  try {
+    await appStore.cancelDesktopUpdate()
+  } finally {
+    cancelling.value = false
+  }
 }
 
 function openReleasePage() {

@@ -111,7 +111,55 @@ pub fn validate_pdf_upload(file_name: &str, byte_len: usize) -> Result<(), AppEr
 /// 字体与 CMap 只解析一次 —— 上游的逐页接口每页重建, 1300 页中文书要 70s+,
 /// 共享后同样内容 1.4s。pdf-extract 内部仍有 panic!/todo! 分支 (罕见编码),
 /// 用 catch_unwind 兜底, 失败时退回按页逐个提取, 单页失败只丢那一页。
+/// 并行上限。逐页解析是纯 CPU 工作, 更多线程的收益在实测中到 8 就基本饱和。
+const PDF_EXTRACT_MAX_THREADS: usize = 8;
+
+/// 低于这个页数时并行的线程调度开销盖过收益, 直接串行。
+const PDF_EXTRACT_MIN_PARALLEL_PAGES: usize = 8;
+
 fn extract_pages_from_doc(doc: &Document, page_ids: &[ObjectId]) -> Vec<String> {
+    let wanted = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .min(PDF_EXTRACT_MAX_THREADS);
+    // 每块至少 PDF_EXTRACT_MIN_PARALLEL_PAGES 页, 否则线程调度开销盖过收益。
+    let threads = wanted.min(page_ids.len() / PDF_EXTRACT_MIN_PARALLEL_PAGES);
+    if threads < 2 {
+        return extract_pages_serial(doc, page_ids);
+    }
+
+    // 单页约 3.5 千个内容流操作符, 解析一页要十几毫秒: 641 页串行就是 15 秒。
+    // 按页切块并行即可, 每块各自持有一个 `Processor`(它的字体表跨页复用, 不能
+    // 跨线程共享), `Document` 只读共享。
+    let chunk = page_ids.len().div_ceil(threads);
+    let mut results: Vec<(usize, Vec<String>)> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (index, group) in page_ids.chunks(chunk).enumerate() {
+            handles.push((
+                index,
+                scope.spawn(move || extract_pages_serial(doc, group)),
+            ));
+        }
+        handles
+            .into_iter()
+            .map(|(index, handle)| match handle.join() {
+                Ok(pages) => (index, pages),
+                Err(_) => {
+                    // 块内已经逐页做过 panic 隔离, 走到这里说明连兜底都炸了:
+                    // 宁可这段是空白, 也不要整本书打不开。
+                    (index, Vec::new())
+                }
+            })
+            .collect()
+    });
+    results.sort_by_key(|(index, _)| *index);
+    results
+        .into_iter()
+        .flat_map(|(_, pages)| pages)
+        .collect()
+}
+
+fn extract_pages_serial(doc: &Document, page_ids: &[ObjectId]) -> Vec<String> {
     let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pdf_extract::extract_text_for_page_ids(doc, page_ids)
     }));
@@ -1182,6 +1230,29 @@ fn ensure_non_blank(text: String) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 并行按页切块提取必须与串行逐页结果**逐页一致**(顺序与内容都不能变),
+    /// 否则章节页号会错位。
+    #[test]
+    fn parallel_page_extraction_matches_serial_order() {
+        let sample = std::path::Path::new(r"E:\Desktop\reader\红楼梦.pdf");
+        if !sample.exists() {
+            return;
+        }
+        let bytes = std::fs::read(sample).unwrap();
+        let Ok(doc) = load_pdf(&bytes) else { return };
+        let page_ids = collect_page_ids(&doc);
+        if page_ids.len() < PDF_EXTRACT_MIN_PARALLEL_PAGES * 2 {
+            return;
+        }
+
+        let parallel = extract_pages_from_doc(&doc, &page_ids);
+        let serial = extract_pages_serial(&doc, &page_ids);
+        assert_eq!(parallel.len(), serial.len());
+        for (index, (left, right)) in parallel.iter().zip(serial.iter()).enumerate() {
+            assert_eq!(left, right, "page {} differs between parallel and serial", index);
+        }
+    }
 
     #[test]
     fn fold_doubled_render_text_folds_pure_doubled_lines() {
