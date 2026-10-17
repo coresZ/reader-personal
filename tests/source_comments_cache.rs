@@ -167,7 +167,7 @@ async fn unrelated_catalogs_continue_using_existing_cache() {
 }
 
 #[tokio::test]
-async fn reading_refreshes_plain_cached_content_and_retains_offline_fallback() {
+async fn cached_content_is_served_without_refetch_and_fresh_content_carries_comments() {
     let (service, cache, root) = service();
     let source = book_source_from_value(json!({
         "bookSourceUrl": format!("https://content-cache-{}.test", uuid::Uuid::new_v4()),
@@ -181,17 +181,24 @@ async fn reading_refreshes_plain_cached_content_and_retains_offline_fallback() {
         STANDARD.encode("<div class='content'>在线正文</div>")
     );
     cache
-        .put("test", &md5_hex(book_url), &chapter_url, "旧纯正文")
+        .put("test", &md5_hex(book_url), &chapter_url, "已有正文")
         .await
         .unwrap();
+
+    // 缓存命中即返回本地正文, 不再联网 —— 与 legado 的 BookHelp.getContent 一致。
     assert_eq!(
         service
-            .get_content_with_stage("test", book_url, &source, &chapter_url, None, true)
+            .get_content_with_stage("test", book_url, &source, &chapter_url, None)
             .await
             .unwrap(),
-        "旧纯正文"
+        "已有正文"
     );
 
+    // 想让这一章重新抓取, 先删掉本章缓存; 新正文必须带上段评(jsLib 里的 addComment)。
+    service
+        .delete_chapter_cache("test", book_url, &chapter_url)
+        .await
+        .unwrap();
     let content = service
         .get_content("test", book_url, &source, &chapter_url)
         .await
@@ -207,19 +214,14 @@ async fn reading_refreshes_plain_cached_content_and_retains_offline_fallback() {
         Some(content.as_str())
     );
 
-    // Invalid inline data fails the fetch without making a network request.
+    // 未缓存的章节抓取失败就是失败, 不能被伪装成"读到了正文"。
     let unavailable_url = "data:;base64,invalid!!";
-    cache
-        .put("test", &md5_hex(book_url), unavailable_url, "离线正文")
-        .await
-        .unwrap();
-    assert_eq!(
+    assert!(
         service
             .get_content("test", book_url, &source, unavailable_url)
             .await
-            .unwrap(),
-        "离线正文"
+            .is_err()
     );
-    assert!(service.is_chapter_cached("test", book_url, unavailable_url).await);
+    assert!(!service.is_chapter_cached("test", book_url, unavailable_url).await);
     tokio::fs::remove_dir_all(root).await.unwrap();
 }

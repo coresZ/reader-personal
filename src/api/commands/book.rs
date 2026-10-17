@@ -1031,15 +1031,17 @@ pub async fn get_book_content(
     )
     .await?;
 
-    // If refresh is requested, delete this chapter's cache before fetching
+    // 只让这一章的"刷新"失效: 清掉本章缓存后, 下面的读取必然未命中并重新联网。
+    // 早先这里删的是整本书的缓存, 翻一章刷新会把其它已读章节一并丢掉, 对照
+    // legado 的 `delContent(book, bookChapter)`(同样只删单章)。
     if do_refresh {
         let _ = state
             .book_service
-            .delete_book_cache(&user_ns, &book_url)
+            .delete_chapter_cache(&user_ns, &book_url, &chapter_url)
             .await;
     }
 
-    // 阶段回调: 缓存命中时后端直接返回, 不会有任何阶段事件
+    // 阶段回调: 本地已缓存时后端直接返回, 不会有任何阶段事件
     let notify_stage = |stage: crate::service::book_service::ContentLoadStage| {
         let _ = on_stage.send(serde_json::json!({ "stage": stage }));
     };
@@ -1051,8 +1053,6 @@ pub async fn get_book_content(
             &source,
             &chapter_url,
             Some(&notify_stage),
-            // 阅读路径要完整的正文规则(含段评), 不跳过书源脚本
-            false,
         )
         .await?;
     Ok(ApiResponse::ok(serde_json::Value::String(content)))

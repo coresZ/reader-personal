@@ -43,7 +43,7 @@
 
         <template v-else>
           <div class="info-card">
-            <p>本地缓存保存在应用存储目录，断网时可以继续阅读已经缓存的章节。</p>
+            <p>已缓存的章节直接从本地读取，不再联网，断网也能照常翻页。</p>
           </div>
 
           <section class="cache-section">

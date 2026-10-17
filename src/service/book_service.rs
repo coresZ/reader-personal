@@ -2123,17 +2123,17 @@ impl BookService {
         source: &BookSource,
         chapter_url: &str,
     ) -> Result<String, AppError> {
-        self.get_content_with_stage(user_ns, book_url, source, chapter_url, None, false)
+        self.get_content_with_stage(user_ns, book_url, source, chapter_url, None)
             .await
     }
 
     /// 与 `get_content` 相同, 但把加载阶段回调出去, 供前端显示"卡在哪一步"。
     ///
-    /// `skip_js_lib` 为 true 时跳过选择器规则的可选脚本；纯 JS 正文仍保留必需的库。
-    /// 正文规则里的插件调用
-    /// (如 `addComment(result)`) 会因函数不存在而失败, 从而回退到选择器提取结果
-    /// —— 也就是纯正文。离线缓存只需要正文, 没必要为每章付出脚本解析与段评请求
-    /// 的代价。
+    /// 读正文统一走"本地优先": 缓存里有内容就直接返回(见下方缓存命中分支), 只有
+    /// 未缓存时才联网抓取并写回缓存 —— 与 legado 的 `BookHelp.getContent` 一致。
+    ///
+    /// 想让某一章重新抓取, 由调用方在进来之前删掉它的缓存(见 `cache_chapter` 的
+    /// `refresh` 与 `get_book_content`)。
     pub async fn get_content_with_stage(
         &self,
         user_ns: &str,
@@ -2141,7 +2141,6 @@ impl BookService {
         source: &BookSource,
         chapter_url: &str,
         on_stage: Option<&(dyn Fn(ContentLoadStage) + Send + Sync)>,
-        skip_js_lib: bool,
     ) -> Result<String, AppError> {
         let notify = |stage: ContentLoadStage| {
             if let Some(callback) = on_stage {
@@ -2154,19 +2153,19 @@ impl BookService {
             chapter_url,
             book_key
         );
+        // 本地已有正文就直接返回, 与 legado 的 `BookHelp.getContent` 一致: 缓存命中即
+        // 意味着这一章读过了, 不必再发一次请求等网络往返。联网只发生在未缓存、或用户
+        // 显式刷新(`refresh`)时 —— 后者会先删缓存再走到这里。
         let cached = self
             .cache
             .get(user_ns, &book_key, chapter_url)
             .await
             .ok()
-            .flatten();
-        // 离线缓存路径命中即用; 阅读路径则**优先在线解析**(保证段评是最新的),
-        // 缓存只作为请求失败时的兜底 —— 离线缓存里只有纯正文, 直接用它就看不到段评。
-        if skip_js_lib {
-            if let Some(hit) = cached.clone() {
-                tracing::debug!("get_content returning cached content, len={}", hit.len());
-                return Ok(strip_leading_content_title(&hit));
-            }
+            .flatten()
+            .filter(|hit| !hit.trim().is_empty());
+        if let Some(hit) = cached {
+            tracing::debug!("get_content returning cached content, len={}", hit.len());
+            return Ok(strip_leading_content_title(&hit));
         }
         tracing::debug!("get_content cache miss, fetching from network");
 
@@ -2174,13 +2173,6 @@ impl BookService {
         let mut visited_urls = std::collections::HashSet::new();
         let mut current_url = chapter_url.to_string();
         let book_ctx = self.js_book_context(user_ns, book_url, chapter_url).await;
-        // Pure JS rules require their library to obtain/decode the content.
-        // Selector-based rules can still skip optional presentation helpers.
-        let content_rule = source.rule_content.as_ref().and_then(|rule| rule.content.as_deref()).unwrap_or("").trim_start();
-        let requires_library = ["@js:", "js:", "<js>"].iter().any(|prefix| content_rule.starts_with(prefix));
-        let stripped_source: Option<BookSource> = (skip_js_lib && !requires_library)
-            .then(|| BookSource { js_lib: None, ..source.clone() });
-        let parse_source = stripped_source.as_ref().unwrap_or(source);
 
         // Follow pagination to get all content pages
         loop {
@@ -2197,35 +2189,16 @@ impl BookService {
                 .await
             {
                 Ok(res) => res,
-                Err(e) => {
-                    // 网络失败(离线或书源故障)时回退到已缓存正文, 保证离线仍可阅读
-                    if let Some(hit) = cached.clone() {
-                        tracing::debug!("get_content fetch failed, falling back to cache: {e}");
-                        return Ok(hit);
-                    }
-                    return Err(e);
-                }
+                // 走到这里说明本地没有这一章的正文(有的话上面已经直接返回了),
+                // 请求失败就是失败, 没有可兜底的内容。
+                Err(e) => return Err(e),
             };
             tracing::debug!("get_content fetch done, body len={}", res.body.len());
             // 正文规则里往往会触发书源脚本与段评请求, 这是最耗时的一步
             notify(ContentLoadStage::Parsing);
-            let (content, _logs) = match self
-                .parse_content_blocking(user_ns, parse_source, &res, &current_url, book_url, book_ctx.clone())
-                .await
-            {
-                Ok(parsed) => parsed,
-                // 解析失败(如书源提示 VIP 专属、正文规则为空)时:
-                // 有缓存就用缓存保证可读, 否则把书源的真实提示抛给用户。
-                Err(err) => {
-                    match cached.clone() {
-                        Some(hit) if !hit.trim().is_empty() => {
-                            tracing::debug!("get_content parse failed, falling back to cache: {err:?}");
-                            return Ok(hit);
-                        }
-                        _ => return Err(err),
-                    }
-                }
-            };
+            let (content, _logs) = self
+                .parse_content_blocking(user_ns, source, &res, &current_url, book_url, book_ctx.clone())
+                .await?;
             tracing::debug!("get_content parsed content len={}", content.len());
 
             if !content.is_empty() {
@@ -2282,6 +2255,23 @@ impl BookService {
     ) -> bool {
         let book_key = md5_hex(book_url);
         self.cache.exists(user_ns, &book_key, chapter_url).await
+    }
+
+    /// 删除**单章**正文缓存, 其余章节不受影响。
+    ///
+    /// 阅读页的"刷新本章"依赖它: 缓存命中即返回之后, 想让这一章重新抓取就只能
+    /// 先删掉它的缓存文件。
+    pub async fn delete_chapter_cache(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        chapter_url: &str,
+    ) -> Result<(), AppError> {
+        let book_key = md5_hex(book_url);
+        self.cache
+            .remove(user_ns, &book_key, chapter_url)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))
     }
 
     pub async fn chapter_list_cache_exists(&self, user_ns: &str, toc_url: &str) -> bool {
@@ -2671,24 +2661,18 @@ impl BookService {
         if refresh {
             let _ = self.cache.remove(user_ns, &book_key, chapter_url).await;
         }
+        // 缓存走**完整解析**, 与阅读时未命中的那一趟完全一致(含 jsLib 与段评插件)。
+        // 缓存命中后阅读不再联网, 所以这里存的必须就是"之后要读到的那份正文";
+        // 为省时间跳过书源脚本会让段评标记缺失, 而且这份纯正文会被当成最终结果。
         let content = self
-            .get_content_with_stage(user_ns, book_url, source, chapter_url, None, true)
+            .get_content_with_stage(user_ns, book_url, source, chapter_url, None)
             .await?;
-        // 正文规则若是**纯 JS**（没有选择器部分，如 `@js:clean(result)`），跳过书源
-        // 脚本会让整条规则失败并得到空内容。这类书源回退到完整解析（含 jsLib）再试。
-        if content.trim().is_empty() {
-            tracing::debug!("cache_chapter: 跳过书源脚本后正文为空, 回退完整解析");
-            if let Err(e) = self
-                .get_content_with_stage(user_ns, book_url, source, chapter_url, None, false)
-                .await
-            {
-                tracing::warn!("cache_chapter 回退完整解析失败: {e}");
-            }
-        }
         // 以「缓存是否真的落盘」为准：空正文不会被写入缓存（见 get_content_with_stage
-        // 里的 is_empty 判断）。若仍未落盘就报错计入失败数，否则进度会把没缓存的
+        // 里的非空判断）。若仍未落盘就报错计入失败数，否则进度会把没缓存的
         // 章节算作成功，且下次缓存时这些章又被判为未缓存。
-        if !self.is_chapter_cached(user_ns, book_url, chapter_url).await {
+        if content.trim().is_empty()
+            || !self.is_chapter_cached(user_ns, book_url, chapter_url).await
+        {
             return Err(AppError::Internal(anyhow::anyhow!(
                 "正文解析为空, 未写入缓存"
             )));
@@ -4549,6 +4533,71 @@ mod tests {
     fn keeps_ordinary_source_content() {
         let content = "<p>他抬头看向远处的星空。</p><p>正文</p>";
         assert_eq!(strip_leading_content_title(content), content);
+    }
+
+    /// 缓存命中必须直接返回本地正文, 且**一次网络请求都不发**。
+    ///
+    /// 只断言正文内容是不够的: 旧实现"优先在线、失败回退缓存"在站点连不上时也会返回
+    /// 同一份缓存正文, 用例照样通过, 只是白等一次超时。这里用本地 mock 数请求次数,
+    /// 一旦又走回优先在线, `requests` 就会大于 0。
+    #[tokio::test]
+    async fn cached_chapter_is_returned_without_touching_the_network() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let router = axum::Router::new().route(
+            "/2.html",
+            axum::routing::get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { "<div class='con'>在线正文</div>" }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cache-first-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let book_url = format!("{base}/book");
+        let chapter_url = format!("{base}/2.html");
+        let cached = "<p>本地已有的正文</p>";
+        service
+            .cache
+            .put("default", &md5_hex(&book_url), &chapter_url, cached)
+            .await
+            .unwrap();
+
+        let source: BookSource = serde_json::from_value(serde_json::json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "测试源",
+            "bookSourceType": 0,
+            "ruleContent": { "content": "class.con@text" },
+        }))
+        .unwrap();
+
+        let content = service
+            .get_content_with_stage("default", &book_url, &source, &chapter_url, None)
+            .await
+            .unwrap();
+
+        assert_eq!(content, cached);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "缓存命中的章节不应该再发网络请求"
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(storage_dir);
     }
 
 }

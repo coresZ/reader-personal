@@ -107,6 +107,9 @@ async fn source_read_config_reaches_details_shelf_catalog_and_content() {
     assert_eq!(current.read_config.as_ref().unwrap().use_replace_rule, Some(true));
     let shelf = reloaded.get_bookshelf("default").await.unwrap();
     assert_eq!(shelf[0].read_config.as_ref().unwrap().use_replace_rule, Some(true));
+    // 本章正文已缓存, 读取会直接命中本地而不再重跑正文规则; 要让配置变更反映到正文
+    // 解析结果里, 必须先让这一章的缓存失效 —— 与阅读页"刷新本章"走同一条路径。
+    reloaded.delete_chapter_cache("default", &book_url, &chapter_url).await.unwrap();
     let content = reloaded.get_content("default", &book_url, &source, &chapter_url).await.unwrap();
     assert_eq!(serde_json::from_str::<Value>(&content).unwrap()["enabled"], true);
 
