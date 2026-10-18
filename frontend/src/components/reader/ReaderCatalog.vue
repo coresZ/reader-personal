@@ -98,11 +98,17 @@
         @click="goToChapter(chapter.index)"
       >
         <span class="item-index">{{ chapter.index + 1 }}</span>
-        <span class="item-title">{{ chapter.title }}</span>
-        <div class="item-status">
-          <span v-if="chapter.index === store.currentIndex" class="status-badge current">当前</span>
-          <span v-else-if="store.isChapterRead(chapter.index)" class="status-badge read">已读</span>
-          <span v-if="isChapterCached(chapter.url)" class="status-badge cached">已缓存</span>
+        <div class="item-main">
+          <span class="item-title">{{ chapter.title }}</span>
+          <div v-if="hasChapterMeta(chapter)" class="item-meta">
+            <span v-if="chapterWordCountText(chapter.url)" class="word-count">{{ chapterWordCountText(chapter.url) }}</span>
+            <span v-if="isChapterCached(chapter.url)" class="status-badge cached">已缓存</span>
+            <span v-if="chapter.index === store.currentIndex" class="status-badge current">当前</span>
+            <span
+              v-else-if="store.isChapterRead(chapter.index)"
+              class="status-badge read"
+            >已读</span>
+          </div>
         </div>
       </div>
     </div>
@@ -143,7 +149,7 @@
 import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { useReaderStore } from '../../stores/reader'
 import { useAppStore } from '../../stores/app'
-import { getCachedChapterUrls } from '../../api/bookshelf'
+import { getCachedChapterUrls, getChapterWordCounts } from '../../api/bookshelf'
 import type { Bookmark } from '../../types'
 
 const props = withDefaults(defineProps<{
@@ -169,6 +175,8 @@ const listRef = ref<HTMLElement>()
 const bookmarkEditMode = ref(false)
 const selectedBookmarkKeys = ref<Set<string>>(new Set())
 const cachedChapterUrls = ref<Set<string>>(new Set())
+/** 已缓存章节的可见字数（去标签后统计），key 为章节地址。 */
+const chapterWordCounts = ref<Map<string, number>>(new Map())
 const chapterSearch = ref('')
 
 // Filtered chapters based on search
@@ -239,16 +247,36 @@ async function refreshCatalog() {
 async function refreshCachedChapterState() {
   if (!store.book || !store.chapters.length) {
     cachedChapterUrls.value = new Set()
+    chapterWordCounts.value = new Map()
     return
   }
+  const bookUrl = store.book.bookUrl
   const urls = store.chapters.map((chapter) => chapter.url).filter(Boolean)
   cachedChapterUrls.value = new Set(
-    await getCachedChapterUrls(store.book.bookUrl, urls).catch(() => []),
+    await getCachedChapterUrls(bookUrl, urls).catch(() => []),
   )
+  const counts = await getChapterWordCounts(bookUrl, urls).catch(() => [])
+  chapterWordCounts.value = new Map(counts)
 }
 
 function isChapterCached(chapterUrl?: string) {
   return !!chapterUrl && cachedChapterUrls.value.has(chapterUrl)
+}
+
+/** 该章是否有第二行元信息（当前/字数/缓存/已读）需要渲染。 */
+function hasChapterMeta(chapter: { url?: string; index: number }) {
+  return chapter.index === store.currentIndex
+    || !!chapterWordCountText(chapter.url)
+    || isChapterCached(chapter.url)
+    || store.isChapterRead(chapter.index)
+}
+
+/** 章节字数文案：与阅读端一致，过万字显示为 x.x 万字。 */
+function chapterWordCountText(chapterUrl?: string): string {
+  const count = chapterUrl ? chapterWordCounts.value.get(chapterUrl) : undefined
+  if (!count) return ''
+  if (count > 10000) return `${(count / 10000).toFixed(1)} 万字`
+  return `${count} 字`
 }
 
 async function goToBookmark(bm: Bookmark) {
@@ -563,7 +591,8 @@ function formatDate(ts?: number) {
   background: rgba(201, 127, 58, 0.05);
 }
 
-.list-item.read:not(.active) .item-title {
+.list-item.read:not(.active) .item-title,
+.list-item.read:not(.active) .item-meta {
   opacity: 0.74;
 }
 
@@ -572,24 +601,37 @@ function formatDate(ts?: number) {
   opacity: 0.4;
   width: 24px;
   flex-shrink: 0;
+  align-self: flex-start;
+  padding-top: 2px;
 }
 
 .item-title {
+  display: block;
   font-size: 14px;
   line-height: 1.4;
-  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.item-status {
+/* 标题与元信息分两行: 状态多起来之后, 挤在同一行会把章节名压到只剩几个字。
+   标题独占整行宽度, 不再为任何徽标让位。 */
+.item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.item-meta {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
   gap: 6px;
-  flex-shrink: 0;
+  flex-wrap: wrap;
+  font-size: 11px;
+  line-height: 1.3;
 }
 
 .status-badge {
@@ -604,10 +646,11 @@ function formatDate(ts?: number) {
   border: 1px solid transparent;
 }
 
+/* 「当前」用实心主色, 「已缓存」用同色淡底: 两者同色系, 靠填充强度区分层级 */
 .status-badge.current {
-  color: var(--color-primary, #c97f3a);
-  background: rgba(201, 127, 58, 0.12);
-  border-color: rgba(201, 127, 58, 0.2);
+  color: #fff;
+  background: var(--color-primary, #c97f3a);
+  border-color: var(--color-primary, #c97f3a);
 }
 
 .status-badge.read {
@@ -618,9 +661,18 @@ function formatDate(ts?: number) {
 }
 
 .status-badge.cached {
-  color: #2563eb;
-  background: rgba(37, 99, 235, 0.1);
-  border-color: rgba(37, 99, 235, 0.14);
+  color: var(--color-primary, #c97f3a);
+  background: rgba(201, 127, 58, 0.1);
+  border-color: rgba(201, 127, 58, 0.18);
+}
+
+/* 章节字数：只做轻量提示，不与「已缓存」「已读」抢视觉焦点 */
+.word-count {
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Bookmark items */
@@ -777,6 +829,20 @@ function formatDate(ts?: number) {
 
 .reader-catalog.mini .status-badge {
   padding: 1px 5px;
+  font-size: 10px;
+}
+
+.reader-catalog.mini .word-count {
+  font-size: 10px;
+}
+
+/* 侧边栏较窄: 元信息行收紧, 避免两行把单条撑得太高 */
+.reader-catalog.mini .item-main {
+  gap: 2px;
+}
+
+.reader-catalog.mini .item-meta {
+  gap: 4px;
   font-size: 10px;
 }
 

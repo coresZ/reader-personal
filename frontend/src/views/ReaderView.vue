@@ -106,6 +106,7 @@
 
     <ReaderTtsPanel
       :show="showTTSPanel"
+      :state="ttsPanelState"
       :theme="chromeTheme"
       :chapter-title="store.currentChapter?.title"
       :provider="store.speechConfig.provider"
@@ -133,12 +134,17 @@
       @rate-change="adjustSpeechRate"
       @pitch-change="adjustSpeechPitch"
       @timer-change="setSpeechTimer"
+      @update:state="setTtsPanelState"
     />
 
     <!-- Main Content Area -->
     <div
       class="reader-scroll-container"
-      :class="{ 'horizontal-page-mode': isHorizontalPageMode }"
+      :class="{
+        'horizontal-page-mode': isHorizontalPageMode,
+        'tts-panel-open': ttsPanelOpen,
+      }"
+      :style="{ '--tts-panel-inset': `${ttsPanelInset}px` }"
       ref="scrollContainerRef"
       @scroll="handleScroll"
       @load.capture="handleReaderImageLoad"
@@ -433,6 +439,8 @@ const ReplaceRuleManager = defineAsyncComponent(() => import('../components/read
 const CacheManager = defineAsyncComponent(() => import('../components/reader/CacheManager.vue'))
 const BookDetailModal = defineAsyncComponent(() => import('../components/BookDetailModal.vue'))
 const ReaderTtsPanel = defineAsyncComponent(() => import('../components/reader/ReaderTtsPanel.vue'))
+/** 面板三态的运行时类型只用于本地状态标注, 与组件里的定义保持字面量一致即可。 */
+type TtsPanelState = 'expanded' | 'bar' | 'bubble'
 const ReaderSearchPanel = defineAsyncComponent(() => import('../components/reader/ReaderSearchPanel.vue'))
 
 const router = useRouter()
@@ -762,6 +770,74 @@ const showBookInfo = ref(false)
 const bookInfoBook = ref<Book | null>(null)
 const showTTSPanel = ref(false)
 const ttsPanelDismissed = ref(false)
+/**
+ * 听书面板形态：展开设置 / 单行控制条 / 圆形气泡。
+ *
+ * 默认单行: 展开态含音色、语速、语调、定时停止等设置, 高度约为视口三分之一,
+ * 而它是 fixed 浮层、不参与滚动, 听书时想看对应正文就会被它挡住。
+ * 单行只占一条, 播放/切段这些高频操作仍然随手可用; 圆形气泡是给"只想听、不看屏"用的。
+ */
+const TTS_PANEL_STATE_KEY = 'reader-ttsPanelState'
+const ttsPanelState = ref<TtsPanelState>(readTtsPanelState())
+
+function readTtsPanelState(): TtsPanelState {
+  try {
+    const saved = localStorage.getItem(TTS_PANEL_STATE_KEY)
+    // 缺省单行: 首次打开听书不该先挡掉正文。
+    return saved === 'expanded' || saved === 'bubble' ? saved : 'bar'
+  } catch {
+    return 'bar'
+  }
+}
+
+function setTtsPanelState(value: TtsPanelState) {
+  ttsPanelState.value = value
+  try {
+    localStorage.setItem(TTS_PANEL_STATE_KEY, value)
+  } catch { /* 存储不可用时仅本次生效 */ }
+}
+
+/**
+ * 听书面板浮层给正文让出的底部空间。
+ *
+ * 面板是 fixed 浮层、不参与滚动: 分页模式下页高恒等于容器高, 被它盖住的行永远
+ * 翻不出来; 滚动模式下滚到底也仍有最后几行藏在它后面。两种模式统一按面板高度
+ * 收缩容器。
+ *
+ * 高度取实测值而不是写死: 收起/展开态差着好几百像素, 写死会让收起态白白浪费
+ * 一大片正文空间。
+ */
+const ttsPanelOpen = ref(false)
+const ttsPanelInset = ref(0)
+const TTS_PANEL_GAP = 12
+/** 面板刚打开时可能还没渲染完: 用 rAF 重试, 但要设上限, 否则面板永久不出现时会空转。 */
+let ttsPanelMeasureAttempts = 0
+
+function measureTtsPanelInset() {
+  // 圆形气泡几乎不挡正文, 让空间反而白亏一块; 只有条形/展开态才收缩。
+  if (!showTTSPanel.value || ttsPanelState.value === 'bubble') {
+    ttsPanelMeasureAttempts = 0
+    ttsPanelOpen.value = false
+    ttsPanelInset.value = 0
+    return
+  }
+  const panel = document.querySelector('.tts-controls') as HTMLElement | null
+  if (!panel) {
+    // 还没渲染出来: 下一帧再量。这一帧先按"已打开"处理, 但不改高度,
+    // 免得用 0 当高度放行一次、把底部内容露出去。
+    ttsPanelOpen.value = true
+    if (ttsPanelMeasureAttempts >= 8) return
+    ttsPanelMeasureAttempts += 1
+    requestAnimationFrame(measureTtsPanelInset)
+    return
+  }
+  ttsPanelMeasureAttempts = 0
+  // 距视口底部的距离 = 面板底部留白; 让出 面板高 + 该留白 + 一点间距。
+  const panelRect = panel.getBoundingClientRect()
+  const inset = Math.round(window.innerHeight - panelRect.top + TTS_PANEL_GAP)
+  ttsPanelOpen.value = true
+  ttsPanelInset.value = Math.max(0, inset)
+}
 const offlineCachedCount = ref(0)
 const speechTimerNow = ref(Date.now())
 const speechTimerText = computed(() => {
@@ -2368,6 +2444,8 @@ const {
   chapterTextRef,
   nextChapter,
   prevChapter,
+  isHorizontalPageMode,
+  horizontalPageIndex,
 )
 
 /** 手动输入(滚轮/触摸/点击/按键)时中断翻页补间并暂停自动滚动。
@@ -3112,9 +3190,13 @@ function handleTTS() {
   showTTSPanel.value = true
 }
 
+/** 关闭听书面板 = 结束听书。否则面板消失后朗读还在继续, 而用户已经没有任何
+ *  入口回到它(除非再点一次听书), 容易变成"关不掉的声音"。 */
 function closeTTSPanel() {
   showTTSPanel.value = false
   ttsPanelDismissed.value = true
+  cancelSpeechTransition()
+  store.stopTTS()
 }
 
 function toggleSpeechFromPanel() {
@@ -3152,6 +3234,17 @@ watch(() => store.isAutoScrolling, (val) => {
 
 watch(showTTSPanel, (visible) => {
   if (!visible) return
+})
+
+/** 面板显隐/形态变化都会改变它占的高度, 量完必须重新分页:
+ *  分页按容器高度切页, 容器没变高就还是旧页边界, 底部照样被遮。 */
+watch([showTTSPanel, ttsPanelState], async () => {
+  await nextTick()
+  measureTtsPanelInset()
+  await nextTick()
+  if (isHorizontalPageMode.value) {
+    await rebuildHorizontalPages()
+  }
 })
 
 function changeVoice(name: string) {
@@ -3341,6 +3434,7 @@ onMounted(async () => {
     document.addEventListener('selectionchange', handleSelectionChange)
     checkMedia()
     window.addEventListener('resize', checkMedia)
+    window.addEventListener('resize', measureTtsPanelInset)
     window.addEventListener(APP_VIEWPORT_CHANGE_EVENT, handleViewportChange)
     window.addEventListener('pagehide', handlePageHide)
     window.addEventListener('beforeunload', handleBeforeUnload)
@@ -3401,6 +3495,7 @@ onUnmounted(() => {
   document.removeEventListener('touchend', handleTouchEndSelection)
     document.removeEventListener('selectionchange', handleSelectionChange)
     window.removeEventListener('resize', checkMedia)
+    window.removeEventListener('resize', measureTtsPanelInset)
     window.removeEventListener(APP_VIEWPORT_CHANGE_EVENT, handleViewportChange)
     window.removeEventListener('pagehide', handlePageHide)
     window.removeEventListener('beforeunload', handleBeforeUnload)
@@ -3787,6 +3882,15 @@ watch(
   overflow-y: hidden;
   touch-action: pan-y pinch-zoom;
   overscroll-behavior: none;
+}
+
+/* 听书面板浮在正文之上、不参与滚动。分页模式下正文高度恒等于一屏,
+   被面板压住的那几行永远翻不出来, 所以面板在时给容器让出底部空间:
+   容器变矮 → clientHeight 变小 → 分页重建时按更矮的页高重新切页,
+   最后一行落在面板上方而不是被它盖住。 */
+.reader-scroll-container.tts-panel-open {
+  padding-bottom: var(--tts-panel-inset, 0px);
+  box-sizing: border-box;
 }
 
 /* Hide scrollbar */

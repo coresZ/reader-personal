@@ -29,7 +29,10 @@ impl FileCache {
         Ok(Some(data))
     }
 
-    /// Put cached content for a specific book
+    /// Put cached content for a specific book.
+    ///
+    /// 同时写入字数 sidecar(`<md5>.count`), 让目录不必为算字数去解析整篇正文。
+    /// sidecar 写失败不影响正文可用 —— 读取侧会对缺失的 sidecar 回退现算。
     pub async fn put(
         &self,
         user_ns: &str,
@@ -41,11 +44,49 @@ impl FileCache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::write(path, value).await?;
+        fs::write(&path, value).await?;
+        let count =
+            crate::util::text::visible_char_count(value).to_string();
+        if let Err(err) = fs::write(self.count_path(user_ns, book_key, chapter_key), count).await {
+            tracing::warn!("写入章节字数 sidecar 失败(将从正文现算): {err}");
+        }
         Ok(())
     }
 
-    /// Remove a single chapter cache
+    /// 读取缓存字数。返回 `None` 表示**缺少** sidecar(旧缓存或写入失败),
+    /// 调用方应回退到解析正文; 返回 `Some(0)` 表示确实统计为 0。
+    pub async fn get_word_count(
+        &self,
+        user_ns: &str,
+        book_key: &str,
+        chapter_key: &str,
+    ) -> anyhow::Result<Option<usize>> {
+        let path = self.count_path(user_ns, book_key, chapter_key);
+        match fs::read_to_string(&path).await {
+            Ok(raw) => Ok(raw.trim().parse::<usize>().ok()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// 补写 sidecar。用于命中旧缓存(无字数)时把现算结果固化下来。
+    pub async fn set_word_count(
+        &self,
+        user_ns: &str,
+        book_key: &str,
+        chapter_key: &str,
+        count: usize,
+    ) -> anyhow::Result<()> {
+        let path = self.count_path(user_ns, book_key, chapter_key);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(path, count.to_string()).await?;
+        Ok(())
+    }
+
+    /// Remove a single chapter cache. sidecar 与正文一并删除, 避免字数残留下来
+    /// 让"已删除"的章节仍然报出旧数字。
     pub async fn remove(
         &self,
         user_ns: &str,
@@ -54,7 +95,11 @@ impl FileCache {
     ) -> anyhow::Result<()> {
         let path = self.chapter_path(user_ns, book_key, chapter_key);
         if path.exists() {
-            fs::remove_file(path).await?;
+            fs::remove_file(&path).await?;
+        }
+        let count_path = self.count_path(user_ns, book_key, chapter_key);
+        if count_path.exists() {
+            fs::remove_file(&count_path).await?;
         }
         Ok(())
     }
@@ -113,5 +158,81 @@ impl FileCache {
         self.book_path(user_ns, book_key)
             .join(name)
             .with_extension("txt")
+    }
+
+    /// 章节字数 sidecar 路径。用 `.count` 扩展名而不是 `.txt`, 这样
+    /// `list_chapter_files` 不会把它当成一章的正文。
+    fn count_path(&self, user_ns: &str, book_key: &str, chapter_key: &str) -> PathBuf {
+        let name = md5_hex(chapter_key);
+        self.book_path(user_ns, book_key)
+            .join(name)
+            .with_extension("count")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_cache() -> (FileCache, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "reader-file-cache-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        (FileCache::new(root.join("cache")), root)
+    }
+
+    #[tokio::test]
+    async fn put_writes_word_count_sidecar() {
+        let (cache, root) = temp_cache();
+        cache
+            .put("default", "book", "chapter-1", "<p>你好世界</p>")
+            .await
+            .unwrap();
+
+        // 标签不计入: `<p>你好世界</p>` 是 4 个字。
+        assert_eq!(
+            cache.get_word_count("default", "book", "chapter-1").await.unwrap(),
+            Some(4)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn missing_sidecar_is_none_not_zero() {
+        let (cache, root) = temp_cache();
+        // 分开判断 None / Some(0), 否则"旧缓存无字数"会被误当成"0 字"。
+        assert_eq!(
+            cache.get_word_count("default", "book", "absent").await.unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn removing_chapter_also_removes_sidecar() {
+        let (cache, root) = temp_cache();
+        cache.put("default", "book", "c1", "正文").await.unwrap();
+        assert!(cache.get_word_count("default", "book", "c1").await.unwrap().is_some());
+
+        cache.remove("default", "book", "c1").await.unwrap();
+
+        // 正文与 sidecar 都要消失, 否则删掉的章节仍会报出旧字数。
+        assert!(!cache.exists("default", "book", "c1").await);
+        assert_eq!(cache.get_word_count("default", "book", "c1").await.unwrap(), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sidecar_is_not_listed_as_a_chapter() {
+        let (cache, root) = temp_cache();
+        cache.put("default", "book", "c1", "正文").await.unwrap();
+
+        // 目录里同时有 c1.txt 与 c1.count, 列表只能出现 c1 一次。
+        let names = cache.list_chapter_files("default", "book").await.unwrap();
+        assert_eq!(names.len(), 1, "sidecar 不能被当成章节: {names:?}");
+        assert_eq!(names[0], md5_hex("c1"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

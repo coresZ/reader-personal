@@ -46,6 +46,7 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
         commands::book::delete_book_cache,
         commands::book::clear_search_cover_cache,
         commands::book::get_cached_chapter_urls,
+        commands::book::get_chapter_word_counts,
         commands::book::get_bookshelf,
         commands::book::upload_txt_book,
         commands::book::upload_epub_book,

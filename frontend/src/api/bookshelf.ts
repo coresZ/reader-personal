@@ -109,6 +109,11 @@ export function getCachedChapterUrls(bookUrl: string, chapterUrls: string[]) {
   return post<string[]>('/getCachedChapterUrls', { bookUrl, chapterUrls }).then((r) => r.data)
 }
 
+/** 已缓存章节的可见字数：返回 `[章节地址, 字数]` 二元组。 */
+export function getChapterWordCounts(bookUrl: string, chapterUrls: string[]) {
+  return post<[string, number][]>('/getChapterWordCounts', { bookUrl, chapterUrls }).then((r) => r.data)
+}
+
 // ─── Groups ───
 export function getBookGroups() {
   return get<BookGroup[]>('/getBookGroups').then((r) => r.data)

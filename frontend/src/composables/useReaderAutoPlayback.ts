@@ -34,6 +34,23 @@ export function getSpeechProgressItemIndex(lengths: number[], progress: number) 
   return normalizedLengths.length - 1
 }
 
+/** 分页模式下"该段落属于第几页"：返回页容器的索引，找不到返回 -1。
+ *
+ *  独立成纯函数是为了可测: 页与页之间只靠 transform 位移, `offsetTop` 在分页布局里
+ *  没有跨页含义, 只能靠最近祖先页容器来判断归属。
+ *
+ *  只要求 `contains` 这一种能力, 不依赖真实 DOM —— 单元测试环境没有 DOM 实现。 */
+export function findParagraphPageIndex(
+  pages: readonly { contains(node: unknown): boolean }[],
+  paragraph: unknown,
+): number {
+  if (!paragraph) return -1
+  for (let index = 0; index < pages.length; index += 1) {
+    if (pages[index].contains(paragraph)) return index
+  }
+  return -1
+}
+
 export function useReaderAutoPlayback(
   store: ReaderStore,
   config: ComputedRef<AutoPlaybackConfig>,
@@ -42,6 +59,9 @@ export function useReaderAutoPlayback(
   chapterTextRef: Ref<HTMLElement | undefined>,
   nextChapter: () => void | Promise<void>,
   prevChapter: () => void | Promise<void>,
+  /** 左右分页模式: 正文按页渲染, 跟随朗读要靠页索引而不是纵向滚动。 */
+  isHorizontalPageMode: ComputedRef<boolean>,
+  horizontalPageIndex: Ref<number>,
 ) {
   let autoScrollId: number | null = null
   let autoScrollResumeTimer: number | null = null
@@ -94,6 +114,21 @@ export function useReaderAutoPlayback(
     if (!container) return null
 
     const list = getFilteredParagraphs()
+
+    // 分页模式: 纵向滚动不生效(容器 overflow-y: hidden), 改用「当前页里第一个段落」。
+    // 若仍按偏移量算, 每一页的 offsetTop 都会落在同一套纵向坐标系里, 结果与当前页无关。
+    if (isHorizontalPageMode.value) {
+      const pages = Array.from(
+        container.querySelectorAll('.horizontal-page') || [],
+      ) as HTMLElement[]
+      const page = pages[horizontalPageIndex.value]
+      if (page) {
+        const inPage = list.find((paragraph) => page.contains(paragraph))
+        if (inPage) return inPage
+      }
+      return list[0] || null
+    }
+
     for (const paragraph of list) {
       const top = paragraph.offsetTop - container.scrollTop
       const bottom = top + paragraph.offsetHeight
@@ -322,6 +357,13 @@ export function useReaderAutoPlayback(
     const container = scrollContainerRef.value
     if (!container || !paragraph) return
 
+    // 左右分页模式: 正文被切成 horizontalPages 逐页渲染, 容器是 overflow-y: hidden,
+    // 纵向滚不动。翻页靠页索引 + transform, 所以这里必须改走翻页而不是 scrollTo。
+    if (isHorizontalPageMode.value) {
+      showParagraphOnHorizontalPage(paragraph)
+      return
+    }
+
     const targetTop = Math.max(0, paragraph.offsetTop - 24)
     // 朗读推进是用户意图, 先让翻页补间让位, 否则补间每帧写回的 scrollTop
     // 会把本次滚动顶掉。
@@ -330,6 +372,22 @@ export function useReaderAutoPlayback(
       top: targetTop,
       behavior: smooth ? 'smooth' : 'auto',
     })
+  }
+
+  /**
+   * 分页模式下把朗读段落所在页翻到眼前。
+   *
+   * 段落 DOM 分布在各自的 `.horizontal-page` 里, 所以"段落属于第几页"直接问最近的
+   * 页容器即可 —— 比用 offsetTop 反推页索引可靠: 页与页之间是 transform 位移,
+   * offsetTop 在分页布局下没有跨页含义。
+   */
+  function showParagraphOnHorizontalPage(paragraph: HTMLElement) {
+    const pages = Array.from(
+      scrollContainerRef.value?.querySelectorAll('.horizontal-page') || [],
+    ) as HTMLElement[]
+    const index = findParagraphPageIndex(pages, paragraph)
+    if (index < 0 || index === horizontalPageIndex.value) return
+    horizontalPageIndex.value = index
   }
 
   function markReadingParagraph(paragraph: HTMLElement | null) {

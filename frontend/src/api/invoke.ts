@@ -50,6 +50,7 @@ const COMMAND_BY_PATH: Record<string, string> = {
   '/reader3/deleteBookCache': 'delete_book_cache',
   '/reader3/clearSearchCoverCache': 'clear_search_cover_cache',
   '/reader3/getCachedChapterUrls': 'get_cached_chapter_urls',
+  '/reader3/getChapterWordCounts': 'get_chapter_word_counts',
   '/reader3/getAvailableBookSource': 'get_available_book_source',
   '/reader3/getRssSources': 'get_rss_sources',
   '/reader3/saveRssSource': 'save_rss_source',

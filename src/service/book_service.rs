@@ -18,7 +18,7 @@ use crate::parser::rule_engine::RuleEngine;
 use crate::storage::cache::file_cache::FileCache;
 use crate::service::local_pdf_book::{is_local_pdf_origin, is_local_pdf_url};
 use crate::util::hash::md5_hex;
-use crate::util::text::{normalize_source_url, repair_encoded_url};
+use crate::util::text::{normalize_source_url, repair_encoded_url, visible_char_count};
 use serde_json::json;
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -2641,6 +2641,53 @@ impl BookService {
             .collect())
     }
 
+    /// 批量取回已缓存章节的"读者可见字数"。
+    ///
+    /// 字数在**写入缓存时**就存进 sidecar(`<md5>.count`), 这里只读那个小文件, 不再为
+    /// 目录打开去解析整篇正文。只返回本地已有正文的章节, 未缓存的章节不出现。
+    ///
+    /// 旧缓存没有 sidecar: 命中时现算一次并回填, 下次就不必再解析。
+    ///
+    /// 与 legado 的差别: legado 用 `content.length`(含 HTML 标签), 这里去掉标签后再数,
+    /// 数字更接近读者感知的字数。
+    pub async fn chapter_word_counts(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        chapter_urls: &[String],
+    ) -> Result<Vec<(String, usize)>, AppError> {
+        let book_key = md5_hex(book_url);
+        let cached_files = self.cache.list_chapter_files(user_ns, &book_key).await?;
+        if cached_files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cached_set: std::collections::HashSet<&str> =
+            cached_files.iter().map(|s| s.as_str()).collect();
+
+        let mut counts = Vec::new();
+        for url in chapter_urls {
+            if !cached_set.contains(md5_hex(url).as_str()) {
+                continue;
+            }
+            // 快路径: sidecar 命中, 不读正文。
+            if let Ok(Some(count)) = self.cache.get_word_count(user_ns, &book_key, url).await {
+                counts.push((url.clone(), count));
+                continue;
+            }
+            // 慢路径: 旧缓存没有 sidecar。现算并回填, 只在这一章上付一次代价。
+            let Ok(Some(content)) = self.cache.get(user_ns, &book_key, url).await else {
+                continue;
+            };
+            let count = visible_char_count(&content);
+            let _ = self
+                .cache
+                .set_word_count(user_ns, &book_key, url, count)
+                .await;
+            counts.push((url.clone(), count));
+        }
+        Ok(counts)
+    }
+
     /// Remove persistent JS variables owned by a book and its known chapters.
     /// Chapter keys can only be addressed by URL, so callers pass whatever
     /// chapter list they already have instead of triggering a network fetch
@@ -4597,6 +4644,95 @@ mod tests {
             "缓存命中的章节不应该再发网络请求"
         );
         server.abort();
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    /// 字数只从**已缓存**的正文现算: 未缓存的章节不出现在结果里, 调用方据此决定
+    /// 是否显示。这也保证字数与缓存文件始终一致, 不会出现两套真相。
+    #[tokio::test]
+    async fn chapter_word_counts_only_cover_cached_chapters() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-word-count-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let book_url = "https://book.example/wc";
+        let cached_url = "https://book.example/wc/1.html";
+        let uncached_url = "https://book.example/wc/2.html";
+        service
+            .cache
+            .put("default", &md5_hex(book_url), cached_url, "<p>你好世界</p>")
+            .await
+            .unwrap();
+
+        let counts = service
+            .chapter_word_counts(
+                "default",
+                book_url,
+                &[cached_url.to_string(), uncached_url.to_string()],
+            )
+            .await
+            .unwrap();
+
+        // 标签被去掉: `<p>你好世界</p>` 是 4 个字, 不是 14。
+        assert_eq!(counts, vec![(cached_url.to_string(), 4)]);
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    /// 旧缓存(只有正文、没有 sidecar)必须仍然能算出字数, 并把结果回填下来 ——
+    /// 否则升级后每次打开目录都要把所有旧章节重新解析一遍。
+    #[tokio::test]
+    async fn legacy_cache_without_sidecar_is_backfilled() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-word-count-legacy-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let cache = FileCache::new(storage_dir.join("cache"));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            cache.clone(),
+            storage_dir.to_str().unwrap(),
+        );
+        let book_url = "https://book.example/legacy";
+        let chapter_url = "https://book.example/legacy/1.html";
+        let book_key = md5_hex(book_url);
+
+        // 直接写正文文件, 模拟升级前留下的缓存(没有 .count)。
+        cache
+            .put("default", &book_key, chapter_url, "<p>旧正文五个</p>")
+            .await
+            .unwrap();
+        tokio::fs::remove_file(
+            storage_dir
+                .join("cache")
+                .join("default")
+                .join(&book_key)
+                .join(format!("{}.count", md5_hex(chapter_url))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cache.get_word_count("default", &book_key, chapter_url).await.unwrap(),
+            None
+        );
+
+        let counts = service
+            .chapter_word_counts("default", book_url, &[chapter_url.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(counts, vec![(chapter_url.to_string(), 5)]);
+
+        // 回填之后 sidecar 就该存在, 下次不再走解析。
+        assert_eq!(
+            cache.get_word_count("default", &book_key, chapter_url).await.unwrap(),
+            Some(5)
+        );
         let _ = std::fs::remove_dir_all(storage_dir);
     }
 

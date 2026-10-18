@@ -1173,6 +1173,22 @@ pub async fn get_cached_chapter_urls(
 }
 
 #[tauri::command]
+pub async fn get_chapter_word_counts(
+    state: tauri::State<'_, AppState>,
+    req: CachedChapterUrlsRequest,
+) -> Result<ApiResponse<Value>, AppError> {
+    let user_ns = "default";
+    let book_url = req
+        .book_url
+        .ok_or_else(|| AppError::BadRequest("bookUrl required".to_string()))?;
+    let counts = state
+        .book_service
+        .chapter_word_counts(&user_ns, &book_url, &req.chapter_urls)
+        .await?;
+    Ok(ApiResponse::ok(serde_json::json!(counts)))
+}
+
+#[tauri::command]
 pub async fn get_bookshelf(
     state: tauri::State<'_, AppState>,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
