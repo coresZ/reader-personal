@@ -1847,7 +1847,17 @@ fn build_cookie_harvest_script(book_source_url: &str, login_session: &str) -> St
   var loginSession = {login_session_json};
   // 登录目标站点的二级域(如 "example.com")。留空时退化为「代理所有非第三方请求」。
   var siteDomain = {book_domain_json};
-  var proxyPath = "bookSourceProxy";
+  // 必须是**绝对**地址: 代理页的文档地址形如
+  // `http://reader.localhost/bookSourceProxy?...&url=https%3A%2F%2Fhost%2Fuser%2Fme`,
+  // 相对路径 "bookSourceProxy" 会被浏览器按文档 URL 解析成
+  // `/user/bookSourceProxy?...` —— 于是每个同站请求都打到上游站点的
+  // 不存在的路径上, 表现为登录页加载即 404、登录接口全部失败。
+  // 运行时再取一次 location.origin 兜底: WebView 后端不同, reader origin 的
+  // 形态也不同(http://reader.localhost 与 reader://localhost)。
+  var readerOrigin = (function () {{
+    try {{ return window.location.origin; }} catch (_e) {{ return ""; }}
+  }})();
+  var proxyPath = (readerOrigin ? readerOrigin : "{reader_origin}") + "/bookSourceProxy";
   var skip = /^(#|javascript:|data:|mailto:|tel:)/i;
   function toProxy(url) {{
     if (!url || skip.test(url)) return url;
@@ -1914,6 +1924,7 @@ fn build_cookie_harvest_script(book_source_url: &str, login_session: &str) -> St
 }})();
 </script>
 "#,
+        reader_origin = reader_scheme_origin(),
     )
 }
 
@@ -2676,6 +2687,29 @@ mod tests {
             script.contains(r#"var siteDomain = "";"#),
             "无法解析时 siteDomain 应为空串"
         );
+    }
+
+    /// 采集脚本注入的代理地址必须是**绝对**地址。
+    ///
+    /// 登录 iframe 的文档地址是 `http://reader.localhost/bookSourceProxy?...`,
+    /// 若脚本里写相对路径 `bookSourceProxy`, 浏览器会按文档路径解析成
+    /// `/user/bookSourceProxy?...` —— 同站请求全部打到上游站点不存在的路径,
+    /// 表现为登录页一打开就 404、登录接口全部失败。
+    #[test]
+    fn login_harvest_script_uses_absolute_proxy_path() {
+        let script = build_cookie_harvest_script("https://www.example.com", "session-a");
+        assert!(
+            script.contains(&format!(
+                "{}/bookSourceProxy",
+                reader_scheme_origin()
+            )),
+            "代理地址必须以 reader origin 开头: {}",
+            script.chars().take(400).collect::<String>()
+        );
+        // 不能出现裸相对路径写法(会被解析成 /user/bookSourceProxy)。
+        assert!(!script.contains("var proxyPath = \"bookSourceProxy\""));
+        // 运行时兜底仍在: 取 window.location.origin。
+        assert!(script.contains("window.location.origin"));
     }
 
     #[test]
