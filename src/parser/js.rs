@@ -899,12 +899,37 @@ const JS_PRELUDE: &str = r#"(function (g) {
       return jsonNode;
     }
     var attrs = s.attrs || {};
-    return {
-      text: function () { return S(s.text); },
-      ownText: function () { return S(s.ownText); },
-      html: function () { return S(s.innerHtml); },
+    var el = {
+      // JSoup 的 `Element.text(String)` / `ownText(String)` / `html(String)` 是
+      // **可变 setter**, 返回元素自身; 无参时取值。书源会先读标题、为空时用
+      // `aEl.text(title)` 把标题写回元素, 再整体返回目录元素列表, 让宿主的
+      // `chapterName: text` 取到值。只读实现会让这类目录解析出 0 章
+      // (CSS 伪元素标题的站点普遍这么写)。
+      text: function (value) {
+        if (arguments.length && value !== undefined) {
+          s.text = S(value); s.ownText = S(value); return el;
+        }
+        return S(s.text);
+      },
+      ownText: function (value) {
+        if (arguments.length && value !== undefined) {
+          s.ownText = S(value); return el;
+        }
+        return S(s.ownText);
+      },
+      html: function (value) {
+        if (arguments.length && value !== undefined) {
+          s.innerHtml = S(value); return el;
+        }
+        return S(s.innerHtml);
+      },
       outerHtml: function () { return S(s.outerHtml); },
-      attr: function (name) { var v = attrs[S(name)]; return v === undefined ? '' : S(v); },
+      // JSoup `attr(key, value)` 同样是 setter, 返回元素自身。
+      attr: function (name, value) {
+        if (arguments.length > 1) { attrs[S(name)] = S(value); return el; }
+        var v = attrs[S(name)];
+        return v === undefined ? '' : S(v);
+      },
       hasAttr: function (name) { return Object.prototype.hasOwnProperty.call(attrs, S(name)); },
       tagName: function () { return S(s.tag); },
       // 在元素内部继续查询: 用 innerHtml 作为内容, 只匹配**后代**
@@ -918,6 +943,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
       // 保留原始快照: JSoup 桥需要在元素间复制/合并时重建包装对象。
       __snapshot: s
     };
+    return el;
   }
   function wrapElements(json) {
     var list;
@@ -926,6 +952,46 @@ const JS_PRELUDE: &str = r#"(function (g) {
     var out = [];
     for (var i = 0; i < list.length; i++) out.push(wrapElement(list[i]));
     return out;
+  }
+  // legado 的 `java.getElements` 返回 `Elements`(JSoup), 书源按 Java 方法调用:
+  // `list.size()` / `list.get(i)` / `list.isEmpty()`。只返回普通数组时这些
+  // 调用会抛 "not a function", 整条 chapterList 脚本报错 → 目录 0 章。
+  // 方法定义成**不可枚举**, 否则 `JSON.stringify(elements)` / `for..in`
+  // 会把函数当数据项序列化出去。
+  function elementsApi(list) {
+    if (!list || typeof list.length !== 'number') return list;
+    function def(name, fn) {
+      try {
+        Object.defineProperty(list, name, { value: fn, enumerable: false, writable: true, configurable: true });
+      } catch (e) { /* 冻结数组保持原样 */ }
+    }
+    def('size', function () { return list.length; });
+    def('isEmpty', function () { return list.length === 0; });
+    def('get', function (i) { return list[i] === undefined ? null : list[i]; });
+    def('first', function () { return list.length ? list[0] : null; });
+    def('last', function () { return list.length ? list[list.length - 1] : null; });
+    def('eachText', function () {
+      var out = [];
+      for (var i = 0; i < list.length; i++) out.push(list[i] && list[i].text ? list[i].text() : '');
+      return out;
+    });
+    def('text', function () {
+      var out = [];
+      for (var i = 0; i < list.length; i++) out.push(list[i] && list[i].text ? list[i].text() : '');
+      return out.join(' ').replace(/^\s+|\s+$/g, '');
+    });
+    // 返回 Elements 的脚本(典型是 chapterList)由宿主 JSON 序列化后再按字段
+    // 规则取值, 因此必须交出扁平快照; JSONPath 的原始节点没有 `__snapshot`,
+    // 原样透传(见 get_elements_on_jsonpath_returns_raw_json_nodes)。
+    def('toJSON', function () {
+      var out = [];
+      for (var i = 0; i < list.length; i++) {
+        var item = list[i];
+        out.push(item && item.__snapshot ? item.__snapshot : item);
+      }
+      return out;
+    });
+    return list;
   }
   // mContent 省略时用当前页面内容(与 legado 默认 this.content 一致)
   function ruleContent(mContent) {
@@ -941,7 +1007,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
     return list || [];
   };
   J.getElements = function (rule) {
-    return wrapElements(g.__rule_get(S(rule), '', 'elements'));
+    return elementsApi(wrapElements(g.__rule_get(S(rule), '', 'elements')));
   };
   J.getElement = function (rule) {
     var list = wrapElements(g.__rule_get(S(rule), '', 'elements'));
@@ -985,6 +1051,41 @@ const JS_PRELUDE: &str = r#"(function (g) {
     toJSON: function () { return this.__a; }
   };
   J.util = { HashMap: HashMap, LinkedHashMap: HashMap, Map: HashMap, ArrayList: ArrayList };
+  // Rhino 里 `java.lang.String` 是 Java String: 除了 JS String 原生方法, 书源
+  // 还会调用 Java 侧方法 —— `isEmpty()`(判断元素文本/标题是否为空) 与
+  // `replaceAll(regex, repl)`(从 class 名里抠出 `p_123456`)。缺这两个方法时
+  // 脚本抛 "not a function", 整条 chapterList 直接失败 → 目录 0 章。
+  // 方法定义成**不可枚举**, 避免 `JSON.stringify` / `for..in` 把函数当字符项。
+  function javaStringProto() {
+    var proto = {
+      isEmpty: function () { return String(this).length === 0; },
+      length: function () { return String(this).length; },
+      // Java `String.replaceAll(regex, repl)`: 第一个参数是**正则**。
+      // 原生 replaceAll 传字符串时按字面量匹配, 与 Java 语义不同, 这里补包装;
+      // 传 RegExp 时仍走原生(书源里两种写法都出现过)。
+      replaceAll: function (pattern, replacement) {
+        if (pattern !== null && typeof pattern === 'object' && typeof pattern.test === 'function') {
+          return String(this).replace(pattern, S(replacement));
+        }
+        return String(this).replace(new RegExp(S(pattern), 'g'), S(replacement));
+      },
+      replaceFirst: function (pattern, replacement) {
+        if (pattern !== null && typeof pattern === 'object' && typeof pattern.test === 'function') {
+          return String(this).replace(pattern, S(replacement));
+        }
+        return String(this).replace(new RegExp(S(pattern)), S(replacement));
+      },
+      matches: function (pattern) { return new RegExp('^(?:' + S(pattern) + ')$').test(String(this)); }
+    };
+    Object.keys(proto).forEach(function (name) {
+      try {
+        Object.defineProperty(String.prototype, name, {
+          value: proto[name], enumerable: false, writable: true, configurable: true
+        });
+      } catch (e) { /* 宿主冻结时保持原生行为 */ }
+    });
+  }
+  javaStringProto();
   J.lang = {
     String: function (s) { return new String(S(s)); },
     System: { currentTimeMillis: function () { return Date.now(); } },

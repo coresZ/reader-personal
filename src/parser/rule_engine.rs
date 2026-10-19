@@ -733,33 +733,50 @@ impl RuleEngine {
     ) -> Option<String> {
         let rule = source.rule_content.clone().unwrap_or_default();
         let next_rule = rule.next_content_url.as_deref()?;
-        if next_rule.is_empty() {
+        if next_rule.trim().is_empty() {
             return None;
         }
 
+        // `nextContentUrl` 和正文规则一样支持 `选择器@js:脚本` 组合
+        // (`#linkNext@href@js:/_/.test(result) ? result : null`)。整条当 CSS
+        // 选择器解析的话，分页链接永远取不到，多页正文只剩第一页。
         let mode = self.detect_mode(next_rule, body);
         let next_url = match mode {
-            ParseMode::JsonPath => {
-                if let Ok(v) = serde_json::from_str::<Value>(body) {
-                    jsonpath::jsonpath_first_string(&v, self.strip_mode_prefix(next_rule))
-                } else {
-                    None
-                }
-            }
+            ParseMode::JsonPath => serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|v| jsonpath::jsonpath_first_string(&v, self.strip_mode_prefix(next_rule))),
             ParseMode::XPath => html::select_xpath(body, self.strip_mode_prefix(next_rule))
-                .first()
-                .cloned(),
-            _ => {
+                .into_iter()
+                .find(|value| !value.trim().is_empty()),
+            ParseMode::Js | ParseMode::Regex => RuleEngine::eval_rule_on(next_rule, body, base_url, false)
+                .into_iter()
+                .find(|value| !value.trim().is_empty()),
+            ParseMode::Css => {
+                // 组合规则(`@href@js:…`)先按 `@js:` 切分：前半段是选择器,
+                // 后半段以取到的值为 `result` 求值。
+                let (pure, script) = extract_js(next_rule);
                 let doc = html::parse_document(body);
-                html::select_text(&doc, self.strip_mode_prefix(next_rule))
+                let extracted = if pure.trim().is_empty() {
+                    String::new()
+                } else {
+                    html::select_text(&doc, self.strip_mode_prefix(pure)).unwrap_or_default()
+                };
+                match script {
+                    Some(script) if !script.trim().is_empty() => match eval_js(script, &extracted, base_url) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            push_js_log(format!("[nextContentUrl JS] {error}"));
+                            None
+                        }
+                    },
+                    _ => Some(extracted),
+                }
             }
         };
 
-        if next_url.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-            return None;
-        }
-
-        let next_url = next_url?;
+        let next_url = next_url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && value != "null" && value != "undefined")?;
         Some(resolve_url(base_url, &next_url))
     }
 
@@ -933,6 +950,10 @@ impl RuleEngine {
         if !remaining_rule.is_empty() {
             return self.parse_toc_list(&output, base_url, rule, remaining_rule, ctx);
         }
+        // 分页目录: `chapterList` 是脚本时, `nextTocUrl` 仍要在**原始页面**上
+        // 求值 —— 脚本输出是元素快照列表, 里面已经没有 `option` 分页控件。
+        // 分页站点(目录按 60 章/页切分)只解析第一页会让书架少掉后续页面。
+        let next_urls = toc_next_urls(body, base_url, rule);
 
         if let Some(items) = parse_js_output_items(&output) {
             let mut out = Vec::with_capacity(items.len());
@@ -946,7 +967,7 @@ impl RuleEngine {
                     }
                 }
             }
-            return (out, vec![]);
+            return (out, next_urls);
         }
 
         let doc = html::parse_document(&output);
@@ -1007,7 +1028,7 @@ impl RuleEngine {
                 ..Default::default()
             });
         }
-        (out, vec![])
+        (out, next_urls)
     }
 
     fn parse_chapter_list_regex(
@@ -1554,16 +1575,39 @@ fn parse_chapter_list_html(
     // 没有配 `nextTocUrl` 时直接给空 —— 不能把空串交给 `select_text_list`：
     // 空选择器在元素级语义里表示"当前元素自身"，会凭空产出一个 next_url，
     // 让本来单页的目录被当成有下一页。
-    let next_urls: Vec<String> = match rule.next_toc_url.as_deref().map(str::trim) {
-        Some(rule_str) if !rule_str.is_empty() => html::select_text_list(&doc, rule_str)
-            .into_iter()
-            .filter(|u| !u.is_empty())
-            .map(|u| resolve_url(base_url, &u))
-            .collect(),
-        _ => Vec::new(),
-    };
+    let next_urls = toc_next_urls(body, base_url, rule);
 
     (out, next_urls)
+}
+
+/// 求值目录分页规则 `nextTocUrl`（`option:not([selected])@value` 这类 CSS、
+/// `@js:` 脚本、或 `||` 组合），返回绝对地址。
+///
+/// 必须在**原始页面**上求值：`chapterList` 是脚本时，脚本输出已经是元素快照，
+/// 里面不再包含分页控件。
+fn toc_next_urls(body: &str, base_url: &str, rule: &TocRule) -> Vec<String> {
+    let Some(rule_str) = rule.next_toc_url.as_deref().map(str::trim) else {
+        return Vec::new();
+    };
+    if rule_str.is_empty() {
+        return Vec::new();
+    }
+    let engine = RuleEngine;
+    let values = match engine.detect_mode(rule_str, body) {
+        // 脚本分页规则按 legado 语义取全部结果
+        ParseMode::Js | ParseMode::Regex | ParseMode::JsonPath => {
+            RuleEngine::eval_rule_on(rule_str, body, base_url, true)
+        }
+        _ => {
+            let doc = html::parse_document(body);
+            html::select_text_list(&doc, engine.strip_mode_prefix(rule_str))
+        }
+    };
+    values
+        .into_iter()
+        .filter(|u| !u.trim().is_empty())
+        .map(|u| resolve_url(base_url, u.trim()))
+        .collect()
 }
 
 fn parse_chapter_list_xpath(
