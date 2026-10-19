@@ -1034,6 +1034,22 @@ async fn forward_book_source_request(
         // Clear cookies left on reader.localhost by older releases. Current
         // login sessions live only in the backend source-scoped client.
         .header("Clear-Site-Data", "\"cookies\"");
+    // 登录页里的 `<script type="module" crossorigin src=...>` 按 CORS 规则加载:
+    // 模块脚本与任何带 `crossorigin` 的标签, 浏览器都按 CORS 模式校验响应头,
+    // 不看"是否同源"。缺 `Access-Control-Allow-Origin` 时脚本会被静默拒绝
+    // 执行, 表现为登录页一片空白 —— 单页应用(Vue/React)的主脚本正是这种写法。
+    //
+    // 带 Cookie 的请求(credentials: include)还要求 `Allow-Credentials: true`,
+    // 且此时 `Allow-Origin` 不能是 `*`, 必须回显实际 Origin。
+    if let Some(origin) = headers.get(http::header::ORIGIN) {
+        response_builder = response_builder
+            .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone())
+            .header(http::header::VARY, "Origin")
+            .header(http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true");
+    } else {
+        response_builder =
+            response_builder.header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+    }
 
     let body = if html_response {
         // 登录 iframe 运行在 reader.localhost 下；只注入请求代理脚本。

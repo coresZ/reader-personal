@@ -959,11 +959,17 @@ impl RuleEngine {
             let mut out = Vec::with_capacity(items.len());
             let mut seen_urls = std::collections::HashSet::new();
             for item in items {
-                if let Some(chapter) =
-                    build_chapter_from_json(&item, base_url, rule, ctx, out.len())
-                {
-                    if seen_urls.insert(chapter.url.clone()) {
-                        out.push(chapter);
+                // 脚本返回的是**包着列表的对象**时(如 `{"data":{"chapters":[...]}}`),
+                // legado 的 `getElements` 会在整个对象上继续按字段规则求值; 字段
+                // 规则是 `$.name` 这种相对路径时, 必须先下钻到真正的列表节点,
+                // 否则外层对象上取不到 `name`, 整本目录解析出 0 章。
+                for candidate in expand_toc_item(item) {
+                    if let Some(chapter) =
+                        build_chapter_from_json(&candidate, base_url, rule, ctx, out.len())
+                    {
+                        if seen_urls.insert(chapter.url.clone()) {
+                            out.push(chapter);
+                        }
                     }
                 }
             }
@@ -3066,6 +3072,72 @@ fn parse_js_output_items(output: &str) -> Option<Vec<Value>> {
         None
     } else {
         Some(items)
+    }
+}
+
+/// 把脚本输出的单个 item 展开成"真正的章节节点"列表。
+///
+/// 不少聚合源的 `chapterList` 脚本会 `return resStr` —— 交回的是**完整响应**，
+/// 形如 `{"code":0,"data":{"chapters":[...]}}`，章节数组埋在里面。legado 的
+/// `getElements` 拿到这种对象后，字段规则（`$.name` / `$.id`）是在每个元素上
+/// 求值的，因此这里必须先把对象里唯一/最像章节列表的数组找出来；找不到就保持
+/// 原样（对象自身就是一个 item，如 JSONPath 直接给出的单章）。
+fn expand_toc_item(item: Value) -> Vec<Value> {
+    fn push_array(value: Value, out: &mut Vec<Value>) -> bool {
+        match value {
+            Value::Array(items) => {
+                if items.is_empty() {
+                    return false;
+                }
+                out.extend(items);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // 已经是数组: 只有在元素**都是对象**时才当章节列表展开。
+    // 管道串兼容路径产出的数组项形如 ["101","V","第一章","2026-08-01"], 那是
+    // `id|名称|…` 的单章字段集合, 由 `@js:result.split('|')[n]` 按索引取值,
+    // 直接展开会把每根管道段变成一章。
+    if let Value::Array(items) = &item {
+        if items.iter().all(Value::is_object) {
+            return items.clone();
+        }
+        return vec![item];
+    }
+    let Value::Object(map) = &item else {
+        return vec![item];
+    };
+
+    // 先找顶层里"元素都是对象、且数量最多"的数组, 再逐层下钻一层
+    // (`{"data": {"chapters": [...]}}`)。只下钻两层: 再深的嵌套属于
+    // 正常字段取值, 交给字段规则自己的 JSONPath 处理。
+    let mut best: Vec<Value> = Vec::new();
+    for value in map.values() {
+        let mut found = Vec::new();
+        if push_array(value.clone(), &mut found) {
+            if found.iter().all(Value::is_object) && found.len() > best.len() {
+                best = found;
+            }
+            continue;
+        }
+        if let Value::Object(inner) = value {
+            for inner_value in inner.values() {
+                let mut nested = Vec::new();
+                if push_array(inner_value.clone(), &mut nested)
+                    && nested.iter().all(Value::is_object)
+                    && nested.len() > best.len()
+                {
+                    best = nested;
+                }
+            }
+        }
+    }
+    if best.is_empty() {
+        vec![item]
+    } else {
+        best
     }
 }
 
