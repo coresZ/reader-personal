@@ -163,6 +163,42 @@
         </div>
       </div>
 
+      <!-- 面板不透明度: 目录/书签/设置抽屉与右键菜单的底板 -->
+      <div class="setting-block">
+        <div class="setting-block-head">
+          <label for="reader-panel-opacity">面板不透明度</label>
+          <button
+            v-if="config.panelOpacity < 1"
+            class="link-btn"
+            @click="resetPanelOpacity"
+          >还原实色</button>
+        </div>
+        <div class="inline-slider">
+          <input
+            id="reader-panel-opacity"
+            class="settings-slider"
+            type="range"
+            :min="READER_PANEL_OPACITY_MIN"
+            max="1"
+            :step="READER_BACKGROUND_OPACITY_STEP"
+            :value="config.panelOpacity"
+            @input="store.updateConfig('panelOpacity', Number(($event.target as HTMLInputElement).value))"
+          >
+          <label class="opacity-input-wrap" title="可直接输入百分比数值">
+            <input
+              class="opacity-input"
+              type="number"
+              :min="Math.round(READER_PANEL_OPACITY_MIN * 100)"
+              max="100"
+              step="1"
+              :value="readerOpacityToPercent(config.panelOpacity)"
+              @change="applyPanelOpacityPercent(($event.target as HTMLInputElement).value, $event.target as HTMLInputElement)"
+            >
+            <span class="opacity-unit">%</span>
+          </label>
+        </div>
+      </div>
+
       <!-- 正文字体 -->
       <div class="setting-row">
         <label>正文字体</label>
@@ -659,7 +695,10 @@ import {
   READER_PAGE_WIDTH_MIN,
 } from '../../stores/reader'
 import {
+  DEFAULT_READER_PANEL_OPACITY,
   READER_BACKGROUND_OPACITY_STEP,
+  READER_PANEL_OPACITY_MIN,
+  normalizeReaderPanelOpacity,
   percentToReaderOpacity,
   prepareReaderBackgroundImage,
   readerOpacityToPercent,
@@ -766,6 +805,23 @@ function applyReaderOpacityPercent(raw: string, input: HTMLInputElement) {
   }
   store.updateConfig('readerImageOpacity', next)
   syncOpacityInput(input, next)
+}
+
+/** 面板不透明度输入框: 与背景图透明度同一套「非数字不写回」的规则,
+ *  但下限是 READER_PANEL_OPACITY_MIN, 由 normalizeReaderPanelOpacity 统一钳制。 */
+function applyPanelOpacityPercent(raw: string, input: HTMLInputElement) {
+  const parsed = percentToReaderOpacity(raw)
+  if (parsed === null) {
+    syncOpacityInput(input, store.config.panelOpacity)
+    return
+  }
+  const next = normalizeReaderPanelOpacity(parsed)
+  store.updateConfig('panelOpacity', next)
+  syncOpacityInput(input, next)
+}
+
+function resetPanelOpacity() {
+  store.updateConfig('panelOpacity', DEFAULT_READER_PANEL_OPACITY)
 }
 
 /** 一键把背景色与文字色都还原为跟随主题。 */

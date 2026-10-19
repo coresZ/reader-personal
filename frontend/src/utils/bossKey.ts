@@ -6,6 +6,31 @@ export interface BossKeyCaptureResult {
 export const DEFAULT_BOSS_KEY_SHORTCUT = 'CommandOrControl+Shift+H'
 const FUNCTION_KEY_PATTERN = /^F([1-9]|1[0-2])$/
 
+/** 可以单独绑定、不必再配修饰键的主键。
+ *
+ *  编辑键区与方向键: Insert/Delete/Home/End/PageUp/PageDown 与四个方向键。
+ *  它们不会被当作文字输入, 单按也不会在输入框里留下内容, 因此单独绑定不会
+ *  误敲出字符。Backspace/Enter/Tab 虽然也在键盘上, 但打字时高频使用, 单独
+ *  绑定会把它们从所有程序里抢走, 所以仍要求配修饰键。字母、数字、空格同理。
+ *  (issue #14 第 12 点) */
+const STANDALONE_KEYS = new Set([
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'Delete',
+  'End',
+  'Home',
+  'Insert',
+  'PageDown',
+  'PageUp',
+])
+
+/** 该主键能否省略 Ctrl/Alt/Shift 单独作为老板键。 */
+export function canUseStandaloneKey(key: string): boolean {
+  return FUNCTION_KEY_PATTERN.test(key) || STANDALONE_KEYS.has(key)
+}
+
 export function hasSystemKey(shortcut: string): boolean {
   return shortcut
     .split('+')
@@ -49,11 +74,9 @@ export function captureBossKey(event: KeyboardEvent): BossKeyCaptureResult {
 
   const key = resolveMainKey(event)
   if (!key) return { error: '不支持这个按键，请换一个按键组合' }
-  if (FUNCTION_KEY_PATTERN.test(key) && !event.ctrlKey && !event.altKey && !event.shiftKey) {
-    return { shortcut: key }
-  }
   if (!event.ctrlKey && !event.altKey && !event.shiftKey) {
-    return { error: '快捷键需要包含 Ctrl、Alt 或 Shift' }
+    if (canUseStandaloneKey(key)) return { shortcut: key }
+    return { error: '这个按键需要搭配 Ctrl、Alt 或 Shift' }
   }
 
   const parts: string[] = []
@@ -64,9 +87,23 @@ export function captureBossKey(event: KeyboardEvent): BossKeyCaptureResult {
   return { shortcut: parts.join('+') }
 }
 
+/** 键名的显示写法。存储与注册仍用事件里的原始名(ArrowLeft/PageDown),
+ *  只有界面上换成更好认的符号 —— "ArrowLeft" 这种英文长串挤在按钮里既占宽又难扫。 */
+const KEY_DISPLAY: Record<string, string> = {
+  ArrowUp: '↑',
+  ArrowDown: '↓',
+  ArrowLeft: '←',
+  ArrowRight: '→',
+  PageUp: 'PgUp',
+  PageDown: 'PgDn',
+  Insert: 'Ins',
+}
+
 export function formatBossKey(shortcut: string): string {
   return shortcut
     .replace(/CommandOrControl/gi, 'Ctrl / Command')
     .replace(/Control/gi, 'Ctrl')
-    .replace(/\+/g, ' + ')
+    .split('+')
+    .map((part) => KEY_DISPLAY[part.trim()] || part)
+    .join(' + ')
 }

@@ -167,7 +167,6 @@
               >
                 {{ recordingBossKey ? '请按下新的快捷键' : formatBossKey(appStore.bossKeyShortcut) }}
               </button>
-              <small class="boss-key-hint">需包含 Ctrl、Alt 或 Shift，F1 至 F12 可单独使用</small>
             </div>
             <template v-if="appStore.canCheckVersionUpdate">
               <div class="setting-switch-row">
@@ -946,11 +945,6 @@ async function handleCheckVersionUpdate() {
 .boss-key-recorder:disabled {
   cursor: not-allowed;
   opacity: 0.55;
-}
-
-.boss-key-hint {
-  color: var(--color-text-tertiary);
-  line-height: 1.5;
 }
 
 .proxy-setting {

@@ -86,7 +86,12 @@
     </div>
 
     <!-- Chapters List -->
-    <div v-show="activeTab === 'chapters'" class="list-container" ref="listRef">
+    <div
+      v-show="activeTab === 'chapters'"
+      class="list-container"
+      ref="listRef"
+      @scroll="hideTitleTip"
+    >
       <div v-if="store.chaptersLoading" class="loading">加载目录中...</div>
       <div v-else-if="filteredChapters.length === 0" class="empty">未找到匹配的章节</div>
       <div
@@ -97,18 +102,28 @@
         :class="{ active: chapter.index === store.currentIndex, read: store.isChapterRead(chapter.index) }"
         @click="goToChapter(chapter.index)"
       >
-        <span class="item-index">{{ chapter.index + 1 }}</span>
-        <div class="item-main">
-          <span class="item-title">{{ chapter.title }}</span>
-          <div v-if="hasChapterMeta(chapter)" class="item-meta">
-            <span v-if="chapterWordCountText(chapter.url)" class="word-count">{{ chapterWordCountText(chapter.url) }}</span>
-            <span v-if="isChapterCached(chapter.url)" class="status-badge cached">已缓存</span>
-            <span v-if="chapter.index === store.currentIndex" class="status-badge current">当前</span>
-            <span
-              v-else-if="store.isChapterRead(chapter.index)"
-              class="status-badge read"
-            >已读</span>
-          </div>
+        <span class="item-index">
+          <span class="index-num">{{ chapter.index + 1 }}</span>
+          <span
+            v-if="isChapterCached(chapter.url)"
+            class="cached-dot"
+            role="img"
+            aria-label="已缓存"
+            title="已缓存"
+          ></span>
+        </span>
+        <span
+          class="item-title"
+          @mouseenter="handleTitleEnter"
+          @mouseleave="handleTitleLeave"
+        ><span class="item-title-text">{{ chapter.title }}</span></span>
+        <span v-if="chapterWordCountText(chapter.url)" class="word-count">{{ chapterWordCountText(chapter.url) }}</span>
+        <div
+          v-if="chapter.index === store.currentIndex || store.isChapterRead(chapter.index)"
+          class="item-status"
+        >
+          <span v-if="chapter.index === store.currentIndex" class="status-badge current">当前</span>
+          <span v-else class="status-badge read">已读</span>
         </div>
       </div>
     </div>
@@ -263,20 +278,130 @@ function isChapterCached(chapterUrl?: string) {
   return !!chapterUrl && cachedChapterUrls.value.has(chapterUrl)
 }
 
-/** 该章是否有第二行元信息（当前/字数/缓存/已读）需要渲染。 */
-function hasChapterMeta(chapter: { url?: string; index: number }) {
-  return chapter.index === store.currentIndex
-    || !!chapterWordCountText(chapter.url)
-    || isChapterCached(chapter.url)
-    || store.isChapterRead(chapter.index)
-}
-
 /** 章节字数文案：与阅读端一致，过万字显示为 x.x 万字。 */
 function chapterWordCountText(chapterUrl?: string): string {
   const count = chapterUrl ? chapterWordCounts.value.get(chapterUrl) : undefined
   if (!count) return ''
-  if (count > 10000) return `${(count / 10000).toFixed(1)} 万字`
-  return `${count} 字`
+  if (count > 10000) return `${(count / 10000).toFixed(1)}万字`
+  return `${count}字`
+}
+
+/** 标题是否被省略号截断。
+ *
+ *  不看 outer 的 scrollWidth: 外层是固定宽度的裁剪窗口, 它的 scrollWidth 包含
+ *  内层溢出部分, 但直接拿内层宽度更直观 —— 内层是 inline-block 且 nowrap,
+ *  其 offsetWidth 就是文字的真实宽度。
+ *  退化路径: 内层还没渲染(不可能, 但防御)时用离屏探针量文本宽度。 */
+function isTitleTruncated(outer: HTMLElement, text: string): boolean {
+  if (outer.clientWidth <= 0) return false
+  const inner = outer.querySelector<HTMLElement>('.item-title-text')
+  if (inner) return inner.scrollWidth > outer.clientWidth + 1
+  const probe = document.createElement('span')
+  const style = window.getComputedStyle(outer)
+  probe.style.cssText = [
+    'position:absolute',
+    'visibility:hidden',
+    'white-space:nowrap',
+    'pointer-events:none',
+    `font:${style.font}`,
+    `letter-spacing:${style.letterSpacing}`,
+  ].join(';')
+  probe.textContent = text
+  document.body.appendChild(probe)
+  const textWidth = probe.getBoundingClientRect().width
+  document.body.removeChild(probe)
+  return textWidth > outer.clientWidth + 1
+}
+
+/** 当前正在滚动的标题元素与动画。同一时刻只保留一个:
+ *  鼠标从上一条移到下一条时, 上一条的动画要显式取消, 否则它会在后台继续跑,
+ *  并且把 transform 留在元素上, 让那条标题错位。 */
+let titleAnimation: Animation | null = null
+/** 记录被动画的标题元素, 停止时用来还原省略号(见 startTitleScroll)。 */
+let titleScrolledEl: HTMLElement | null = null
+
+/** 停止滚动并把标题恢复到原位。 */
+function stopTitleScroll() {
+  if (titleAnimation) {
+    try {
+      // cancel() 会撤销 fill: forwards 留下的 transform, 元素回到原始位置。
+      titleAnimation.cancel()
+    } catch {
+      /* 动画可能已自然结束, 忽略 */
+    }
+    titleAnimation = null
+  }
+  if (titleScrolledEl) {
+    titleScrolledEl.style.textOverflow = ''
+    titleScrolledEl = null
+  }
+}
+
+/** 标题横向滚动, 露出被省略号截断的尾部。
+ *
+ *  用 Web Animations API 而不是 CSS 动画 / class: 这个组件是按需加载的分包,
+ *  给它写的 CSS 规则在产物里曾整条缺失(浮层就是这么没显示出来的), 同样的坑
+ *  不想在滚动上再踩一次。Element.animate 由脚本直接驱动, 不经过样式表。
+ *
+ *  transform 只作用在标题自身, 不影响列表布局; 滚动结束停在末尾, 让用户看清
+ *  被截掉的部分。 */
+/** 标题横向滚动, 露出被省略号截断的尾部。
+ *
+ *  两层结构是关键: outer(.item-title) 只用 overflow: hidden 当裁剪窗口,
+ *  真正被 translate 的是 inner(.item-title-text)。若直接位移 outer, 裁剪框会
+ *  跟着元素一起移动, 文字相对可见区毫无变化 —— 那正是"不会滚动"的原因。
+ *
+ *  用 Web Animations API 而不是 CSS 动画 / class: 这个组件是按需加载的分包,
+ *  给它写的 CSS 规则在产物里曾整条缺失(浮层就是这么没显示出来的), 同样的坑
+ *  不想在滚动上再踩一次。Element.animate 由脚本直接驱动, 不经过样式表。
+ *
+ *  滚动结束停在末尾, 让用户看清被截掉的部分。 */
+function startTitleScroll(outer: HTMLElement) {
+  stopTitleScroll()
+  const inner = outer.querySelector<HTMLElement>('.item-title-text')
+  if (!inner) return
+  // 用内层的实际文字宽度减外层可见宽度, 得到需要移动的距离。
+  const overflow = inner.scrollWidth - outer.clientWidth
+  if (overflow <= 1) return
+  // 约 45px/秒, 夹在 0.8~5 秒: 太快的长标题看不清, 太慢的短溢出又拖沓。
+  const duration = Math.min(5000, Math.max(800, (overflow / 45) * 1000))
+  // 滚动期间去掉省略号: 否则它跟着内容一起左移, 看着像文字末尾粘了个「…」。
+  outer.style.textOverflow = 'clip'
+  titleScrolledEl = outer
+  titleAnimation = inner.animate(
+    [
+      { transform: 'translateX(0)' },
+      { transform: `translateX(-${overflow}px)` },
+    ],
+    {
+      duration,
+      // 先停顿 0.35s 再动: 鼠标扫过列表时不会到处闪动。
+      delay: 350,
+      easing: 'linear',
+      fill: 'forwards',
+    },
+  )
+}
+
+function handleTitleEnter(event: MouseEvent) {
+  const el = event.currentTarget as HTMLElement | null
+  if (!el) return
+  const text = el.textContent || ''
+  if (!text.trim()) return
+  if (!isTitleTruncated(el, text)) return
+  startTitleScroll(el)
+}
+
+function handleTitleLeave(event: MouseEvent) {
+  const el = event.currentTarget as HTMLElement | null
+  if (!el) return
+  stopTitleScroll()
+  // cancel() 会把元素恢复到未动画时的状态, 因此下一次悬停仍从开头滚起。
+}
+
+/** 列表滚动时停掉标题动画: 动画锚定的是元素自身, 列表一滚画面会跟着错位。 */
+function hideTitleTip() {
+  stopTitleScroll()
 }
 
 async function goToBookmark(bm: Bookmark) {
@@ -591,47 +716,81 @@ function formatDate(ts?: number) {
   background: rgba(201, 127, 58, 0.05);
 }
 
-.list-item.read:not(.active) .item-title,
-.list-item.read:not(.active) .item-meta {
+.list-item.read:not(.active) .item-title {
   opacity: 0.74;
 }
 
+/* 序号列: 数字贴左起排, 已缓存圆点跟在其右侧。
+   用 flex-start 而非 flex-end: 靠右对齐时, 圆点占走的宽度会把有缓存的那行
+   数字顶向左, 无缓存的行数字却停在右边, 同一列序号就对不齐。
+   min-width 而非固定 width: 三位数章节号(100+)进来时不会被挤扁或换行。 */
 .item-index {
-  font-size: 11px;
-  opacity: 0.4;
-  width: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 5px;
+  min-width: 30px;
   flex-shrink: 0;
-  align-self: flex-start;
-  padding-top: 2px;
 }
 
+.index-num {
+  font-size: 11px;
+  opacity: 0.4;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 已缓存: 一个实心小圆点, 贴在序号右侧。用主色但压低不透明度, 只是"这章
+   本地有货"的旁注, 不与「当前」「已读」抢注意力。 */
+.cached-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--color-primary, #c97f3a);
+  opacity: 0.55;
+}
+
+/* 悬停看全名: 外层是裁剪窗口, 内层 .item-title-text 由 startTitleScroll 用
+   Web Animations API 横向位移, 露出被省略号截断的尾部。
+   必须是两层: 对 overflow: hidden 的元素本身做 translate 时, 裁剪框会跟着
+   一起移动, 文字相对可见区没有任何位移 —— 看起来就是"不会滚动"。
+   静止时仍是省略号, 列表密度与阅读位置都不动。 */
 .item-title {
-  display: block;
   font-size: 14px;
   line-height: 1.4;
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: default;
 }
 
-/* 标题与元信息分两行: 状态多起来之后, 挤在同一行会把章节名压到只剩几个字。
-   标题独占整行宽度, 不再为任何徽标让位。 */
-.item-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+/* 内层承载文字, 也是被动画的那个元素。
+   它必须自己也 nowrap 且不换行, 否则移动到边界时文字会折行。 */
+.item-title-text {
+  display: inline-block;
+  white-space: nowrap;
+  vertical-align: top;
 }
 
-.item-meta {
+/* 章节字数: 贴在最右侧的小字, 与标题之间留出弹性空档。
+   只做轻量提示, 不与「当前」「已读」抢视觉焦点, 也不额外占一行高度。 */
+.word-count {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  opacity: 0.42;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.item-status {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
-  font-size: 11px;
-  line-height: 1.3;
+  flex-shrink: 0;
 }
 
 .status-badge {
@@ -646,11 +805,12 @@ function formatDate(ts?: number) {
   border: 1px solid transparent;
 }
 
-/* 「当前」用实心主色, 「已缓存」用同色淡底: 两者同色系, 靠填充强度区分层级 */
+/* 「当前」用淡色底 + 主色字, 「已缓存」用同色系更弱的底: 靠强度分层,
+   不用实心色块 —— 实心「当前」会在滚动时变成整列最重的一块。 */
 .status-badge.current {
-  color: #fff;
-  background: var(--color-primary, #c97f3a);
-  border-color: var(--color-primary, #c97f3a);
+  color: var(--color-primary, #c97f3a);
+  background: rgba(201, 127, 58, 0.12);
+  border-color: rgba(201, 127, 58, 0.2);
 }
 
 .status-badge.read {
@@ -658,21 +818,6 @@ function formatDate(ts?: number) {
   background: color-mix(in srgb, currentColor 10%, transparent);
   border-color: color-mix(in srgb, currentColor 14%, transparent);
   opacity: 0.72;
-}
-
-.status-badge.cached {
-  color: var(--color-primary, #c97f3a);
-  background: rgba(201, 127, 58, 0.1);
-  border-color: rgba(201, 127, 58, 0.18);
-}
-
-/* 章节字数：只做轻量提示，不与「已缓存」「已读」抢视觉焦点 */
-.word-count {
-  font-size: 11px;
-  line-height: 1.4;
-  white-space: nowrap;
-  opacity: 0.6;
-  font-variant-numeric: tabular-nums;
 }
 
 /* Bookmark items */
@@ -819,8 +964,17 @@ function formatDate(ts?: number) {
 }
 
 .reader-catalog.mini .item-index {
-  width: 20px;
+  width: 28px;
+  gap: 4px;
+}
+
+.reader-catalog.mini .index-num {
   font-size: 10px;
+}
+
+.reader-catalog.mini .cached-dot {
+  width: 4px;
+  height: 4px;
 }
 
 .reader-catalog.mini .item-title {
@@ -836,14 +990,8 @@ function formatDate(ts?: number) {
   font-size: 10px;
 }
 
-/* 侧边栏较窄: 元信息行收紧, 避免两行把单条撑得太高 */
-.reader-catalog.mini .item-main {
-  gap: 2px;
-}
-
-.reader-catalog.mini .item-meta {
+.reader-catalog.mini .item-status {
   gap: 4px;
-  font-size: 10px;
 }
 
 .reader-catalog.mini .loading,

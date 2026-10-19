@@ -1,11 +1,34 @@
 import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_READER_BACKGROUND_OPACITY,
+  DEFAULT_READER_PANEL_OPACITY,
   READER_BACKGROUND_OPACITY_STEP,
+  READER_PANEL_OPACITY_MIN,
   normalizeReaderBackgroundOpacity,
+  normalizeReaderPanelOpacity,
   percentToReaderOpacity,
   readerOpacityToPercent,
 } from './readerBackground'
+
+describe('reader panel opacity', () => {
+  it('defaults to opaque so panels look as before', () => {
+    expect(DEFAULT_READER_PANEL_OPACITY).toBe(1)
+    expect(normalizeReaderPanelOpacity(undefined)).toBe(1)
+    expect(normalizeReaderPanelOpacity('invalid')).toBe(1)
+  })
+
+  it('keeps a user-chosen translucency', () => {
+    expect(normalizeReaderPanelOpacity(0.84)).toBe(0.84)
+    expect(normalizeReaderPanelOpacity(1)).toBe(1)
+  })
+
+  it('refuses to go below the readable floor', () => {
+    // 再低会让抽屉里的章节标题透出正文, 读不清。
+    expect(normalizeReaderPanelOpacity(0.2)).toBe(READER_PANEL_OPACITY_MIN)
+    expect(normalizeReaderPanelOpacity(0)).toBe(READER_PANEL_OPACITY_MIN)
+    expect(normalizeReaderPanelOpacity(5)).toBe(1)
+  })
+})
 
 describe('reader background opacity', () => {
   it('uses the default for invalid saved values', () => {

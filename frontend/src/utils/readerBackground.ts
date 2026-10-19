@@ -10,6 +10,12 @@ const MAX_STORED_LENGTH = 2_000_000
 
 export const DEFAULT_READER_BACKGROUND_OPACITY = 0.35
 
+/** 阅读页浮层底板默认实色: 面板不透明度是可选装饰, 默认不改变旧版观感。 */
+export const DEFAULT_READER_PANEL_OPACITY = 1
+
+/** 浮层底板不透明度下限: 再低会让抽屉里的文字失去可读底色。 */
+export const READER_PANEL_OPACITY_MIN = 0.6
+
 /** 透明度滑块的步长(1%)。旧版是 5%, 用户反馈太粗。 */
 export const READER_BACKGROUND_OPACITY_STEP = 0.01
 
@@ -17,6 +23,15 @@ export function normalizeReaderBackgroundOpacity(value: unknown) {
   const numeric = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(numeric)) return DEFAULT_READER_BACKGROUND_OPACITY
   return Math.max(0, Math.min(1, numeric))
+}
+
+/** 浮层底板不透明度归一化。
+ *  非法输入回落默认实色; 有效值钳到 [READER_PANEL_OPACITY_MIN, 1] ——
+ *  低于 0.6 时抽屉内的章节标题与徽标会透出正文, 已经读不清。 */
+export function normalizeReaderPanelOpacity(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numeric)) return DEFAULT_READER_PANEL_OPACITY
+  return Math.max(READER_PANEL_OPACITY_MIN, Math.min(1, numeric))
 }
 
 /** 存储值(0~1) → 界面上的百分比整数。 */

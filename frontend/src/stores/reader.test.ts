@@ -543,7 +543,11 @@ describe('reader local txt chapters', () => {
 
     readerStore.setBackgroundImage(image)
     readerStore.updateConfig('backgroundOpacity', 0.6)
+    // 面板底板默认实色: 有了背景图也不会自动变半透明, 由「面板不透明度」决定。
+    expect(readerStore.chromeTheme.popup).toBe('#fff')
+    readerStore.updateConfig('panelOpacity', 0.84)
     expect(readerStore.chromeTheme.popup).toBe('color-mix(in srgb, #fff 84%, transparent)')
+    readerStore.updateConfig('panelOpacity', 1)
     readerStore.updateConfig('applyBackgroundToReader', false)
 
     expect(readerStore.config.backgroundImage).toBe(image)

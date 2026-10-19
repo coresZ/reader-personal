@@ -42,6 +42,7 @@
           class="reader-drawer"
           :class="{
             'with-custom-background': hasReaderBackground,
+            'drawer-translucent': hasTranslucentPanel,
             'drawer-wide': store.activePanel === 'settings',
           }"
           :style="{ background: chromeTheme.popup, color: chromeTheme.fontColor, colorScheme: readerColorScheme }"
@@ -500,6 +501,9 @@ const shellPaintsBackground = computed(() => (
 ))
 /** 工具栏等界面元素的「有背景图」判断, 供毛玻璃样式使用。 */
 const hasReaderBackground = computed(() => shellPaintsBackground.value)
+/** 浮层底板是否半透明(用户调低了「面板不透明度」)。半透明时才上毛玻璃:
+ *  实色底板再叠 blur 只是白耗 GPU, 而模糊层在实色下也完全看不出来。 */
+const hasTranslucentPanel = computed(() => store.config.panelOpacity < 1)
 const readerColorScheme = computed(() => store.isNight || theme.value.name === '暗灰' ? 'dark' : 'light')
 
 const scrollContainerRef = ref<HTMLElement>()
@@ -3904,7 +3908,8 @@ watch(
 }
 
 .reader-drawer.with-custom-background,
-.selection-menu.with-custom-background {
+.selection-menu.with-custom-background,
+.drawer-translucent {
   backdrop-filter: blur(20px) saturate(120%);
   -webkit-backdrop-filter: blur(20px) saturate(120%);
 }

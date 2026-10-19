@@ -24,7 +24,9 @@ import { isLocalBook } from '../utils/localBook'
 import { saveRecentReadBook } from '../utils/recentBooks'
 import {
   DEFAULT_READER_BACKGROUND_OPACITY,
+  DEFAULT_READER_PANEL_OPACITY,
   normalizeReaderBackgroundOpacity,
+  normalizeReaderPanelOpacity,
 } from '../utils/readerBackground'
 import { normalizeReaderColor } from '../utils/readerColor'
 import {
@@ -129,6 +131,9 @@ export interface ReadConfig {
   readerBackgroundImage: string
   /** 阅读页背景图透明度。 */
   readerImageOpacity: number
+  /** 阅读页浮层（目录/书签/设置抽屉、右键菜单等）的底板不透明度, 1 为实色。
+   *  阅读页铺了背景图时, 半透明底板能让用户边调设置边看到正文变化。 */
+  panelOpacity: number
 }
 
 const defaultConfig: ReadConfig = {
@@ -157,6 +162,7 @@ const defaultConfig: ReadConfig = {
   readerBackgroundColor: '',
   readerBackgroundImage: '',
   readerImageOpacity: DEFAULT_READER_BACKGROUND_OPACITY,
+  panelOpacity: DEFAULT_READER_PANEL_OPACITY,
 }
 
 function loadConfig(): ReadConfig {
@@ -216,6 +222,7 @@ function loadConfig(): ReadConfig {
         readerBackgroundImage: localStorage.getItem(READER_PAGE_BACKGROUND_IMAGE_KEY)
           || (typeof savedConfig.readerBackgroundImage === 'string' ? savedConfig.readerBackgroundImage : ''),
         readerImageOpacity: normalizeReaderBackgroundOpacity(savedConfig.readerImageOpacity),
+        panelOpacity: normalizeReaderPanelOpacity(savedConfig.panelOpacity),
       }
     }
   } catch { /* ignore */ }
@@ -502,6 +509,7 @@ export const useReaderStore = defineStore('reader', () => {
       readerBackgroundColor: config.readerBackgroundColor,
       readerBackgroundImage: config.readerBackgroundImage,
       readerImageOpacity: config.readerImageOpacity,
+      panelOpacity: config.panelOpacity,
       fontColor: config.fontColor,
     }
     Object.assign(config, defaultConfig)
@@ -646,12 +654,16 @@ export const useReaderStore = defineStore('reader', () => {
   })
   /** 阅读页背景色(已归一化)。空串表示跟随主题 / 让位给桌面背景图。 */
   const readerBackgroundColor = computed(() => normalizeReaderColor(config.readerBackgroundColor))
+  /** 阅读页浮层底板配色。
+   *  popup 同时是抽屉、右键菜单、划词菜单、搜索面板的底色, 因此这里统一按
+   *  「面板不透明度」合成一次; 100% 时直接返回主题色, 与旧版实色完全一致。 */
   const chromeTheme = computed<ThemePreset>(() => {
     const activeTheme = currentTheme.value
-    if (!config.backgroundImage || !config.applyBackgroundToReader) return activeTheme
+    const opacity = normalizeReaderPanelOpacity(config.panelOpacity)
+    if (opacity >= 1) return activeTheme
     return {
       ...activeTheme,
-      popup: `color-mix(in srgb, ${activeTheme.popup} 84%, transparent)`,
+      popup: `color-mix(in srgb, ${activeTheme.popup} ${Math.round(opacity * 100)}%, transparent)`,
     }
   })
 
