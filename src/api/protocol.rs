@@ -57,16 +57,61 @@ async fn route(
 ) -> tauri::http::Response<Vec<u8>> {
     match path {
         "/bookSourceProxy" => book_source_proxy_route(state, query, &request).await,
+        // 路径式代理: 形如 `/bookSourceProxyPath/user/assets/index-xxx.js?loginSession=…`。
+        //
+        // 查询串式代理(`/bookSourceProxy?url=…`)会把整条上游地址塞进 query, 代理
+        // URL 的**路径**因此恒为 `/bookSourceProxy`。打包出来的单页应用用相对路径
+        // 动态 `import('assets/Home-xxx.js')`, 而 ES module 的相对说明符是按
+        // **模块自身的 URL** 解析的 —— 路径丢了, 懒加载分片就会落到
+        // `reader.localhost` 根目录下 404, 登录页永远白屏。
+        //
+        // 这里保留上游路径, 让模块内的相对 import 重新对齐。
+        p if p.starts_with("/bookSourceProxyPath/") => {
+            book_source_proxy_path_route(state, p, query, &request).await
+        }
         "/sourcePanelBridge" => source_panel_bridge_route(state, query, &request).await,
         "/sourcePanel" => source_panel_route(state, query, &request).await,
         "/cover" => cover_route(state, query).await,
         "/epub" => epub_route(state, query).await,
+        "/pdf" => pdf_route(state, query).await,
         "/files" => files_route(state, query).await,
         _ => http::Response::builder()
             .status(404)
             .body(Vec::new())
             .unwrap_or_default(),
     }
+}
+
+/// 路径式登录代理: 上游路径原样保留, 只把主机换成 `reader.localhost`。
+///
+/// 与查询串式共用同一套会话校验、转发与 HTML 改写, 区别仅在于目标地址由
+/// 「路径 + `__readerUpstreamOrigin`」重建。
+async fn book_source_proxy_path_route(
+    state: &AppState,
+    path: &str,
+    query: &str,
+    request: &tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    let params: HashMap<String, String> = serde_urlencoded::from_str(query).unwrap_or_default();
+    let Some(login_session) = params.get("loginSession") else {
+        return error_response(403, "loginSession required");
+    };
+    let Some(upstream_origin) = params.get("__readerUpstreamOrigin") else {
+        return error_response(400, "upstream origin required");
+    };
+    let Some(raw_path) = path.strip_prefix("/bookSourceProxyPath") else {
+        return error_response(400, "invalid proxy path");
+    };
+    let Ok(mut target) = Url::parse(upstream_origin) else {
+        return error_response(400, "invalid upstream origin");
+    };
+    target.set_path(raw_path);
+    if let Some((_, value)) = params.iter().find(|(key, _)| key.as_str() == "__readerUpstreamQuery") {
+        target.set_query(Some(value));
+    }
+    let target_url = target.to_string();
+
+    book_source_proxy_forward(state, login_session, &target_url, request).await
 }
 
 // ─────────────────────────── 书源面板 (showBrowser) ───────────────────────────
@@ -778,7 +823,6 @@ async fn book_source_proxy_route(
     query: &str,
     request: &tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
-    let user_ns = "default";
     let q: BookSourceProxyParam = serde_urlencoded::from_str(query).unwrap_or_default();
     let Some(login_session) = q.login_session else {
         return error_response(403, "loginSession required");
@@ -786,10 +830,20 @@ async fn book_source_proxy_route(
     let Some(raw_target_url) = q.url else {
         return error_response(400, "url required");
     };
+    book_source_proxy_forward(state, &login_session, &raw_target_url, request).await
+}
 
+/// 会话校验 + 同源校验 + 实际转发。两种代理入口(查询串式 / 路径式)共用。
+async fn book_source_proxy_forward(
+    state: &AppState,
+    login_session: &str,
+    raw_target_url: &str,
+    request: &tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    let user_ns = "default";
     let Some(source_url) = state
         .book_service
-        .source_for_login_session(&login_session)
+        .source_for_login_session(login_session)
         .await
     else {
         return error_response(403, "invalid or expired loginSession");
@@ -803,7 +857,7 @@ async fn book_source_proxy_route(
         _ => return error_response(404, "bookSource not found"),
     };
 
-    let target_url = match resolve_proxy_target_url(&raw_target_url, &source.book_source_url) {
+    let target_url = match resolve_proxy_target_url(raw_target_url, &source.book_source_url) {
         Ok(url) => url,
         Err(err) => return error_response(400, &err.to_string()),
     };
@@ -814,7 +868,7 @@ async fn book_source_proxy_route(
     match forward_book_source_request(
         &state.book_service,
         &source,
-        &login_session,
+        login_session,
         request.method(),
         request.headers(),
         &target_url,
@@ -1029,11 +1083,13 @@ async fn forward_book_source_request(
     }
     // Keep upstream cookies inside the source-scoped client. Never expose
     // them to the shared reader.localhost browser origin.
-    response_builder = response_builder
-        .header(http::header::CACHE_CONTROL, "no-store")
-        // Clear cookies left on reader.localhost by older releases. Current
-        // login sessions live only in the backend source-scoped client.
-        .header("Clear-Site-Data", "\"cookies\"");
+    //
+    // 这里**不能**下发 `Clear-Site-Data: "cookies"`: 该指令会被浏览器执行并
+    // 清空整个 origin 的 Cookie, 而它挂在每一个代理响应上(页面、JS、CSS、图标),
+    // 单页登录页一次加载就是几十个请求 —— 等于反复清空登录页自己刚写的 Cookie,
+    // 页面因此表现为空白/反复重载。目标站点的 Cookie 本来就只存在后端按书源
+    // 隔离的 jar 里, 浏览器侧不需要清。
+    response_builder = response_builder.header(http::header::CACHE_CONTROL, "no-store");
     // 登录页里的 `<script type="module" crossorigin src=...>` 按 CORS 规则加载:
     // 模块脚本与任何带 `crossorigin` 的标签, 浏览器都按 CORS 模式校验响应头,
     // 不看"是否同源"。缺 `Access-Control-Allow-Origin` 时脚本会被静默拒绝
@@ -1133,7 +1189,11 @@ fn rewrite_login_html_attr(
 ) -> String {
     let attribute = captures.get(1).map(|m| m.as_str()).unwrap_or("src");
     let value = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-    let rewritten = build_login_proxy_url(value, upstream_url, book_source_url, login_session)
+    // 优先用**路径式**代理: 保留上游路径, 让单页应用模块内的相对 import 解析
+    // 正确(见 `build_login_proxy_path_url`)。路径不是绝对路径形态(如 `about:`
+    // 之类)时退回查询串式。
+    let rewritten = build_login_proxy_path_url(value, upstream_url, book_source_url, login_session)
+        .or_else(|| build_login_proxy_url(value, upstream_url, book_source_url, login_session))
         .unwrap_or_else(|| value.to_string());
     format!("{}={}{}{}", attribute, quote, rewritten, quote)
 }
@@ -1169,6 +1229,48 @@ fn build_login_proxy_url(
         urlencoding::encode(login_session),
         urlencoding::encode(absolute.as_str())
     ))
+}
+
+/// 把同站资源改写为**路径式**代理地址, 保留上游路径。
+///
+/// 单页应用的主脚本会按自身 URL 解析相对 `import('assets/Home-xxx.js')`; 若主
+/// 脚本被改写成 `/bookSourceProxy?url=…`(路径恒为 `/bookSourceProxy`), 懒加载
+/// 分片就会落到 `reader.localhost` 根目录下 404, 页面永远白屏。路径式代理让
+/// 上游路径原样出现在代理 URL 上, 相对解析因此重新正确。
+fn build_login_proxy_path_url(
+    raw_value: &str,
+    upstream_url: &str,
+    book_source_url: &str,
+    login_session: &str,
+) -> Option<String> {
+    let value = raw_value.trim();
+    if value.is_empty()
+        || value.starts_with('#')
+        || value.starts_with("javascript:")
+        || value.starts_with("data:")
+        || value.starts_with("mailto:")
+        || value.starts_with("tel:")
+        || value.starts_with("/bookSourceProxy")
+    {
+        return None;
+    }
+    let absolute = Url::parse(value)
+        .or_else(|_| Url::parse(upstream_url).and_then(|base| base.join(value)))
+        .ok()?;
+    if !proxy_target_matches_source(absolute.as_str(), book_source_url) {
+        return None;
+    }
+    let mut proxy = format!(
+        "/bookSourceProxyPath{}?loginSession={}&__readerUpstreamOrigin={}",
+        absolute.path(),
+        urlencoding::encode(login_session),
+        urlencoding::encode(&absolute.origin().ascii_serialization())
+    );
+    if let Some(query) = absolute.query() {
+        proxy.push_str("&__readerUpstreamQuery=");
+        proxy.push_str(&urlencoding::encode(query));
+    }
+    Some(proxy)
 }
 
 // Source settings override the embedded browser's defaults. HeaderMap::insert
@@ -1881,6 +1983,27 @@ fn build_cookie_harvest_script(book_source_url: &str, login_session: &str) -> St
     params.set("loginSession", loginSession);
     params.set("url", url);
     return proxyPath + "?" + params.toString();
+  }}
+  // 资源类请求(脚本/样式/图片/字体/动态 import)优先走**路径式**代理: 代理 URL
+  // 保留上游路径, 单页应用模块内的相对说明符才能正确解析。接口请求(fetch/XHR)
+  // 沿用扁平查询串, 避免把业务 query 混进代理路径。
+  var ASSET_RE = /\\.(?:m?js|css|map|json|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|otf|eot|wasm)(?:$|[?#])/i;
+  function toProxyAsset(url) {{
+    if (!url || skip.test(url)) return url;
+    try {{
+      var u = new URL(url, location.href);
+      if (!ASSET_RE.test(u.pathname)) return toProxy(url);
+      // 上游 origin 由宿主注入: 代理路径只承载 path, 主机在转发时拼回。
+      var origin = u.origin;
+      var base = (readerOrigin ? readerOrigin : "{reader_origin}") + "/bookSourceProxyPath" + u.pathname;
+      var p = new URLSearchParams();
+      p.set("loginSession", loginSession);
+      p.set("__readerUpstreamOrigin", origin);
+      if (u.search) p.set("__readerUpstreamQuery", u.search.slice(1));
+      return base + "?" + p.toString();
+    }} catch (_e) {{
+      return toProxy(url);
+    }}
   }}
   // 判断一个 URL 是否属于登录站点(应走代理转发以捕获 Set-Cookie):
   // - 相对路径 → 同站, 走代理
@@ -2728,6 +2851,42 @@ mod tests {
         assert!(script.contains("window.location.origin"));
     }
 
+    /// 单页应用登录页的主脚本必须走路径式代理, 且路径与上游一致。
+    ///
+    /// Vite/webpack 产出的应用会把路由分片写成相对说明符
+    /// (`import('assets/Home-xxx.js')`), ES module 按**模块自身 URL** 解析它。
+    /// 主脚本一旦被改成 `/<任意扁平路径>`, 相对解析就会落到 reader.localhost
+    /// 根目录下 404, 应用永远不会挂载 —— 表现为纯白页且没有明显报错。
+    #[test]
+    fn spa_login_bundle_keeps_upstream_path() {
+        let html = r#"<html><head>
+          <script type="module" crossorigin src="/user/assets/index-DwArin4u.js"></script>
+          <link rel="stylesheet" crossorigin href="/user/assets/index-C3gGMfX1.css">
+        </head><body><div id="app"></div></body></html>"#;
+        let output = rewrite_login_html(
+            html,
+            "https://www.example.com/user/me?app=yuedu",
+            "https://www.example.com",
+            "session-a",
+        );
+        // 路径完整保留: `/user/assets/index-DwArin4u.js` 原样出现在代理 URL 里。
+        assert!(
+            output.contains("/bookSourceProxyPath/user/assets/index-DwArin4u.js?loginSession=session-a"),
+            "模块脚本应保留上游路径: {output}"
+        );
+        assert!(
+            output.contains("/bookSourceProxyPath/user/assets/index-C3gGMfX1.css?loginSession=session-a"),
+            "样式应保留上游路径: {output}"
+        );
+        // 仍需带着上游 origin, 转发时才能拼回绝对地址。
+        assert!(output.contains("__readerUpstreamOrigin="));
+        // 主脚本上被改写的 URL 不能再以 `/bookSourceProxy?` 这种扁平查询串形式出现。
+        assert!(
+            !output.contains("crossorigin src=\"/bookSourceProxy?"),
+            "模块脚本不应退回扁平查询串代理: {output}"
+        );
+    }
+
     #[test]
     fn login_html_rewrites_same_source_resources() {
         let html = r#"<html><head>
@@ -2743,16 +2902,78 @@ mod tests {
             "session-a",
         );
 
-        assert!(output.contains(
-            "/bookSourceProxy?loginSession=session-a&url=https%3A%2F%2Fwww.example.com%2Fstatic%2Fapp.js"
-        ));
-        assert!(output.contains(
-            "/bookSourceProxy?loginSession=session-a&url=https%3A%2F%2Fexample.com%2Fstatic%2Fapp.css"
-        ));
-        assert!(output.contains(
-            "/bookSourceProxy?loginSession=session-a&url=https%3A%2F%2Fwww.example.com%2Fuser%2Flogin"
-        ));
+        // 同站资源改写为**路径式**代理: 上游路径必须保留, 否则单页应用模块内的
+        // 相对 import 会解析到 reader.localhost 根目录下 404(登录页白屏)。
+        assert!(
+            output.contains("/bookSourceProxyPath/static/app.js?loginSession=session-a"),
+            "同站脚本应走路径式代理: {output}"
+        );
+        assert!(
+            output.contains("/bookSourceProxyPath/static/app.css?loginSession=session-a"),
+            "同站样式应走路径式代理: {output}"
+        );
+        assert!(
+            output.contains("/bookSourceProxyPath/user/login?loginSession=session-a"),
+            "同站表单应走路径式代理: {output}"
+        );
+        // 跨域资源保持直连。
         assert!(output.contains("https://cdn.example.net/logo.png"));
+    }
+
+    /// HTML 改写只代理同域资源。
+    ///
+    /// 跨域资源一律保持原样, 由 WebView 自己去取 —— 见 `rewrite_source_panel_html`
+    /// 的说明: 把它们一起收进代理会让每个子资源都变成一次宿主请求, 直连不通时
+    /// 全部挂到 15s 超时, 足以把整个应用(乃至桌面)拖垮。这条用例固定住该边界。
+    #[test]
+    fn rewrite_source_panel_html_only_proxies_same_domain() {
+        let html = r#"<html><head>
+          <link rel="stylesheet" href="https://cdn.other.example/a.css">
+          <script src="/static/app.js"></script>
+          <a href="https://yckceo.com/detail/1">跨域详情</a>
+          <a href="javascript:void(0)">脚本</a>
+        </head></html>"#;
+        let page_url = "https://yckceo.vip/";
+        let allowed = "https://yckceo.vip/";
+
+        let output = rewrite_source_panel_html(html, page_url, allowed, "panel-1");
+
+        // 同域资源被代回代理。
+        assert!(
+            output.contains("__readerPanelUrl=https%3A%2F%2Fyckceo.vip%2Fstatic%2Fapp.js"),
+            "同域资源应代回代理: {output}"
+        );
+        // 跨域资源保持原样, 不经过本进程。
+        assert!(
+            output.contains("https://cdn.other.example/a.css"),
+            "跨域资源必须保持原样: {output}"
+        );
+        assert!(
+            !output.contains("__readerPanelUrl=https%3A%2F%2Fcdn.other.example"),
+            "跨域资源不能被收进代理"
+        );
+        assert!(output.contains("https://yckceo.com/detail/1"));
+        // 非 http(s) 不改写。
+        assert!(output.contains(r#"<a href="javascript:void(0)">"#));
+    }
+
+    /// 跨域二级页自己的**同域**资源仍要代理: 判定基准必须包含当前页面的域,
+    /// 而不是只看订阅源最初的那个地址。
+    #[test]
+    fn rewrite_source_panel_uses_current_page_domain() {
+        let html = r#"<a href="/detail/2">同域</a>"#;
+        // 页面已经从 yckceo.vip 跳到 yckceo.com, 订阅源原始地址仍是 .vip。
+        let output = rewrite_source_panel_html(
+            html,
+            "https://yckceo.com/",
+            "https://yckceo.vip/",
+            "panel-1",
+        );
+
+        assert!(
+            output.contains("__readerPanelUrl=https%3A%2F%2Fyckceo.com%2Fdetail%2F2"),
+            "应基于当前页面域改写: {output}"
+        );
     }
 
     #[test]
