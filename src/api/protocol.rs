@@ -57,61 +57,262 @@ async fn route(
 ) -> tauri::http::Response<Vec<u8>> {
     match path {
         "/bookSourceProxy" => book_source_proxy_route(state, query, &request).await,
-        // 路径式代理: 形如 `/bookSourceProxyPath/user/assets/index-xxx.js?loginSession=…`。
-        //
-        // 查询串式代理(`/bookSourceProxy?url=…`)会把整条上游地址塞进 query, 代理
-        // URL 的**路径**因此恒为 `/bookSourceProxy`。打包出来的单页应用用相对路径
-        // 动态 `import('assets/Home-xxx.js')`, 而 ES module 的相对说明符是按
-        // **模块自身的 URL** 解析的 —— 路径丢了, 懒加载分片就会落到
-        // `reader.localhost` 根目录下 404, 登录页永远白屏。
-        //
-        // 这里保留上游路径, 让模块内的相对 import 重新对齐。
-        p if p.starts_with("/bookSourceProxyPath/") => {
-            book_source_proxy_path_route(state, p, query, &request).await
-        }
         "/sourcePanelBridge" => source_panel_bridge_route(state, query, &request).await,
         "/sourcePanel" => source_panel_route(state, query, &request).await,
         "/cover" => cover_route(state, query).await,
         "/epub" => epub_route(state, query).await,
         "/pdf" => pdf_route(state, query).await,
         "/files" => files_route(state, query).await,
-        _ => http::Response::builder()
-            .status(404)
-            .body(Vec::new())
-            .unwrap_or_default(),
+        // 登录页兜底: 登录 iframe 跑在专属路径空间里, 并**完整保留上游路径**:
+        //   http://reader.localhost/__login/<session>/user/me?app=yuedu
+        //
+        // 这两个性质缺一不可:
+        // 1. 打包产出的单页应用把路径写死进代码 —— Vue Router 的 base 是
+        //    `/user/`, 分片也可能是 `"/user/" + chunk`。文档路径一旦对不上,
+        //    这些绝对路径全部 404, 应用永远挂载不起来(纯白页)。
+        // 2. WebView2 在自定义协议下**不给子资源发 Cookie, Referer 也是空串**
+        //    (实测), 因此会话只能编码进路径, 让每个分片请求天然带着它。
+        p if p.starts_with(SESSION_PATH_PREFIX) => {
+            source_login_proxy_route(state, p, query, &request).await
+        }
+        p => source_login_fallback_route(state, p, query, &request)
+            .await
+            .unwrap_or_else(|| {
+                http::Response::builder()
+                    .status(404)
+                    .body(Vec::new())
+                    .unwrap_or_default()
+            }),
     }
 }
 
-/// 路径式登录代理: 上游路径原样保留, 只把主机换成 `reader.localhost`。
+/// 登录页专属路径空间的前缀: `/__login/<session>/<上游路径>`。
+const SESSION_PATH_PREFIX: &str = "/__login/";
+
+/// 登录页代理: 从路径里取会话, 把**剩余路径**原样转发给上游。
 ///
-/// 与查询串式共用同一套会话校验、转发与 HTML 改写, 区别仅在于目标地址由
-/// 「路径 + `__readerUpstreamOrigin`」重建。
-async fn book_source_proxy_path_route(
+/// 会话放在路径里而不是 cookie/Referer, 因为 WebView2 对自定义协议的子资源
+/// 请求既不附 Cookie 也不附 Referer(实测), 只有 URL 本身一定会被带上。
+async fn source_login_proxy_route(
     state: &AppState,
     path: &str,
     query: &str,
     request: &tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
-    let params: HashMap<String, String> = serde_urlencoded::from_str(query).unwrap_or_default();
-    let Some(login_session) = params.get("loginSession") else {
+    let rest = match path.strip_prefix(SESSION_PATH_PREFIX) {
+        Some(rest) => rest,
+        None => return error_response(400, "invalid login path"),
+    };
+    let (session, upstream_path) = match rest.split_once('/') {
+        Some((session, upstream_path)) => (session, format!("/{upstream_path}")),
+        None => (rest, "/".to_string()),
+    };
+    let login_session = match urlencoding::decode(session) {
+        Ok(value) => value.into_owned(),
+        Err(_) => return error_response(400, "invalid login session"),
+    };
+    if login_session.is_empty() {
         return error_response(403, "loginSession required");
+    }
+    let Some(upstream_origin) = source_login_upstream_origin(state, &login_session).await else {
+        return error_response(403, "invalid or expired loginSession");
     };
-    let Some(upstream_origin) = params.get("__readerUpstreamOrigin") else {
-        return error_response(400, "upstream origin required");
+    let mut target = match Url::parse(&upstream_origin) {
+        Ok(url) => url,
+        Err(_) => return error_response(400, "invalid upstream origin"),
     };
-    let Some(raw_path) = path.strip_prefix("/bookSourceProxyPath") else {
-        return error_response(400, "invalid proxy path");
+    target.set_path(&upstream_path);
+    if !query.is_empty() {
+        target.set_query(Some(query));
+    }
+    book_source_proxy_forward(state, &login_session, &target.to_string(), request).await
+}
+
+/// 按登录会话反查上游 origin。
+async fn source_login_upstream_origin(state: &AppState, login_session: &str) -> Option<String> {
+    state
+        .book_service
+        .source_for_login_session(login_session)
+        .await
+        .and_then(|source_url| Url::parse(&normalize_source_url(&source_url)).ok())
+        .map(|url| url.origin().ascii_serialization())
+}
+
+/// 首次导航用的会话参数名: 兜底路由据此认出「这是登录页」并从 query 取会话。
+const SESSION_QUERY_KEY: &str = "__readerLoginSession";
+
+/// 登录页的兜底代理: 把 reader origin 上「属于某个登录页」的请求转发回上游。
+///
+/// 判定会话的来源, 按可靠性排序:
+/// 1. 首次导航显式带上的 `__readerLoginSession`(此时还没有 cookie);
+/// 2. 登录代理页写下的同源 cookie(子资源请求只能靠它);
+/// 3. 登录页的 `Referer`(兜底)。
+///
+/// 三条都不成立时返回 `None`, 交回 404 —— 否则这个 origin 会变成任意转发器。
+async fn source_login_fallback_route(
+    state: &AppState,
+    path: &str,
+    query: &str,
+    request: &tauri::http::Request<Vec<u8>>,
+) -> Option<tauri::http::Response<Vec<u8>>> {
+    let mut params: HashMap<String, String> =
+        serde_urlencoded::from_str(query).unwrap_or_default();
+    let explicit_session = params.remove(SESSION_QUERY_KEY);
+
+    let (login_session, upstream_origin) = match explicit_session {
+        Some(session) => {
+            let origin = state
+                .book_service
+                .source_for_login_session(&session)
+                .await
+                .and_then(|source_url| Url::parse(&normalize_source_url(&source_url)).ok())
+                .map(|url| url.origin().ascii_serialization())?;
+            (session, origin)
+        }
+        None => match parse_session_cookie(request.headers()) {
+            Some(pair) => pair,
+            None => {
+                let referer = request
+                    .headers()
+                    .get(http::header::REFERER)
+                    .and_then(|value| value.to_str().ok())?;
+                let referer_url = Url::parse(referer).ok()?;
+                if referer_url.origin().ascii_serialization() != reader_scheme_origin() {
+                    return None;
+                }
+                let referer_query: HashMap<String, String> =
+                    serde_urlencoded::from_str(referer_url.query()?).unwrap_or_default();
+                let session = referer_query.get("loginSession")?.clone();
+                let origin = match referer_query.get("__readerUpstreamOrigin") {
+                    Some(origin) => origin.clone(),
+                    None => {
+                        let target = referer_query.get("url")?;
+                        Url::parse(target).ok()?.origin().ascii_serialization()
+                    }
+                };
+                (session, origin)
+            }
+        },
     };
-    let Ok(mut target) = Url::parse(upstream_origin) else {
-        return error_response(400, "invalid upstream origin");
-    };
-    target.set_path(raw_path);
-    if let Some((_, value)) = params.iter().find(|(key, _)| key.as_str() == "__readerUpstreamQuery") {
-        target.set_query(Some(value));
+
+    let mut target = Url::parse(&upstream_origin).ok()?;
+    target.set_path(path);
+    // 剥掉传输参数: 上游页面不该看到它们。
+    if !params.is_empty() {
+        let rebuilt: Vec<(String, String)> = params.into_iter().collect();
+        target.set_query(Some(&serde_urlencoded::to_string(&rebuilt).ok()?));
     }
     let target_url = target.to_string();
+    Some(book_source_proxy_forward(state, &login_session, &target_url, request).await)
+}
 
-    book_source_proxy_forward(state, login_session, &target_url, request).await
+/// 判断响应体是否 JavaScript(打包产物的主脚本/分片)。
+fn is_script_response(content_type: Option<&str>, body: &[u8]) -> bool {
+    let _ = body;
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    let lowered = content_type.to_ascii_lowercase();
+    lowered.contains("javascript") || lowered.contains("ecmascript")
+}
+
+/// 构建脚本响应里的会话路径前缀: `/__login/<session>/`。
+fn script_session_prefix(login_session: &str) -> String {
+    format!("/__login/{}/", urlencoding::encode(login_session))
+}
+/// 给打包产物里**写死的分片前缀**补上会话段。
+///
+/// Vite 把资源基准烘进代码: `Ab=e=>"/user/"+e`(路由 base `/user/`)。分片地址
+/// 因此完全不经过文档基准, 无论 iframe 挂在哪个路径下都会请求 `/user/...` ——
+/// 那里没有会话段, 后端无从判断该转发到哪, 只能 404。
+///
+/// **只**改写「整个字符串就是一个前导斜杠 + 单段 + 尾随斜杠」的字面量
+/// (`"/user/"`)。业务接口地址(`"/site/info"`)必须原样保留: 它们会和 axios 的
+/// baseURL(`/api`)再拼接, 插了会话段就变成上游不存在的
+/// `/api/__login/.../site/info`。
+fn annotate_script_asset_prefix(script: &str, login_session: &str) -> String {
+    if login_session.is_empty() {
+        return script.to_string();
+    }
+    let prefix = script_session_prefix(login_session);
+    // `regex` crate 不支持反向引用, 两种引号各写一条。
+    let pattern = Regex::new(r#""/([A-Za-z0-9_.~%-]+)/""#).expect("valid double-quoted prefix");
+    let script = pattern
+        .replace_all(script, |caps: &Captures| {
+            let segment = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            if segment == "__login" {
+                return caps.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+            }
+            format!("\"{prefix}{segment}/\"")
+        })
+        .into_owned();
+    let pattern = Regex::new(r"'/([A-Za-z0-9_.~%-]+)/'").expect("valid single-quoted prefix");
+    pattern
+        .replace_all(&script, |caps: &Captures| {
+            let segment = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            if segment == "__login" {
+                return caps.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+            }
+            format!("'{prefix}{segment}/'")
+        })
+        .into_owned()
+}
+
+/// 只改写 HTML 标签里的资源属性(`src|href|action="…"`), 保留上游路径并补上会话段。
+///
+/// 页面里写死的绝对路径(`/user/assets/index.js`)不继承文档路径, 不补会话段就
+/// 会落到 reader origin 根下 404。相对路径与协议相对地址保持原样。
+fn rewrite_login_html_resource_attrs(html: &str, login_session: &str) -> String {
+    if login_session.is_empty() {
+        return html.to_string();
+    }
+    let prefix = script_session_prefix(login_session);
+    let pattern = Regex::new(r#"(?i)\b(src|href|action)\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+        .expect("valid resource attribute regex");
+    pattern
+        .replace_all(html, |caps: &Captures| {
+            let whole = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+            let attr = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            let double = caps.get(2);
+            let value = double
+                .or_else(|| caps.get(3))
+                .map(|m| m.as_str())
+                .unwrap_or_default();
+            let quote = if double.is_some() { '"' } else { '\'' };
+            if !value.starts_with('/')
+                || value.starts_with("//")
+                || value.starts_with(SESSION_PATH_PREFIX)
+            {
+                return whole.to_string();
+            }
+            let trimmed = value.trim_start_matches('/');
+            if trimmed.is_empty() {
+                return whole.to_string();
+            }
+            format!("{attr}={quote}{prefix}{trimmed}{quote}")
+        })
+        .into_owned()
+}
+
+
+/// 从请求头里取 `reader_login_session` cookie, 解出 `(loginSession, 上游origin)`。
+fn parse_session_cookie(headers: &http::HeaderMap) -> Option<(String, String)> {
+    let raw = headers
+        .get(http::header::COOKIE)
+        .and_then(|value| value.to_str().ok())?;
+    for part in raw.split(';') {
+        let part = part.trim();
+        let Some(value) = part.strip_prefix("reader_login_session=") else {
+            continue;
+        };
+        let decoded = urlencoding::decode(value).ok()?;
+        let (session, origin) = decoded.split_once('|')?;
+        if session.is_empty() || origin.is_empty() {
+            return None;
+        }
+        return Some((session.to_string(), origin.to_string()));
+    }
+    None
 }
 
 // ─────────────────────────── 书源面板 (showBrowser) ───────────────────────────
@@ -399,12 +600,79 @@ async fn fetch_source_panel_page(
     target: Option<&str>, request: &tauri::http::Request<Vec<u8>>,
 ) -> Result<tauri::http::Response<Vec<u8>>, AppError> {
     let target = resolve_proxy_target_url(target.unwrap_or(&entry.url), &entry.url)?;
+
+    // RSS / 单 URL 订阅源的面板没有归属书源(`book_source_url` 为空), 因此不能走
+    // 下面那条「查书源 → 用书源规则」的路径。它对应手机端 `ReadRssActivity` 的
+    // 那个 WebView: `handleCommonSchemes` 对 http/https 返回 false, 也就是
+    // 「在原地打开」, 不限制域名。源仓库的二级页面正是跨域跳转
+    // (yckceo.vip → yckceo.com / yck2026.fun), 若沿用书源的同域校验只会得到
+    // 「panel target is outside the page domain」。
+    if entry.book_source_url.is_empty() {
+        return fetch_rss_panel_page(panel_id, entry, &target, request).await;
+    }
+
+    // 书源面板保持严格同域: 它带着书源的 cookie 与登录态, 放宽等于把登录凭证
+    // 交给任意目标域。
     if !proxy_target_matches_source(&target, &entry.url) {
         return Ok(text_response(403, "panel target is outside the page domain"));
     }
     let source = state.book_source_service.get("default", &entry.book_source_url).await?
         .ok_or_else(|| AppError::NotFound("bookSource not found".into()))?;
     fetch_source_panel_response(&source, panel_id, entry, &target, request).await
+}
+
+/// RSS 面板的二级页抓取: 不依赖书源, 用面板自身的 http 上下文(源级 cookie jar
+/// 与代理), 并保留内网地址拦截 —— 面板 HTML 托管在 `reader` origin, 桥能触达
+/// 宿主网络, 而 RSS 源可从远程 JSON 导入(不受信任)。
+async fn fetch_rss_panel_page(
+    panel_id: &str,
+    entry: &crate::service::book_service::SourcePanelEntry,
+    target: &str,
+    request: &tauri::http::Request<Vec<u8>>,
+) -> Result<tauri::http::Response<Vec<u8>>, AppError> {
+    crate::api::commands::rss::reject_non_public_target(target)?;
+    let context = match entry.http.clone() {
+        Some(context) => context,
+        None => crate::parser::js::source_http_context(&entry.url)
+            .map_err(AppError::Internal)?,
+    };
+    let client = context.client.clone();
+    let method = request.method().clone();
+    let mut forwarded = http::HeaderMap::new();
+    if let Some(content_type) = request.headers().get(http::header::CONTENT_TYPE) {
+        forwarded.insert(http::header::CONTENT_TYPE, content_type.clone());
+    }
+    let mut builder = client.request(method, target).headers(forwarded);
+    if !request.body().is_empty() {
+        builder = builder.body(request.body().clone());
+    }
+    let response = builder.send().await.map_err(AppError::Http)?;
+    let status = response.status();
+    let final_url = response.url().to_string();
+    let content_type = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = response.bytes().await.map_err(AppError::Http)?;
+    let is_html = is_html_response(Some(&content_type), &bytes);
+    let body = if is_html {
+        let html = crate::crawler::fetcher::decode_body(&bytes, None, Some(&content_type));
+        // 跨域放行: 这类页面会跳到任意同族/合作域名。
+        let html = rewrite_source_panel_html(&html, &final_url, &entry.url, panel_id);
+        render_source_panel_page(panel_id, entry, &final_url, &html).into_bytes()
+    } else {
+        bytes.to_vec()
+    };
+    let built = http::Response::builder()
+        .status(status.as_u16())
+        .header(
+            http::header::CONTENT_TYPE,
+            if is_html { "text/html; charset=utf-8" } else { &content_type },
+        )
+        .header(http::header::CACHE_CONTROL, "no-store");
+    Ok(built.body(body).unwrap_or_default())
 }
 
 async fn fetch_source_panel_response(
@@ -471,7 +739,28 @@ async fn fetch_source_panel_response(
     Ok(built.body(body).unwrap_or_default())
 }
 
-fn rewrite_source_panel_html(html: &str, page_url: &str, allowed_url: &str, panel_id: &str) -> String {
+/// 把上游 HTML 里的资源/链接改写成经本应用代理的地址。
+///
+/// 只改写**同域**目标。跨域资源(第三方 CDN 的 css/js/图片、广告统计等)保持原样,
+/// 由 WebView 直接去取 —— 这是刻意的:
+///
+///   1. 每个改写过的地址都会变成一次 `/sourcePanel` 宿主请求, 而宿主请求是
+///      **串行经过本进程**的(reqwest → 上游 → 回写)。页面引用几十个跨域资源时,
+///      就是几十个并发任务, 每个都要占住连接的 15s 超时才释放; WebView2 对同一
+///      host 的并发连接数又有上限(通常 6), 于是请求互相排队直到超时。
+///   2. 跨域页面往往引用大量第三方资源, 其中不少在直连网络下根本连不通。
+///      一旦把它们全部收进代理, 主文档加载会被这些挂起的子资源拖住。
+///
+/// 实测: 放开跨域改写后打开源仓库二级页, 系统出现大量挂起连接, 资源管理器
+/// (explorer.exe) 被拖到重启。因此这里保持「只代理同域」的保守做法; 跨域二级页
+/// 本身仍由 `fetch_rss_panel_page` 直接抓取并托管(不受同域限制), 只是它引用的
+/// 外域资源不再经过我们中转。
+fn rewrite_source_panel_html(
+    html: &str,
+    page_url: &str,
+    allowed_url: &str,
+    panel_id: &str,
+) -> String {
     let tags = Regex::new(r"(?is)<(?:script|link|img|iframe|source|video|audio|form|a)\b[^>]*>").unwrap();
     let attrs = Regex::new(r#"(?i)\b(src|href|action)\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap();
     tags.replace_all(html, |tag: &Captures| {
@@ -479,7 +768,13 @@ fn rewrite_source_panel_html(html: &str, page_url: &str, allowed_url: &str, pane
             let raw = attr.get(2).or_else(|| attr.get(3)).map(|v| v.as_str()).unwrap_or_default();
             if raw.starts_with('#') || raw.is_empty() { return attr[0].to_string(); }
             let target = crate::crawler::url_analyzer::absolute_url(page_url, &raw.replace("&amp;", "&"));
-            if !proxy_target_matches_source(&target, allowed_url) { return attr[0].to_string(); }
+            // 跨域面板也按「本次页面所在域」判定, 而不是按订阅源初始地址 ——
+            // 否则跨域二级页连自己的资源都会被判成外站。
+            if !proxy_target_matches_source(&target, page_url)
+                && !proxy_target_matches_source(&target, allowed_url)
+            {
+                return attr[0].to_string();
+            }
             format!("{}=\"{}/sourcePanel?__readerPanelId={}&amp;__readerPanelUrl={}\"", &attr[1], reader_scheme_origin(), urlencoding::encode(panel_id), urlencoding::encode(&target))
         }).into_owned()
     }).into_owned()
@@ -712,6 +1007,33 @@ async fn local_pdf_cover_route(
     }
 }
 
+/// 本地 PDF 原始文件: `/pdf?bookUrl=local-pdf:<hash>`。
+///
+/// 前端 pdf.js 整本取走自己渲染 (与 Legado 的 PdfRenderer 同一分工: 后端只
+/// 管文件, 页面光栅化在前端)。bookUrl 在 service 侧校验 32 位 hex, 无路径穿越面。
+async fn pdf_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
+    let params: HashMap<String, String> =
+        serde_urlencoded::from_str(query).unwrap_or_default();
+    let book_url = params.get("bookUrl").map(String::as_str).unwrap_or_default();
+    if book_url.is_empty() {
+        return http::Response::builder()
+            .status(404)
+            .body(Vec::new())
+            .unwrap_or_default();
+    }
+    match state
+        .local_pdf_book_service
+        .read_pdf_file("default", book_url)
+        .await
+    {
+        Ok(bytes) => bytes_response(bytes, "application/pdf", Some("private, max-age=3600")),
+        Err(_) => http::Response::builder()
+            .status(404)
+            .body(Vec::new())
+            .unwrap_or_default(),
+    }
+}
+
 async fn epub_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
     let params: HashMap<String, String> =
         serde_urlencoded::from_str(query).unwrap_or_default();
@@ -833,7 +1155,8 @@ async fn book_source_proxy_route(
     book_source_proxy_forward(state, &login_session, &raw_target_url, request).await
 }
 
-/// 会话校验 + 同源校验 + 实际转发。两种代理入口(查询串式 / 路径式)共用。
+/// 会话校验 + 同源校验 + 实际转发。两种登录代理入口共用:
+/// 查询串式(`/bookSourceProxy?url=…`)与兜底路由(按上游原始路径转发)。
 async fn book_source_proxy_forward(
     state: &AppState,
     login_session: &str,
@@ -841,6 +1164,7 @@ async fn book_source_proxy_forward(
     request: &tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
     let user_ns = "default";
+
     let Some(source_url) = state
         .book_service
         .source_for_login_session(login_session)
@@ -1108,18 +1432,18 @@ async fn forward_book_source_request(
     }
 
     let body = if html_response {
-        // 登录 iframe 运行在 reader.localhost 下；只注入请求代理脚本。
-        // Cookie 始终留在后端按书源隔离的客户端中，不写入浏览器 origin。
+        // 登录 iframe 跑在 `/__login/<session>/` 路径空间下(见前端 frameUrl),
+        // 会话因此随每个子资源请求一起到达 —— WebView2 对自定义协议的子资源
+        // 既不附 Cookie 也不附 Referer(实测), 只有 URL 一定会被带上。
+        //
+        // 上游路径必须完整保留: 打包产出的单页应用把路径写死进代码(Vue Router
+        // 的 base `/user/`、分片 `"/user/" + chunk`), 路径一旦对不上就全部 404,
+        // 应用永远挂载不起来 —— 纯白页。
         let text = crate::crawler::fetcher::decode_body(&bytes, None, content_type.as_deref());
-        // 代理页的文档地址位于 reader.localhost，浏览器不会再按上游站点
-        // 解析相对的 script/link/img/form 地址；先把同站静态资源改写回
-        // bookSourceProxy，避免登录页出现无样式、无脚本或提交地址失效。
-        let text = rewrite_login_html(
-            &text,
-            &final_url,
-            &source.book_source_url,
-            login_session,
-        );
+        // 只改写 HTML 标签里的**绝对路径属性**(`src="/user/assets/x.js"`)。
+        // 不能改脚本字符串: 运行时拼接的地址(`Pe("/site/info")` 配 axios 的
+        // baseURL `/api`)会被插坏, 变成 `/api/__login/.../site/info`。
+        let text = rewrite_login_html_resource_attrs(&text, login_session);
         let harvest = build_cookie_harvest_script(&source.book_source_url, login_session);
         let injected = if text.contains("</head>") {
             text.replace("</head>", &format!("{harvest}</head>"))
@@ -1129,6 +1453,12 @@ async fn forward_book_source_request(
             format!("{harvest}{text}")
         };
         injected.into_bytes()
+    } else if is_script_response(content_type.as_deref(), &bytes) {
+        // 打包产物里的资源基准(`Ab=e=>"/user/"+e`)是**字符串拼接**出来的分片
+        // 前缀, 不经过文档基准。只改这种"整段等于 `/字面量/`"的形态, 不动
+        // `"/site/info"` 这类业务接口地址(它们会与 baseURL 再拼接)。
+        let text = crate::crawler::fetcher::decode_body(&bytes, None, content_type.as_deref());
+        annotate_script_asset_prefix(&text, login_session).into_bytes()
     } else {
         bytes.to_vec()
     };
@@ -1138,140 +1468,6 @@ async fn forward_book_source_request(
         .unwrap_or_else(|_| http::Response::new(Vec::new())))
 }
 
-fn rewrite_login_html(
-    html: &str,
-    upstream_url: &str,
-    book_source_url: &str,
-    login_session: &str,
-) -> String {
-    let tag_re = Regex::new(
-        r#"(?is)<(script|link|img|iframe|frame|source|video|audio|form)\b[^>]*>"#,
-    )
-    .expect("valid login resource tag regex");
-    let double_attr = Regex::new(r#"(?i)\b(src|href|action)\s*=\s*"([^"]*)""#)
-        .expect("valid login double attribute regex");
-    let single_attr = Regex::new(r#"(?i)\b(src|href|action)\s*=\s*'([^']*)'"#)
-        .expect("valid login single attribute regex");
-
-    tag_re
-        .replace_all(html, |tag_caps: &Captures| {
-            let tag = tag_caps.get(0).map(|m| m.as_str()).unwrap_or_default();
-            let output = double_attr.replace_all(tag, |attr_caps: &Captures| {
-                rewrite_login_html_attr(
-                    attr_caps,
-                    upstream_url,
-                    book_source_url,
-                    login_session,
-                    '"',
-                )
-            });
-            single_attr
-                .replace_all(&output, |attr_caps: &Captures| {
-                    rewrite_login_html_attr(
-                        attr_caps,
-                        upstream_url,
-                        book_source_url,
-                        login_session,
-                        '\'',
-                    )
-                })
-                .into_owned()
-        })
-        .into_owned()
-}
-
-fn rewrite_login_html_attr(
-    captures: &Captures,
-    upstream_url: &str,
-    book_source_url: &str,
-    login_session: &str,
-    quote: char,
-) -> String {
-    let attribute = captures.get(1).map(|m| m.as_str()).unwrap_or("src");
-    let value = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-    // 优先用**路径式**代理: 保留上游路径, 让单页应用模块内的相对 import 解析
-    // 正确(见 `build_login_proxy_path_url`)。路径不是绝对路径形态(如 `about:`
-    // 之类)时退回查询串式。
-    let rewritten = build_login_proxy_path_url(value, upstream_url, book_source_url, login_session)
-        .or_else(|| build_login_proxy_url(value, upstream_url, book_source_url, login_session))
-        .unwrap_or_else(|| value.to_string());
-    format!("{}={}{}{}", attribute, quote, rewritten, quote)
-}
-
-fn build_login_proxy_url(
-    raw_value: &str,
-    upstream_url: &str,
-    book_source_url: &str,
-    login_session: &str,
-) -> Option<String> {
-    let value = raw_value.trim();
-    if value.is_empty()
-        || value.starts_with('#')
-        || value.starts_with("javascript:")
-        || value.starts_with("data:")
-        || value.starts_with("mailto:")
-        || value.starts_with("tel:")
-        || value.starts_with("/bookSourceProxy?")
-    {
-        return None;
-    }
-
-    let absolute = Url::parse(value)
-        .or_else(|_| Url::parse(upstream_url).and_then(|base| base.join(value)))
-        .ok()?;
-    if !proxy_target_matches_source(absolute.as_str(), book_source_url) {
-        // CDN、验证码等第三方资源保持直连；代理只负责同一书源域名，
-        // 避免把受限的第三方请求改写成必然返回 403 的代理请求。
-        return None;
-    }
-    Some(format!(
-        "/bookSourceProxy?loginSession={}&url={}",
-        urlencoding::encode(login_session),
-        urlencoding::encode(absolute.as_str())
-    ))
-}
-
-/// 把同站资源改写为**路径式**代理地址, 保留上游路径。
-///
-/// 单页应用的主脚本会按自身 URL 解析相对 `import('assets/Home-xxx.js')`; 若主
-/// 脚本被改写成 `/bookSourceProxy?url=…`(路径恒为 `/bookSourceProxy`), 懒加载
-/// 分片就会落到 `reader.localhost` 根目录下 404, 页面永远白屏。路径式代理让
-/// 上游路径原样出现在代理 URL 上, 相对解析因此重新正确。
-fn build_login_proxy_path_url(
-    raw_value: &str,
-    upstream_url: &str,
-    book_source_url: &str,
-    login_session: &str,
-) -> Option<String> {
-    let value = raw_value.trim();
-    if value.is_empty()
-        || value.starts_with('#')
-        || value.starts_with("javascript:")
-        || value.starts_with("data:")
-        || value.starts_with("mailto:")
-        || value.starts_with("tel:")
-        || value.starts_with("/bookSourceProxy")
-    {
-        return None;
-    }
-    let absolute = Url::parse(value)
-        .or_else(|_| Url::parse(upstream_url).and_then(|base| base.join(value)))
-        .ok()?;
-    if !proxy_target_matches_source(absolute.as_str(), book_source_url) {
-        return None;
-    }
-    let mut proxy = format!(
-        "/bookSourceProxyPath{}?loginSession={}&__readerUpstreamOrigin={}",
-        absolute.path(),
-        urlencoding::encode(login_session),
-        urlencoding::encode(&absolute.origin().ascii_serialization())
-    );
-    if let Some(query) = absolute.query() {
-        proxy.push_str("&__readerUpstreamQuery=");
-        proxy.push_str(&urlencoding::encode(query));
-    }
-    Some(proxy)
-}
 
 // Source settings override the embedded browser's defaults. HeaderMap::insert
 // replaces case-insensitive matches so Referer/User-Agent are sent exactly once.
@@ -1400,8 +1596,12 @@ fn is_html_response(content_type: Option<&str>, body: &[u8]) -> bool {
 /// 是异步的, 因此这里把 bridge 请求发到同源的 `/sourcePanelBridge`, 用同步
 /// `XMLHttpRequest` 取回结果 —— 与 legado 的同步 Java 桥语义一致。
 ///
-/// `external_links`: 面板内的二级链接是否交给系统浏览器打开(RSS 单 URL 源需要,
-/// 见 `SourcePanelEntry::external_links`)。
+/// `external_links`: 面板内的二级链接是否交给系统浏览器打开(见
+/// `SourcePanelEntry::external_links`)。
+///
+/// 注意: 二级链接现在**统一**留在面板内经代理导航(见 click 兜底那段注释),
+/// 这个标志暂时没有消费方, 保留是为了让 `SourcePanelEntry` 的既有语义与
+/// 备份/调用方不受影响, 也便于将来按需恢复「RSS 外链走系统浏览器」。
 fn build_source_panel_bridge_script(panel_id: &str, external_links: bool) -> String {
     let panel_id_json = script_string(panel_id);
     let external_links_json = if external_links { "true" } else { "false" };
@@ -1409,7 +1609,7 @@ fn build_source_panel_bridge_script(panel_id: &str, external_links: bool) -> Str
         r#"<script>
 (function () {{
   var panelId = {panel_id_json};
-  // 二级链接是否交给系统浏览器: 见 SourcePanelEntry::external_links 的说明。
+  // 见 Rust 侧 build_source_panel_bridge_script 的说明: 当前仅为兼容保留。
   var externalLinks = {external_links_json};
   var bridgeBase = new URL("/sourcePanelBridge?panelId=" + encodeURIComponent(panelId), window.location.href).href;
   var nativeFetch = window.fetch.bind(window);
@@ -1552,6 +1752,22 @@ fn build_source_panel_bridge_script(panel_id: &str, external_links: bool) -> Str
       postToHost({{ type: "navigationCancelled" }});
     }}, {{ once: true }});
   }}
+  // 书源仓库的导入协议: legado://import/[path]?src=[json] 与
+  // yuedu://booksource/importonline?src=[json](手机端 Legado 的
+  // OnLineImportActivity / 源仓库页面用的都是这两个)。
+  // 返回规范化后的 href, 非导入协议返回空串。
+  function importProtocolUrl(raw) {{
+    try {{
+      var url = new URL(raw, pageUrl || window.location.href);
+      if (!/^(legado|yuedu):$/i.test(url.protocol)) return "";
+      return url.href;
+    }} catch (error) {{
+      return "";
+    }}
+  }}
+  function requestImport(href) {{
+    postToHost({{ type: "importProtocol", url: href }});
+  }}
   function submitToProxy(event, url) {{
     var source = event.sourceElement;
     var original = source && (source.form || (source.tagName === "FORM" ? source : null));
@@ -1602,22 +1818,25 @@ fn build_source_panel_bridge_script(panel_id: &str, external_links: bool) -> Str
         startNavigation(event);
         return;
       }}
-      if (!/^https?:$/.test(target.protocol)) return;
-      // RSS 单 URL 源: 首屏 HTML 是我们托管到 reader origin 的, 但页面里的链接
-      // 指向上游站点。在 iframe 内导航过去会被上游的 X-Frame-Options / CSP
-      // frame-ancestors 拒绝渲染 —— 表现为白屏。这类面板把二级链接交给系统浏览器。
-      //
-      // 只拦截"离开当前托管页"的跳转; 面板自身 URL(上面的 isPanelUrl 分支)与
-      // 同文档锚点不受影响。表单提交(GET/POST)也一并交出去, 否则同样白屏。
-      if (externalLinks) {{
+      // 书源仓库的「一键导入」链接: legado://import/...?src= 与
+      // yuedu://booksource/importonline?src=。这类协议系统浏览器不认识,
+      // 交出去就是静默失败, 必须在面板里截下并转给宿主导入。
+      var importTargetUrl = importProtocolUrl(destination.href) || importProtocolUrl(event.destination.url);
+      if (importTargetUrl) {{
         event.preventDefault();
-        try {{
-          window.open(target.href, "_blank", "noopener");
-        }} catch (error) {{
-          window.location.href = target.href;
-        }}
+        requestImport(importTargetUrl);
         return;
       }}
+      if (!/^https?:$/.test(target.protocol)) return;
+      // 二级页面统一留在面板内。
+      //
+      // 早先这里把 RSS 面板的二级链接交给系统浏览器, 理由是上游的
+      // X-Frame-Options / CSP frame-ancestors 会让 iframe 拒绝渲染(白屏)。
+      // 但那个理由只在**直接内嵌上游地址**时成立: 现在跳转走 `proxyUrl`,
+      // 由后端把页面抓回来重写后托管在 reader origin 上, 而代理只透传
+      // Content-Type / Cache-Control / Set-Cookie, 不会转发这些限制头,
+      // 所以经代理渲染不会白屏。改成留在面板内之后, 用户在源仓库里点进去
+      // 的详情/列表页不再跳出应用。
       if (!event.cancelable) {{
         startNavigation(event);
         return;
@@ -1645,37 +1864,56 @@ fn build_source_panel_bridge_script(panel_id: &str, external_links: bool) -> Str
   // invalidates readiness when the frame leaves and verifies the next document.
   window.addEventListener("beforeunload", function () {{ if (!navigating) startNavigation(); }});
 
-  // RSS 单 URL 源的二级链接兜底: `window.navigation` 不可用时(老 WebView)上面的
-  // navigate 拦截不会触发, 只能靠捕获阶段的 click 拦下 <a> 跳转。
-  // 用事件委托而不是改写 href: 页面可能动态插入链接(JS 渲染的列表)。
-  if (externalLinks) {{
-    document.addEventListener("click", function (event) {{
-      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-      var anchor = event.target && event.target.closest ? event.target.closest("a[href]") : null;
-      if (!anchor || anchor.hasAttribute("download")) return;
-      var target = (anchor.getAttribute("target") || "").toLowerCase();
-      if (target === "_blank") return; // 交给浏览器/系统处理
-      var raw = anchor.getAttribute("href") || "";
-      // 这里用单引号比较: 双引号加井号的字面量会提前终止外层的原始字符串。
-      if (!raw || raw.charAt(0) === '#') return;
-      if (/^(mailto|tel|javascript):/i.test(raw)) return;
-      var url;
-      try {{ url = realUrl(raw); }} catch (error) {{ return; }}
-      if (!/^https?:$/.test(url.protocol)) return;
-      // 面板自身 URL(同文档跳转/桥导航)不拦截, 保持原有行为。
-      if (isPanelUrl(url)) return;
-      if (pageUrl) {{
-        var current = new URL(pageUrl);
-        if (current.origin === url.origin && current.pathname === url.pathname && current.search === url.search) return;
-      }}
+  // click 兜底: `window.navigation` 不可用时(老 WebView)上面的 navigate 拦截
+  // 不会触发, 只能靠捕获阶段的 click 拦下 <a> 跳转。用事件委托而不是改写
+  // href: 页面可能动态插入链接(JS 渲染的列表)。
+  //
+  // 两种面板合并成同一段逻辑(此前 RSS 与书源各写了一份, 行为还不一致):
+  //   - `legado://` / `yuedu://` 导入协议 → 交给宿主导入;
+  //   - http(s) 链接 → 一律改走代理, 留在面板内打开。
+  //
+  // RSS 面板早先把链接交给系统浏览器, 理由是上游 X-Frame-Options 会让 iframe
+  // 白屏; 但那只是**直接内嵌上游地址**时的问题, 走 `proxyUrl` 后页面由后端
+  // 抓取重写再托管, 代理不透传这些限制头, 因此不会白屏。
+  document.addEventListener("click", function (event) {{
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    var anchor = event.target && event.target.closest ? event.target.closest("a[href]") : null;
+    if (!anchor || anchor.hasAttribute("download")) return;
+    var raw = anchor.getAttribute("href") || "";
+    // 这里用单引号比较: 双引号加井号的字面量会提前终止外层的原始字符串。
+    if (!raw || raw.charAt(0) === '#') return;
+    if (/^(mailto|tel|javascript):/i.test(raw)) return;
+    // 书源仓库的「一键导入」是自定义协议。系统浏览器不认识它们, 交出去只会
+    // 静默失败, 必须在面板里截下并转给宿主。
+    var importTarget = importProtocolUrl(raw);
+    if (importTarget) {{
       event.preventDefault();
-      try {{
-        window.open(url.href, "_blank", "noopener");
-      }} catch (error) {{
-        window.location.href = url.href;
-      }}
-    }}, true);
-  }}
+      requestImport(importTarget);
+      return;
+    }}
+    var url;
+    try {{ url = realUrl(raw); }} catch (error) {{ return; }}
+    if (!/^https?:$/.test(url.protocol)) return;
+    // 面板自身 URL(同文档跳转/桥导航)不拦截, 保持原有行为。
+    if (isPanelUrl(url)) return;
+    if (pageUrl) {{
+      var current = new URL(pageUrl);
+      if (current.origin === url.origin && current.pathname === url.pathname && current.search === url.search) return;
+    }}
+    // 现代 WebView 的 `window.navigation` 已经处理过这次跳转; 这里再拦一次
+    // 会重复导航。只接管它没管的 `target="_blank"` 与老 WebView 的普通点击。
+    if (window.navigation && typeof window.navigation.addEventListener === "function") {{
+      var anchorTarget = (anchor.getAttribute("target") || "").toLowerCase();
+      if (anchorTarget !== "_blank") return;
+    }}
+    event.preventDefault();
+    try {{
+      // 留在面板内跳转: iframe 的 src 变成代理地址, 页面由后端重写后渲染。
+      window.location.assign(proxyUrl(url));
+    }} catch (error) {{
+      postToHost({{ type: "navigationError", message: "网页跳转失败，请重新加载后重试：" + String(error) }});
+    }}
+  }}, true);
   ["pushState", "replaceState"].forEach(function (method) {{
     var native = window.history[method];
     window.history[method] = function (state, title, url) {{
@@ -1953,133 +2191,43 @@ window.addEventListener("message", function (event) {{
 fn build_cookie_harvest_script(book_source_url: &str, login_session: &str) -> String {
     let login_session_json =
         serde_json::to_string(login_session).unwrap_or_else(|_| "\"\"".to_string());
-    // 从书源 URL 提取二级域(如 example.com), 作为「同站请求」判断依据:
-    // 登录 iframe 内指向该域(及其子域)的 fetch/XHR 请求一律走代理转发,
-    // 以便登录响应里的 Set-Cookie 被代理重写落到本 iframe 文档域被采集。
-    // 第三方域(CDN/统计/广告)的请求不走代理, 避免无谓转发与跨域破坏。
-    let book_domain = extract_registrable_domain(book_source_url);
-    let book_domain_json = serde_json::to_string(&book_domain).unwrap_or_else(|_| "\"\"".to_string());
+    // 登录页跑在 reader origin 的**上游原始路径**上(见前端 frameUrl), 页面发出的
+    // 每个请求天然带着正确路径, 由兜底路由统一转发回上游。
+    //
+    // 因此这里**不再改写** fetch/XHR/资源地址: 一旦改写成 `/bookSourceProxy?...`,
+    // 打包产物的绝对路径(路由 base `/user/`、分片 `"/user/"+chunk`)就会全部 404,
+    // 单页应用永远挂载不起来 —— 那正是登录页长期白屏的根因。保持地址原样才能
+    // 复刻 legado 在手机端直接 `loadUrl` 的行为。
+    //
+    // 本脚本只负责把 document.cookie 的变化同步给宿主(部分站点把凭据写在脚本
+    // 可读的 cookie 里), 供上层尝试采集。
+    let _ = book_source_url;
     format!(
         r#"<script>
 (function() {{
   var loginSession = {login_session_json};
-  // 登录目标站点的二级域(如 "example.com")。留空时退化为「代理所有非第三方请求」。
-  var siteDomain = {book_domain_json};
-  // 必须是**绝对**地址: 代理页的文档地址形如
-  // `http://reader.localhost/bookSourceProxy?...&url=https%3A%2F%2Fhost%2Fuser%2Fme`,
-  // 相对路径 "bookSourceProxy" 会被浏览器按文档 URL 解析成
-  // `/user/bookSourceProxy?...` —— 于是每个同站请求都打到上游站点的
-  // 不存在的路径上, 表现为登录页加载即 404、登录接口全部失败。
-  // 运行时再取一次 location.origin 兜底: WebView 后端不同, reader origin 的
-  // 形态也不同(http://reader.localhost 与 reader://localhost)。
-  var readerOrigin = (function () {{
-    try {{ return window.location.origin; }} catch (_e) {{ return ""; }}
-  }})();
-  var proxyPath = (readerOrigin ? readerOrigin : "{reader_origin}") + "/bookSourceProxy";
-  var skip = /^(#|javascript:|data:|mailto:|tel:)/i;
-  function toProxy(url) {{
-    if (!url || skip.test(url)) return url;
-    var params = new URLSearchParams();
-    params.set("loginSession", loginSession);
-    params.set("url", url);
-    return proxyPath + "?" + params.toString();
-  }}
-  // 资源类请求(脚本/样式/图片/字体/动态 import)优先走**路径式**代理: 代理 URL
-  // 保留上游路径, 单页应用模块内的相对说明符才能正确解析。接口请求(fetch/XHR)
-  // 沿用扁平查询串, 避免把业务 query 混进代理路径。
-  var ASSET_RE = /\\.(?:m?js|css|map|json|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|otf|eot|wasm)(?:$|[?#])/i;
-  function toProxyAsset(url) {{
-    if (!url || skip.test(url)) return url;
+  function report() {{
     try {{
-      var u = new URL(url, location.href);
-      if (!ASSET_RE.test(u.pathname)) return toProxy(url);
-      // 上游 origin 由宿主注入: 代理路径只承载 path, 主机在转发时拼回。
-      var origin = u.origin;
-      var base = (readerOrigin ? readerOrigin : "{reader_origin}") + "/bookSourceProxyPath" + u.pathname;
-      var p = new URLSearchParams();
-      p.set("loginSession", loginSession);
-      p.set("__readerUpstreamOrigin", origin);
-      if (u.search) p.set("__readerUpstreamQuery", u.search.slice(1));
-      return base + "?" + p.toString();
-    }} catch (_e) {{
-      return toProxy(url);
-    }}
-  }}
-  // 判断一个 URL 是否属于登录站点(应走代理转发以捕获 Set-Cookie):
-  // - 相对路径 → 同站, 走代理
-  // - 绝对 URL host === siteDomain 或以 .siteDomain 结尾 → 同站, 走代理
-  // - 绝对 URL 但 host 不同 → 第三方(CDN/统计/OAuth 弹窗等), 直连不走代理
-  function shouldProxy(rawUrl) {{
-    if (!rawUrl || skip.test(rawUrl)) return false;
-    // 相对路径(/api/login、api/x、./x、../x)与无协议(//host/path)中的相对部分
-    if (/^(?:\.?\/|(?![a-z]+:))/i.test(rawUrl)) return true;
-    try {{
-      var u = new URL(rawUrl, location.href);
-      if (!siteDomain) return false; // 无法判定站点域时不拦第三方
-      var h = u.hostname.toLowerCase();
-      return h === siteDomain || h.endsWith("." + siteDomain);
-    }} catch (_e) {{
-      return false;
-    }}
-  }}
-  // fetch / XHR hook: 同站请求一律走代理, 以便登录接口的 Set-Cookie
-  // 被代理重写落到本 iframe 文档域。不再只匹配 passport|login 等关键字,
-  // 这样小网站的 /api/auth、/user/doLogin、/token 等登录接口也能被捕获。
-  var rawFetch = window.fetch ? window.fetch.bind(window) : null;
-  if (rawFetch) {{
-    window.fetch = function(input, init) {{
-      try {{
-        // input 是 Request 对象时, 必须保留其 method/headers/body,
-        // 否则登录提交(POST + form body)会退化成 GET, 登录直接失败。
-        if (input instanceof Request) {{
-          if (shouldProxy(input.url)) {{
-            // 用 Request 构造器复制原请求, 由浏览器正确保留 body 流;
-            // 不能把 Request 对象本身赋给 init.body, 那不是合法的 BodyInit。
-            var proxied = new Request(toProxy(input.url), input);
-            var opts = Object.assign({{}}, init || {{}}, {{credentials: "include"}});
-            return rawFetch(proxied, opts);
-          }}
-          return rawFetch(input, init);
-        }}
-        var url = String(input);
-        if (shouldProxy(url)) {{
-          var opts = init || {{}};
-          return rawFetch(toProxy(url), Object.assign({{}}, opts, {{credentials: "include"}}));
-        }}
-        return rawFetch(input, init);
-      }} catch (_e) {{ return rawFetch(input, init); }}
-    }};
-  }}
-  var rawXhrOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(method, url) {{
-    try {{
-      if (shouldProxy(String(url))) {{
-        arguments[1] = toProxy(String(url));
-        this.withCredentials = true;
+      if (window.parent && window.parent !== window) {{
+        window.parent.postMessage(
+          {{ type: "reader:loginCookies", loginSession: loginSession, cookie: String(document.cookie || "") }},
+          "*"
+        );
       }}
     }} catch (_e) {{}}
-    return rawXhrOpen.apply(this, arguments);
-  }};
+  }}
+  report();
+  document.addEventListener("visibilitychange", function () {{
+    if (document.visibilityState === "hidden") report();
+  }});
+  window.addEventListener("pagehide", report);
 }})();
 </script>
 "#,
-        reader_origin = reader_scheme_origin(),
+        login_session_json = login_session_json,
     )
 }
 
-/// 从书源 URL 提取二级域(如 https://www.example.com → example.com),
-/// 供采集脚本判断「同站请求」。无法解析时返回空串, 此时 hook 只代理相对路径请求。
-fn extract_registrable_domain(source_url: &str) -> String {
-    let parsed = match Url::parse(source_url) {
-        Ok(u) => u,
-        Err(_) => return String::new(),
-    };
-    let host = match parsed.host_str() {
-        Some(h) => h,
-        None => return String::new(),
-    };
-    registrable_domain_from_host(host)
-}
 
 /// 从主机名取可注册域(registrable domain), 用于判断两个主机是否属同一站点。
 ///
@@ -2493,25 +2641,6 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn extract_registrable_domain_strips_subdomains() {
-        assert_eq!(
-            extract_registrable_domain("https://www.example.com"),
-            "example.com"
-        );
-        assert_eq!(
-            extract_registrable_domain("https://passport.example.com/login"),
-            "example.com"
-        );
-        assert_eq!(
-            extract_registrable_domain("http://m.example.org/book/1"),
-            "example.org"
-        );
-        // 单段 host(localhost 等)原样返回
-        assert_eq!(extract_registrable_domain("http://localhost:8080"), "localhost");
-        // 无法解析 → 空串
-        assert_eq!(extract_registrable_domain("not a url"), "");
-    }
 
     #[test]
     fn registrable_domain_covers_common_multi_label_suffixes() {
@@ -2777,147 +2906,101 @@ mod tests {
         eprintln!("production login proxy: HTTP 200, form present, {} same-site resources fetched", resources.len());
     }
 
+    /// 业务接口地址**不能**被插进会话段。
+    ///
+    /// 打包产物里 `Pe("/site/info")` 会和 axios 的 baseURL(`/api`)再拼接。
+    /// 若把这类字面量也改写成 `/__login/<s>/site/info`, 最终会请求
+    /// `/api/__login/<s>/site/info` —— 上游根本没有这个地址, 表现为登录页
+    /// 能挂载但数据全空。
     #[test]
-    fn harvest_script_proxies_same_site_and_relative_urls_only() {
-        // 采集脚本应代理同站请求(含相对路径), 放行第三方域:
-        // 验证注入到脚本的 siteDomain 与判断逻辑产物符合预期。
-        let script = build_cookie_harvest_script(
-            "https://m.example.site/book/1",
-            "session-a",
-        );
-        // siteDomain 应被注入为 example.site
+    fn script_rewrite_leaves_business_paths_alone() {
+        let script = r#"function dE(){return Pe("/site/info")} const Ab=e=>"/user/"+e;"#;
+        let output = annotate_script_asset_prefix(script, "session-a");
         assert!(
-            script.contains(r#"var siteDomain = "example.site";"#),
-            "脚本应注入 siteDomain, got snippet: {}",
-            &script[..script.len().min(400)]
-        );
-        // 不再使用旧的 passport|login 关键字匹配
-        assert!(
-            !script.contains("passport|login|qidian|yuewen"),
-            "脚本不应再用旧的关键字正则"
-        );
-        // shouldProxy 逻辑应存在
-        assert!(script.contains("shouldProxy"), "脚本应包含 shouldProxy 函数");
-        assert!(
-            script.contains("endsWith"),
-            "脚本应按域名后缀判断同站"
+            output.contains(r#"Pe("/site/info")"#),
+            "业务接口地址必须原样保留: {output}"
         );
         assert!(
-            !script.contains("document.cookie") && !script.contains("message=harvest"),
-            "登录代理脚本不能读取或上报浏览器 Cookie"
-        );
-        assert!(script.contains(r#"var loginSession = "session-a";"#));
-        assert!(!script.contains("bookSourceUrl"));
-        assert!(
-            script.contains("new Request(toProxy(input.url), input)"),
-            "Request 输入必须通过 Request 构造器复制, 保留 method/headers/body"
-        );
-        assert!(
-            !script.contains("merged.body = input"),
-            "不能把 Request 对象直接作为 fetch 的 body"
+            output.contains(r#""/__login/session-a/user/""#),
+            "资源基准要补会话段: {output}"
         );
     }
 
+    /// HTML 里的绝对路径资源属性要补会话段, 相对/协议相对地址不动。
+    #[test]
+    fn html_resource_attrs_gain_login_session() {
+        let html = r#"<script type="module" crossorigin src="/user/assets/index.js"></script>
+<link rel="stylesheet" href='/user/assets/index.css'>
+<img src="https://cdn.example.net/logo.png">
+<script src="chunk.js"></script>"#;
+        let output = rewrite_login_html_resource_attrs(html, "session-a");
+        assert!(output.contains(r#"src="/__login/session-a/user/assets/index.js""#), "{output}");
+        assert!(output.contains(r#"href='/__login/session-a/user/assets/index.css'"#), "{output}");
+        // 跨域与相对地址保持原样。
+        assert!(output.contains(r#"src="https://cdn.example.net/logo.png""#));
+        assert!(output.contains(r#"src="chunk.js""#));
+    }
+
+    /// 打包产物里写死的分片前缀必须补上会话段。
+    ///
+    /// Vite 把资源基准烘进代码: `Ab=e=>"/user/"+e`。这个前缀不经过文档基准,
+    /// 无论 iframe 挂在哪个路径下都会请求 `/user/assets/x.js` —— 那里没有会话,
+    /// 后端无从判断该转发到哪, 只能 404。补上会话段后, 分片重新落回
+    /// `/__login/<session>/user/assets/x.js`, 由登录代理转发。
+    #[test]
+    fn script_asset_prefix_gains_login_session() {
+        for quote in ['"', '\''] {
+            let script = format!(r#"const Ab=function(e){{return{quote}/user/{quote}+e}};"#);
+            let output = annotate_script_asset_prefix(&script, "session-a");
+            assert!(
+                output.contains(&format!("{quote}/__login/session-a/user/{quote}")),
+                "分片前缀应补会话段: {output}"
+            );
+        }
+        // 根路径与协议相对地址不动。
+        let untouched = "fetch('//cdn.example.com/x.js'); a('/');";
+        assert_eq!(
+            annotate_script_asset_prefix(untouched, "session-a"),
+            untouched
+        );
+        // 空会话不做改写(退回旧行为, 由兜底路由处理)。
+        let plain = r#"const Ab=function(e){return"/user/"+e};"#;
+        assert_eq!(annotate_script_asset_prefix(plain, ""), plain);
+    }
+
+    /// 采集脚本**不得重新引入 URL 改写**。
+    ///
+    /// 登录页现在直接跑在上游原始路径上, 页面自己发出的地址天然正确。一旦
+    /// 脚本把 fetch/XHR/资源地址改写成 `/bookSourceProxy?...`, 打包产物的
+    /// 绝对路径(路由 base `/user/`、分片 `"/user/"+chunk`)就会全部 404,
+    /// 单页应用永远挂载不起来 —— 这正是登录页长期白屏的根因。
+    #[test]
+    fn harvest_script_leaves_urls_untouched() {
+        let script = build_cookie_harvest_script("https://m.example.site/book/1", "session-a");
+        for forbidden in [
+            "shouldProxy",
+            "toProxy",
+            "/bookSourceProxy",
+            "XMLHttpRequest.prototype.open",
+            "window.fetch =",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "采集脚本不应再改写地址, 但出现了 {forbidden}: {}",
+                script.chars().take(300).collect::<String>()
+            );
+        }
+        // 仍然保留会话标识与上报能力。
+        assert!(script.contains(r#"var loginSession = "session-a";"#));
+        assert!(script.contains("reader:loginCookies"));
+    }
+
+    /// 书源 URL 无法解析时脚本同样不生成代理地址(也不应 panic)。
     #[test]
     fn harvest_script_handles_unparseable_source_domain() {
-        // 书源 URL 无法解析时 siteDomain 为空串, shouldProxy 退化为只代理相对路径
         let script = build_cookie_harvest_script("not a url", "session-b");
-        assert!(
-            script.contains(r#"var siteDomain = "";"#),
-            "无法解析时 siteDomain 应为空串"
-        );
-    }
-
-    /// 采集脚本注入的代理地址必须是**绝对**地址。
-    ///
-    /// 登录 iframe 的文档地址是 `http://reader.localhost/bookSourceProxy?...`,
-    /// 若脚本里写相对路径 `bookSourceProxy`, 浏览器会按文档路径解析成
-    /// `/user/bookSourceProxy?...` —— 同站请求全部打到上游站点不存在的路径,
-    /// 表现为登录页一打开就 404、登录接口全部失败。
-    #[test]
-    fn login_harvest_script_uses_absolute_proxy_path() {
-        let script = build_cookie_harvest_script("https://www.example.com", "session-a");
-        assert!(
-            script.contains(&format!(
-                "{}/bookSourceProxy",
-                reader_scheme_origin()
-            )),
-            "代理地址必须以 reader origin 开头: {}",
-            script.chars().take(400).collect::<String>()
-        );
-        // 不能出现裸相对路径写法(会被解析成 /user/bookSourceProxy)。
-        assert!(!script.contains("var proxyPath = \"bookSourceProxy\""));
-        // 运行时兜底仍在: 取 window.location.origin。
-        assert!(script.contains("window.location.origin"));
-    }
-
-    /// 单页应用登录页的主脚本必须走路径式代理, 且路径与上游一致。
-    ///
-    /// Vite/webpack 产出的应用会把路由分片写成相对说明符
-    /// (`import('assets/Home-xxx.js')`), ES module 按**模块自身 URL** 解析它。
-    /// 主脚本一旦被改成 `/<任意扁平路径>`, 相对解析就会落到 reader.localhost
-    /// 根目录下 404, 应用永远不会挂载 —— 表现为纯白页且没有明显报错。
-    #[test]
-    fn spa_login_bundle_keeps_upstream_path() {
-        let html = r#"<html><head>
-          <script type="module" crossorigin src="/user/assets/index-DwArin4u.js"></script>
-          <link rel="stylesheet" crossorigin href="/user/assets/index-C3gGMfX1.css">
-        </head><body><div id="app"></div></body></html>"#;
-        let output = rewrite_login_html(
-            html,
-            "https://www.example.com/user/me?app=yuedu",
-            "https://www.example.com",
-            "session-a",
-        );
-        // 路径完整保留: `/user/assets/index-DwArin4u.js` 原样出现在代理 URL 里。
-        assert!(
-            output.contains("/bookSourceProxyPath/user/assets/index-DwArin4u.js?loginSession=session-a"),
-            "模块脚本应保留上游路径: {output}"
-        );
-        assert!(
-            output.contains("/bookSourceProxyPath/user/assets/index-C3gGMfX1.css?loginSession=session-a"),
-            "样式应保留上游路径: {output}"
-        );
-        // 仍需带着上游 origin, 转发时才能拼回绝对地址。
-        assert!(output.contains("__readerUpstreamOrigin="));
-        // 主脚本上被改写的 URL 不能再以 `/bookSourceProxy?` 这种扁平查询串形式出现。
-        assert!(
-            !output.contains("crossorigin src=\"/bookSourceProxy?"),
-            "模块脚本不应退回扁平查询串代理: {output}"
-        );
-    }
-
-    #[test]
-    fn login_html_rewrites_same_source_resources() {
-        let html = r#"<html><head>
-          <script src="/static/app.js"></script>
-          <link href='https://example.com/static/app.css'>
-          <img src="https://cdn.example.net/logo.png">
-          <form action="/user/login"></form>
-        </head></html>"#;
-        let output = rewrite_login_html(
-            html,
-            "https://www.example.com/login",
-            "https://www.example.com",
-            "session-a",
-        );
-
-        // 同站资源改写为**路径式**代理: 上游路径必须保留, 否则单页应用模块内的
-        // 相对 import 会解析到 reader.localhost 根目录下 404(登录页白屏)。
-        assert!(
-            output.contains("/bookSourceProxyPath/static/app.js?loginSession=session-a"),
-            "同站脚本应走路径式代理: {output}"
-        );
-        assert!(
-            output.contains("/bookSourceProxyPath/static/app.css?loginSession=session-a"),
-            "同站样式应走路径式代理: {output}"
-        );
-        assert!(
-            output.contains("/bookSourceProxyPath/user/login?loginSession=session-a"),
-            "同站表单应走路径式代理: {output}"
-        );
-        // 跨域资源保持直连。
-        assert!(output.contains("https://cdn.example.net/logo.png"));
+        assert!(script.contains(r#"var loginSession = "session-b";"#));
+        assert!(!script.contains("/bookSourceProxy"));
     }
 
     /// HTML 改写只代理同域资源。
@@ -3006,55 +3089,80 @@ mod tests {
 
     // ─────────────────── 书源面板 (showBrowser) ───────────────────
 
-    /// RSS 单 URL 源的面板要把二级链接交给系统浏览器。
+    /// 二级链接统一留在面板内经代理导航, 不再交给系统浏览器。
     ///
-    /// 背景: RSS 面板只托管**首屏** HTML(在 reader origin 下渲染, 所以能正常显示);
-    /// 页面里的链接指向上游站点, 若在 iframe 内直接导航, 上游的 `X-Frame-Options`
-    /// / CSP `frame-ancestors` 会让 WebView 拒绝渲染 —— 表现为白屏。
-    ///
-    /// 书源登录面板必须保持 `false`: 登录/注册流程依赖 iframe 内导航。
+    /// 背景: RSS 面板只托管**首屏** HTML; 页面里的链接指向上游站点。早先为
+    /// 规避上游 `X-Frame-Options` 造成的白屏, 这些链接被交给系统浏览器。
+    /// 但跳转实际走 `proxyUrl` —— 页面由后端抓取、重写后托管在 reader origin,
+    /// 代理不透传那些限制头, 所以经代理渲染不会白屏。现在两种面板共用同一段
+    /// click 兜底, 行为一致。
     #[test]
-    fn panel_bridge_external_links_flag_switches_handling() {
+    fn panel_bridge_keeps_secondary_links_inside_panel() {
         let rss = build_source_panel_bridge_script("panel-rss", true);
         let book = build_source_panel_bridge_script("panel-book", false);
 
-        // 两种面板都要注入标志, 但取值不同。
-        assert!(rss.contains("var externalLinks = true"), "RSS 面板应开启外链跳转");
-        assert!(book.contains("var externalLinks = false"), "书源面板不应改变导航行为");
+        for (label, script) in [("RSS", &rss), ("书源", &book)] {
+            // 两种面板都不应再调用 window.open 把链接甩给系统浏览器。
+            assert!(
+                !script.contains(r#"window.open(url.href, "_blank", "noopener")"#),
+                "{label} 面板不应再把二级链接交给系统浏览器"
+            );
+            assert!(
+                !script.contains(r#"window.open(target.href, "_blank", "noopener")"#),
+                "{label} 面板不应再用 window.open 外跳"
+            );
+            // 二级链接改走代理导航, 留在面板内。
+            assert!(
+                script.contains("window.location.assign(proxyUrl(url))"),
+                "{label} 面板应把二级链接代回代理 URL"
+            );
+            // click 兜底挂在捕获阶段, 否则页面自己的 handler 可能先执行。
+            assert!(script.contains("}, true);"));
+            assert!(script.contains("event.button !== 0"));
+        }
 
-        // RSS 面板: 两条拦截路径(现代 navigation 事件 + click 兜底)都要有。
-        // 注意断言的是**生成后**的 JS(`{{` 在原始字符串里已折叠为单个 `{`)。
-        assert!(
-            rss.contains("if (externalLinks) {"),
-            "应存在受标志控制的拦截分支"
-        );
-        assert!(
-            rss.contains(r#"addEventListener("click""#),
-            "老 WebView 没有 navigation API, 必须靠 click 兜底"
-        );
-        // 拦截后走系统浏览器(window.open 会命中 Tauri 壳的 on_new_window)。
-        assert!(rss.contains(r#"window.open(target.href, "_blank", "noopener")"#));
-        assert!(rss.contains(r#"window.open(url.href, "_blank", "noopener")"#));
+        // 标志仍按面板类型注入(保留兼容), 但不再影响外链处理。
+        assert!(rss.contains("var externalLinks = true"));
+        assert!(book.contains("var externalLinks = false"));
 
-        // click 兜底必须挂在捕获阶段, 否则页面自己的 handler 可能先执行。
-        assert!(
-            rss.contains("}, true);"),
-            "click 监听需为捕获阶段"
-        );
-        // 修饰键/中键点击与 _blank 链接要放行, 避免抢掉浏览器默认行为。
-        assert!(rss.contains("event.button !== 0"));
-        assert!(rss.contains("if (target === \"_blank\") return;"));
+        // 书源面板的表单提交仍走代理(登录/注册依赖它)。
+        assert!(book.contains("submitToProxy(event, target)"));
+    }
 
-        // 书源面板必须保留原有导航逻辑: 登录/注册靠 iframe 内跳转完成。
-        // 标志只控制"是否走外链分支", 不能删掉 else 路径上的原有实现。
+    /// 源仓库的「一键导入」是 `legado://` / `yuedu://` 自定义协议, 系统浏览器
+    /// 不认识, 交出去就是静默失败; `target="_blank"` 的二级链接若不拦, 会被
+    /// 系统浏览器接管(表现为"点一下就跳出应用")。
+    #[test]
+    fn panel_bridge_handles_import_protocol_and_blank_links() {
+        let book = build_source_panel_bridge_script("panel-book", false);
+
+        // 两种面板都要识别导入协议并转给宿主, 由前端拉取并入库。
         assert!(
-            book.contains(r#"window.location.assign(proxyUrl(target))"#),
-            "书源面板仍需把跳转代回代理 URL"
+            book.contains("function importProtocolUrl(raw)"),
+            "书源面板应能识别 legado:// / yuedu:// 导入链接"
         );
         assert!(
-            book.contains("submitToProxy(event, target)"),
-            "书源面板的表单提交仍需走代理"
+            book.contains("postToHost({ type: \"importProtocol\", url: href })"),
+            "导入链接需要转给宿主处理"
         );
+        assert!(
+            book.contains(r#"/^(legado|yuedu):$/i"#),
+            "只接管这两种导入协议"
+        );
+
+        // 两种面板都要处理导入协议(源仓库既可能从书源面板打开, 也可能从
+        // RSS 面板打开), 且都要把 _blank 链接留在面板内经代理导航。
+        let rss = build_source_panel_bridge_script("panel-rss", true);
+        for (label, script) in [("RSS", &rss), ("书源", &book)] {
+            assert!(
+                script.contains("function importProtocolUrl(raw)"),
+                "{label} 面板应能识别导入协议"
+            );
+            assert!(
+                script.contains("window.location.assign(proxyUrl(url))"),
+                "{label} 面板的 _blank 链接应留在面板内"
+            );
+        }
     }
 
     #[test]

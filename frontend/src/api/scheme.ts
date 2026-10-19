@@ -8,8 +8,12 @@ import { convertFileSrc } from '@tauri-apps/api/core'
 
 export const readerOrigin: string = (() => {
   try {
+    // 只取 origin, 不要按 "/probe" 后缀切片: 某些 WebView 后端返回的探测地址
+    // 带路径前缀(形如 http://reader.localhost/user/probe), 切片后剩下的是
+    // `http://reader.localhost/user` —— 用它拼 `/bookSourceProxy` 会得到
+    // `/user/bookSourceProxy`, 登录代理页因此落到错误路径上(表现为白屏)。
     const probe = convertFileSrc('probe', 'reader')
-    if (probe.endsWith('/probe')) return probe.slice(0, -'/probe'.length)
+    return new URL(probe).origin
   } catch {
     /* 不在 Tauri 内运行(单元测试) */
   }

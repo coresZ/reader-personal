@@ -95,8 +95,26 @@ const frameUrl = computed(() => {
   if (!/^https?:\/\//i.test(previewUrl.value)) return ''
   // These login pages depend on their original document.domain.
   if (/^https?:\/\/([\w-]+\.)?(qidian|yuewen)\.com(?:[/:]|$)/i.test(previewUrl.value)) return previewUrl.value
-  const params = new URLSearchParams({ loginSession: view.value?.loginSession || '', url: previewUrl.value })
-  return `${readerOrigin}/bookSourceProxy?${params}`
+  // 登录页跑在 reader origin 的专属路径空间里, 且**完整保留上游路径**:
+  //   http://reader.localhost/__login/<session>/user/me?app=yuedu&version=...
+  //
+  // 原因有两个, 缺一不可:
+  // 1. 打包产出的单页应用把路径写死进代码 —— Vue Router 的 base 是 `/user/`,
+  //    分片也可能是 `"/user/" + chunk`。文档路径一旦对不上, 这些绝对路径全部
+  //    404, 应用永远挂载不起来(纯白页)。
+  // 2. WebView2 在自定义协议下**不给子资源发 Cookie, Referer 也是空串**(实测),
+  //    所以会话只能编码进路径, 让每个分片请求天然带着它 —— 见后端
+  //    `source_login_fallback_route`。
+  //
+  // 效果等于在桌面端复刻 legado 手机端直接 `loadUrl(登录页)` 的行为。
+  const session = view.value?.loginSession || ''
+  try {
+    const target = new URL(previewUrl.value)
+    return `${readerOrigin}/__login/${encodeURIComponent(session)}${target.pathname}${target.search}${target.hash}`
+  } catch {
+    const params = new URLSearchParams({ loginSession: session, url: previewUrl.value })
+    return `${readerOrigin}/bookSourceProxy?${params}`
+  }
 })
 
 function fieldStyle(field: SourceLoginField): CSSProperties {
