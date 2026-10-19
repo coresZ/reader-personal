@@ -110,6 +110,23 @@ describe('compatible backup archives', () => {
     expect(embedded.customFonts).toHaveLength(1)
   })
 
+  it('分组级排序偏好在 Legado 归档往返中保留', () => {
+    // Legado 的 BookGroup 用 bookSort 表达「本分组使用哪种排序」;
+    // 缺这个字段时从手机端恢复后每个分组都会退回「跟随全局」。
+    const result = parseCompatibleBackupArchive({
+      'bookshelf.json': JSON.stringify([]),
+      'bookGroup.json': JSON.stringify([
+        { groupId: 1, groupName: '玄幻', order: 0, bookSort: 2 },
+        { groupId: 2, groupName: '仙侠', order: 1 },
+      ]),
+    })
+
+    const groups = result.payload.bookshelf.groups
+    expect(groups.find((g) => g.groupId === 1)?.bookSort).toBe(2)
+    // 未设置的分组不带该字段(表示跟随全局), 而不是写成 0(最近阅读)。
+    expect(groups.find((g) => g.groupId === 2)?.bookSort).toBeUndefined()
+  })
+
   it('restores a Legado archive and skips Android-only local books', () => {
     const result = parseCompatibleBackupArchive({
       'bookshelf.json': JSON.stringify([
@@ -290,7 +307,11 @@ describe('compatible backup archives', () => {
 })
 
 describe('backup payload v2', () => {
-  it('includes local books, fonts and reading stats from the backend exports', async () => {
+  it('keeps metadata and fonts, but never bundles local book content', async () => {
+    // 与手机端 Legado 对齐: 备份只含元数据, 本地书正文不进备份。
+    // 曾经把每本本地书按 base64 塞进 reader-rust.json, 导出上限(单本 100MB/
+    // 合计 300MB)与打包上限(单条目 64MB/总 128MB)互相矛盾, 本地书合计约 48MB
+    // 就会让整包备份失败 —— 本地备份与 WebDAV 备份共用这条 payload, 于是同时失败。
     vi.stubGlobal('localStorage', {
       getItem: () => null,
       setItem: () => undefined,
@@ -300,10 +321,40 @@ describe('backup payload v2', () => {
       const payload = await createWebdavBackupPayload()
 
       expect(payload.version).toBe(2)
-      expect(payload.localBooks).toHaveLength(1)
-      expect(payload.skippedLocalBooks).toEqual([{ id: 'b'.repeat(32), sizeBytes: 123 }])
+      // 正文不带走
+      expect(payload.localBooks).toEqual([])
+      // 但要记下"哪些本地书没备份", 供界面提示用户换机后重新导入。
+      // mock 里既有一条成功导出的本地书(无 sizeBytes, 记为 0), 也有一条超限被跳过的。
+      expect(payload.skippedLocalBooks).toEqual([
+        { id: 'b'.repeat(32), sizeBytes: 123 },
+        { id: 'a'.repeat(32), sizeBytes: 0 },
+      ])
       expect(payload.customFonts).toHaveLength(1)
       expect(payload.readingStats?.daily).toHaveLength(1)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('produces an archive far below the 64MB per-entry packing limit', async () => {
+    // 这条是 issue #15 的护栏: 打包侧 `build_backup_archive` 限制单条目 64MB。
+    // 本地书正文曾以 base64 全部挤进 reader-rust.json, 合计约 48MB 就会越界,
+    // 而导出侧的上限(单本 100MB/合计 300MB)并不会提前拦下 —— 于是整包失败。
+    // 现在正文不进备份, 体积只与元数据规模有关。
+    vi.stubGlobal('localStorage', {
+      getItem: () => null,
+      setItem: () => undefined,
+      removeItem: () => undefined,
+    })
+    try {
+      const payload = await createWebdavBackupPayload()
+      const files = createCompatibleBackupArchiveFiles(payload)
+      const readerJson = files.find((file) => file.name === 'reader-rust.json')
+
+      expect(readerJson).toBeDefined()
+      // 64MB 上限; 空书架/空书源的基线应在几 KB 量级, 留足余量即可
+      const size = new TextEncoder().encode(readerJson!.content).length
+      expect(size).toBeLessThan(1024 * 1024)
     } finally {
       vi.unstubAllGlobals()
     }

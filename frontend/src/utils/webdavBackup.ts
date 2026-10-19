@@ -134,17 +134,34 @@ function applyLocalState(localState: Record<string, string> = {}) {
 }
 
 export async function createWebdavBackupPayload(): Promise<WebdavBackupPayload> {
-  const [books, groups, bookSources, rssSources, bookmarks, replaceRules, localBooks, customFonts, readingStats] = await Promise.all([
+  const [books, groups, bookSources, rssSources, bookmarks, replaceRules, customFonts, readingStats] = await Promise.all([
     getBookshelf(),
     getBookGroups(),
     getBookSources(),
     getRssSources(),
     getBookmarks(),
     getReplaceRules(),
-    exportLocalBooks().catch(() => ({ books: [], skipped: [], totalBytes: 0 })),
     exportCustomFonts().catch(() => ({ fonts: [], skipped: [], totalBytes: 0 })),
     exportReadingStats().catch(() => ({ daily: [], byBook: [] })),
   ])
+
+  // 本地书正文**不进备份** —— 与手机端 Legado 一致(它的 Backup.kt 只备份书架/
+  // 书源/书签等元数据, 不含任何本地书文件)。
+  //
+  // 这里原本把每本本地书按 base64 塞进 reader-rust.json, 有两条硬伤:
+  //   1. base64 膨胀 4/3, 而导出的单本上限是 100MB、合计 300MB, 打包侧却是
+  //      单条目 64MB、总内容 128MB —— 两边上限互相矛盾, 本地书合计约 48MB 就
+  //      会让整包失败(本地备份与 WebDAV 备份共用这条 payload, 于是同时失败);
+  //   2. 备份体积动辄数百 MB, 上传/下载/恢复都很慢。
+  //
+  // 本地书的正文本来就是用户自己的文件, 换机后重新导入即可 —— 与 Legado 用户
+  // 承担的代价相同。这里仍记下"哪些本地书没有备份"(只有 id 与大小, 不含内容),
+  // 供恢复后提示用户重新导入。
+  const localBooks = await exportLocalBooks().catch(() => ({ books: [], skipped: [], totalBytes: 0 }))
+  const skippedLocalBooks = [
+    ...localBooks.skipped,
+    ...localBooks.books.map((book) => ({ id: book.id, sizeBytes: book.sizeBytes || 0 })),
+  ]
 
   return {
     version: BACKUP_VERSION,
@@ -159,8 +176,9 @@ export async function createWebdavBackupPayload(): Promise<WebdavBackupPayload> 
     bookmarks,
     replaceRules,
     localState: captureLocalState(),
-    localBooks: localBooks.books,
-    skippedLocalBooks: localBooks.skipped,
+    // 保持字段存在但为空: 旧版本读取时按"没有本地书"处理, 不需要版本判断。
+    localBooks: [],
+    skippedLocalBooks,
     customFonts: customFonts.fonts,
     readingStats,
   }
@@ -515,11 +533,17 @@ function toBookGroup(value: JsonRecord): BookGroup | null {
   const groupId = toFiniteNumber(value.groupId)
   const groupName = typeof value.groupName === 'string' ? value.groupName : ''
   if (!groupId || !groupName) return null
-  return {
+  const group: BookGroup = {
     groupId,
     groupName,
     orderNo: toFiniteNumber(value.orderNo ?? value.order),
   }
+  // 分组级排序偏好(Legado 的 `BookGroup.bookSort`): 缺省表示跟随全局,
+  // 有值时原样带上, 否则从手机端恢复后每个分组的排序设置都会被重置。
+  if (typeof value.bookSort === 'number' && Number.isFinite(value.bookSort)) {
+    group.bookSort = value.bookSort
+  }
+  return group
 }
 
 function toBookmark(value: JsonRecord): Bookmark | null {

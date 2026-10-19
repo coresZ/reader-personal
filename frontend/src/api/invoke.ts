@@ -82,6 +82,24 @@ const COMMAND_BY_PATH: Record<string, string> = {
   '/reader3/dismissVersionUpdate': 'dismiss_version_update',
 }
 
+/**
+ * 把 Tauri command 的 reject 值统一成 `Error`。
+ *
+ * Rust 侧的 `AppError` 自定义了 `Serialize`（`serializer.serialize_str(...)`），
+ * 因此 `invoke()` 被 `Err(AppError)` 拒绝时拿到的是**字符串**而非 `Error`。
+ * 调用方写 `(error as Error).message` 只会得到 `undefined`，真实原因被兜底文案
+ * 吞掉 —— 用户只能看到「备份失败」，无从判断是超限、路径还是网络问题。
+ */
+export function toError(value: unknown, fallback = '请求失败'): Error {
+  if (value instanceof Error) return value
+  if (typeof value === 'string' && value.trim()) return new Error(value)
+  if (value && typeof value === 'object' && typeof (value as { message?: unknown }).message === 'string') {
+    const message = (value as { message: string }).message
+    if (message.trim()) return new Error(message)
+  }
+  return new Error(fallback)
+}
+
 let lastNeedLoginDispatchAt = 0
 
 function dispatchNeedLogin() {
@@ -114,8 +132,7 @@ async function call<T>(path: string, payload: unknown): Promise<T> {
     }
     return res as T // raw payload (binary endpoints that bypass the envelope)
   } catch (err) {
-    if (err instanceof Error) throw err
-    throw new Error(String(err))
+    throw toError(err)
   }
 }
 
@@ -143,7 +160,9 @@ export async function invokeEnvelope<T>(
   command: string,
   args: Record<string, unknown>,
 ): Promise<T> {
-  const res = await invoke<ApiResponse<T>>(command, args)
+  const res = await invoke<ApiResponse<T>>(command, args).catch((err) => {
+    throw toError(err)
+  })
   if (!res.isSuccess) throw new Error(res.errorMsg || '请求失败')
   return res.data as T
 }
@@ -172,9 +191,11 @@ export async function invokeUpload<T>(
 ): Promise<T> {
   const res = await invoke<ApiResponse<T>>(command, new Uint8Array(await file.arrayBuffer()), {
     headers: commandHeaders,
+  }).catch((err) => {
+    throw toError(err)
   })
   if (!res.isSuccess) throw new Error(res.errorMsg || '请求失败')
   return res.data as T
 }
 
-export default { get, post, invokeRaw, invokeEnvelope, invokeUpload }
+export default { get, post, invokeRaw, invokeEnvelope, invokeUpload, toError }

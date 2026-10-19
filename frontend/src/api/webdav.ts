@@ -1,4 +1,4 @@
-import { get, post, invokeEnvelope, invokeRaw, invokeUpload } from './invoke'
+import { get, post, invokeEnvelope, invokeRaw, invokeUpload, toError } from './invoke'
 import { FILE_NAME_HEADER, encodeFileName } from './uploadHeader'
 
 /** WebDAV 目标目录的 IPC header，与 Rust 侧 `WEBDAV_PATH_HEADER` 必须一致。 */
@@ -101,8 +101,11 @@ export function uploadLegadoWebdavBackup(
 }
 
 export function downloadLegadoWebdavBackup(config: LegadoWebdavConfig, filename: string) {
+  // 走 invokeRaw 的二进制通道, 失败时同样要把 Rust 的字符串错误转成 Error。
   return invokeRaw<WebdavBinaryResponse>('download_legado_webdav_backup', {
     req: { config, filename },
+  }).catch((error) => {
+    throw toError(error, '下载备份失败')
   })
 }
 

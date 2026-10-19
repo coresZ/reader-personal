@@ -1023,8 +1023,10 @@ function applyParagraphSpacingToBlockChildren(wrapper: HTMLElement) {
  * 判据是后端 `local_epub_book.rs` 的 `CHAPTER_SCOPE_CLASS` 包裹类(两处必须一致):
  * 书源正文里也可能出现 `<style>`, 那些仍要走既有的书源清洗流程。
  */
+const EPUB_SCOPE_CLASS = 'epub-chapter-content'
+
 function isEpubChapterHtml(html: string) {
-  return isLocalEpubBook(store.book) && html.includes('epub-chapter-content')
+  return isLocalEpubBook(store.book) && html.includes(EPUB_SCOPE_CLASS)
 }
 
 /** 承载本地 EPUB 原书样式的 `<style>` 元素(整本书共用一份)。 */
@@ -1071,6 +1073,7 @@ function formatChapterHtml(rawText: string) {
     // 内联内容包进 <p>, 一旦该页被切分, `Range.cloneContents` 会切出半截 CSS。
     moveEpubStylesToHead(wrapper)
     rewriteLocalEpubAssetSrcs(wrapper)
+    applyEpubFirstLineIndent(wrapper)
     highlightSearchText(wrapper)
     return wrapper.innerHTML
   }
@@ -1575,6 +1578,52 @@ function goHome() {
     // Ignore unavailable session storage; navigation should still work.
   }
   router.replace('/')
+}
+
+/**
+ * 本地 EPUB 的首行缩进。
+ *
+ * 问题: 阅读器有一条兜底 `.chapter-text p { text-indent: 0 }`, 特异性(含 scoped
+ * 属性选择器)高于原书样式 `.epub-chapter-content p { text-indent: 2em }`, 于是原书
+ * 写的段首缩进被静默清零 —— 这就是"EPUB 里首行缩进不生效"。
+ *
+ * 分两种阅读模式, 因为两者的 DOM 形态不同:
+ *
+ * 1. **上下滑动**: 章节按原样渲染, `.epub-chapter-content` 容器还在, 原书样式能
+ *    命中。此时唯一要做的就是把阅读器兜底的特异性让开(见样式表 `:where(...)`),
+ *    原书排版自然恢复 —— 包括 `p.foot`/`.sign` 这些刻意 `text-indent:0` 的例外段。
+ *
+ * 2. **左右翻页**: 分页器必须把容器展开成文本块才能测量切页(见
+ *    useHorizontalPaging 的 buildHorizontalBlocks), 容器随之消失, 原书选择器一条
+ *    都匹配不上。这时只能由阅读器补缩进 —— 复用既有的 `reader-indent` 类:
+ *    分页器的 normalizeParagraphHtml 会把它转成内联 `text-indent:2em`, 而拆分
+ *    跨页段落时又会自动去掉续接段的缩进, 全程不需要改分页代码。
+ *
+ *    代价: 分页模式下无法区分原书的例外段(脚注/题记), 它们也会被缩进。这是
+ *    已知取舍 —— 分页模式下原书的其它排版本来就已经失效, 统一缩进至少让正文
+ *    可读, 不会比现状更糟。
+ *
+ * 用户关闭开关时, 两种模式都只需给容器打上 `reader-no-indent`, 由样式表统一清零。
+ */
+const EPUB_NO_INDENT_CLASS = 'reader-no-indent'
+
+/** 分页模式下用来请求"首行缩进"的类(与书源正文共用, 分页器已认识它)。 */
+const READER_INDENT_CLASS = 'reader-indent'
+
+function applyEpubFirstLineIndent(root: HTMLElement) {
+  const container = root.classList.contains(EPUB_SCOPE_CLASS)
+    ? root
+    : root.querySelector<HTMLElement>(`.${EPUB_SCOPE_CLASS}`)
+  if (!container) return
+  // 关闭: 打标记, 由样式表统一强制清零(用户明确要求, 优先于原书)。
+  container.classList.toggle(EPUB_NO_INDENT_CLASS, !config.value.firstLineIndent)
+  // 开启: 上下滑动模式不必干预(原书 CSS 自然生效); 左右翻页模式下容器会被
+  // 分页器展开, 必须靠段落上的类把缩进"带"到分页输出里。
+  if (config.value.firstLineIndent && isHorizontalPageMode.value) {
+    container.querySelectorAll<HTMLElement>('p').forEach((paragraph) => {
+      paragraph.classList.add(READER_INDENT_CLASS)
+    })
+  }
 }
 
 function normalizeSourceTypography(root: HTMLElement) {
@@ -4134,8 +4183,28 @@ watch(
   text-indent: 2em !important;
 }
 
-:deep(.chapter-text p) {
+/* 书源正文的默认无缩进。
+ *
+ * 这里用 `:where()` 把整条选择器的特异性压到 **0** —— 包括 Vue 的 scoped 属性
+ * 选择器也一并被归零。原因: 这条兜底原本特异性 (0,2,1), 会压过本地 EPUB 的原书
+ * 样式 `.epub-chapter-content p { text-indent: 2em }`(0,1,1), 把原书排版静默清零,
+ * 表现为"EPUB 里首行缩进不生效"。
+ *
+ * 归零之后, 任何原书声明都能自然胜出(原书还写了 `p.foot`/`.sign` 等 text-indent:0
+ * 的例外段落, 它们也一并恢复原意)。书源正文没有原书样式, 仍然得到无缩进;
+ * 需要缩进的段落继续走上面那条 `.reader-indent`(带 !important)。
+ *
+ * 只改 CSS 特异性, 不碰 DOM 结构、不碰分页测量 —— 与正文截断问题完全无关。 */
+:deep(:where(.chapter-text p)) {
   text-indent: 0;
+}
+
+/* 用户关闭「首行缩进」时, 连同原书的缩进一起压掉(明确要求, 优先于原书)。 */
+:deep(.epub-chapter-content.reader-no-indent p) {
+  text-indent: 0 !important;
+}
+
+:deep(.chapter-text p) {
   user-select: text;
   -webkit-user-select: text;
 }

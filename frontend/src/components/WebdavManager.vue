@@ -211,6 +211,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useAppStore } from '../stores/app'
+import { toError } from '../api/invoke'
 import {
   createWebdavBackupArchive,
   deleteWebdavFile,
@@ -305,7 +306,7 @@ async function openFolder() {
   try {
     await openWebdavFolder()
   } catch (error) {
-    appStore.showToast((error as Error).message || '打开文件夹失败', 'error')
+    appStore.showToast(errorMessageOf(error, '打开文件夹失败'), 'error')
   }
 }
 
@@ -330,7 +331,7 @@ async function testRemote() {
     appStore.showToast('WebDAV 连接成功', 'success')
     await loadRemoteBackups()
   } catch (error) {
-    remoteError.value = (error as Error).message || '连接失败'
+    remoteError.value = errorMessageOf(error, '连接失败')
   } finally {
     remoteWorking.value = false
     remoteAction.value = ''
@@ -345,7 +346,7 @@ async function loadRemoteBackups() {
     remoteBackups.value = await listLegadoWebdavBackups(remoteDraft.value)
   } catch (error) {
     remoteBackups.value = []
-    remoteError.value = (error as Error).message || '读取网盘备份失败'
+    remoteError.value = errorMessageOf(error, '读取网盘备份失败')
   } finally {
     remoteLoading.value = false
   }
@@ -360,12 +361,14 @@ async function uploadRemoteBackup() {
     await uploadLegadoWebdavBackup(remoteDraft.value, buildBackupFilename(), createCompatibleBackupArchiveFiles(payload))
     const skipped = payload.skippedLocalBooks?.length || 0
     appStore.showToast(
-      skipped ? `备份已上传到 WebDAV，${skipped} 本本地书过大未包含` : '备份已上传到 WebDAV',
+      skipped
+        ? `备份已上传到 WebDAV（${skipped} 本本地书不含正文，换机后需重新导入）`
+        : '备份已上传到 WebDAV',
       skipped ? 'warning' : 'success',
     )
     await loadRemoteBackups()
   } catch (error) {
-    remoteError.value = (error as Error).message || '上传备份失败'
+    remoteError.value = errorMessageOf(error, '上传备份失败')
   } finally {
     remoteWorking.value = false
     remoteAction.value = ''
@@ -381,7 +384,7 @@ async function downloadRemoteBackup(entry: LegadoWebdavBackupEntry) {
       appStore.showToast(`备份已保存到 ${result.path || '所选位置'}`, 'success')
     }
   } catch (error) {
-    remoteError.value = (error as Error).message || '下载备份失败'
+    remoteError.value = errorMessageOf(error, '下载备份失败')
   } finally {
     remoteWorking.value = false
     remoteAction.value = ''
@@ -428,7 +431,7 @@ async function deleteRemoteBackup(entry: LegadoWebdavBackupEntry) {
     appStore.showToast('远端备份已删除', 'success')
     await loadRemoteBackups()
   } catch (error) {
-    remoteError.value = (error as Error).message || '删除备份失败'
+    remoteError.value = errorMessageOf(error, '删除备份失败')
   } finally {
     remoteWorking.value = false
     remoteAction.value = ''
@@ -459,6 +462,16 @@ function formatSkipReport(skipped: SkippedEntryReport[], skippedLocalBooks: numb
 }
 
 /**
+ * 取错误文案。统一走 `toError`：Tauri command 失败时 reject 的是**字符串**
+ * （Rust `AppError` 序列化成消息串），直接读 `.message` 永远是 `undefined`，
+ * 于是界面只剩兜底文案，用户看不到「备份条目 reader-rust.json 超过 64 MB」
+ * 这类真正的原因。
+ */
+function errorMessageOf(error: unknown, fallback: string) {
+  return toError(error, fallback).message
+}
+
+/**
  * 恢复失败时的提示。按**阶段**给不同文案:
  * - write: 已写了一半, 现有数据可能被部分覆盖, 必须明确告知(否则用户以为什么都没发生)。
  * - clear: 旧数据已被删但尚未写入任何东西 —— 同样是不完整状态, 但它不是"写入失败",
@@ -466,7 +479,7 @@ function formatSkipReport(skipped: SkippedEntryReport[], skippedLocalBooks: numb
  * - null (解析/下载阶段): 还没碰过任何数据, 原样报错即可。
  */
 function restoreErrorMessage(error: unknown, phase: RestorePhase | null) {
-  const message = (error as Error)?.message || '恢复失败'
+  const message = errorMessageOf(error, '恢复失败')
   if (phase === 'write') {
     return `${message}（写入过程中断，当前数据可能不完整，请重新恢复）`
   }
@@ -531,7 +544,7 @@ async function loadFiles(path = '/') {
     }))
     entries.value = rows
   } catch (error) {
-    errorMessage.value = (error as Error).message || '无法读取本地备份文件列表'
+    errorMessage.value = errorMessageOf(error, '无法读取本地备份文件列表')
     entries.value = []
   } finally {
     loading.value = false
@@ -561,7 +574,7 @@ async function handleUpload(event: Event) {
     appStore.showToast('文件已上传到本地', 'success')
     await loadFiles(currentPath.value)
   } catch (error) {
-    appStore.showToast((error as Error).message || '上传失败', 'error')
+    appStore.showToast(errorMessageOf(error, '上传失败'), 'error')
   } finally {
     working.value = false
     input.value = ''
@@ -585,12 +598,14 @@ async function createBackup() {
     )
     const skipped = payload.skippedLocalBooks?.length || 0
     appStore.showToast(
-      skipped ? `备份已保存到 /backups，${skipped} 本本地书过大未包含` : '备份已保存到 /backups',
+      skipped
+        ? `备份已保存到 /backups（${skipped} 本本地书不含正文，换机后需重新导入）`
+        : '备份已保存到 /backups',
       skipped ? 'warning' : 'success',
     )
     await loadFiles('/backups')
   } catch (error) {
-    appStore.showToast((error as Error).message || '备份失败', 'error')
+    appStore.showToast(errorMessageOf(error, '备份失败'), 'error')
   } finally {
     working.value = false
   }
@@ -604,7 +619,7 @@ async function downloadEntry(entry: EntryRow) {
       appStore.showToast(`备份已保存到 ${result.path || '所选位置'}`, 'success')
     }
   } catch (error) {
-    appStore.showToast((error as Error).message || '下载失败', 'error')
+    appStore.showToast(errorMessageOf(error, '下载失败'), 'error')
   } finally {
     working.value = false
   }
@@ -619,7 +634,7 @@ async function removeEntry(entry: EntryRow) {
     appStore.showToast('文件已删除', 'success')
     await loadFiles(currentPath.value)
   } catch (error) {
-    appStore.showToast((error as Error).message || '删除失败', 'error')
+    appStore.showToast(errorMessageOf(error, '删除失败'), 'error')
   } finally {
     working.value = false
   }
@@ -635,7 +650,7 @@ async function removeSelected() {
     appStore.showToast('选中文件已删除', 'success')
     await loadFiles(currentPath.value)
   } catch (error) {
-    appStore.showToast((error as Error).message || '批量删除失败', 'error')
+    appStore.showToast(errorMessageOf(error, '批量删除失败'), 'error')
   } finally {
     working.value = false
   }

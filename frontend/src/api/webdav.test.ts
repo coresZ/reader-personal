@@ -16,6 +16,9 @@ vi.mock('./invoke', () => ({
   // 本文件的模块图当前不触达上传，但 mock 需与 invoke.ts 的导出保持一致，
   // 否则将来重构引入命名导入时会以 "invokeUpload is not a function" 报错。
   invokeUpload: vi.fn(),
+  // webdav.ts 用它把 Rust 侧的字符串错误转成 Error，同样必须保留导出。
+  toError: (value: unknown, fallback = '请求失败') =>
+    value instanceof Error ? value : new Error(typeof value === 'string' && value.trim() ? value : fallback),
 }))
 
 describe('webdav binary file conversion', () => {
