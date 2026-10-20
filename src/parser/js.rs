@@ -1366,6 +1366,41 @@ const JS_PRELUDE: &str = r#"(function (g) {
   // `Packages.org.jsoup.Jsoup` —— Rhino 里 `Packages.<pkg>.<Class>` 的取法。
   g.Packages.org = g.org;
 
+  // `Packages.io.legado.app.help.http.StrResponse` —— legado 的响应类, 部分书源的
+  // loginCheckJs 会直接构造它来替换响应:
+  //   result = new Packages.io.legado.app.help.http.StrResponse(java.url, body)
+  // 对应 `StrResponse(url: String, body: String?)`: 得到 code=200、url 为给定值
+  // 的响应对象。缺这个类时脚本直接抛 "cannot read property 'legado' of
+  // undefined", 整个 loginCheckJs 失败, 正文再也加载不出来。
+  function StrResponseClass(first, second) {
+    // 两个实参都有字符串时按 (url, body); 只有一个实参时按 (url, null) 处理,
+    // 与 Kotlin 的重载选择一致(单参不会被当成 body)。
+    var url = first === undefined || first === null ? '' : S(first);
+    var body = second === undefined || second === null ? null : S(second);
+    var envelope = {
+      body: body === null ? '' : body,
+      url: url,
+      code: 200,
+      headers: {},
+      isSuccessful: true
+    };
+    // 复用 `Resp` 的 StrResponse 语义: code()/body()/url()/headers()/isSuccessful()
+    // 等方法齐全, 并且作为脚本返回值时能交出完整信封。
+    return Resp(JSON.stringify(envelope));
+  }
+  tagJavaClassName(StrResponseClass, 'StrResponse');
+  g.Packages.io = {
+    legado: {
+      app: {
+        help: {
+          http: {
+            StrResponse: StrResponseClass
+          }
+        }
+      }
+    }
+  };
+
   g.cache = {
     get: function (k) { return g.__store_get(S(k)); },
     put: function (k, v) { g.__store_put(S(k), S(v)); return v; },
@@ -1421,6 +1456,41 @@ const JS_PRELUDE: &str = r#"(function (g) {
     var h = headers == null ? '' : (typeof headers === 'string' ? headers : JSON.stringify(headers));
     return Resp(g.__http(m, S(url), body == null ? '' : S(body), requestHeaders(h)));
   };
+  // legado 里脚本的 `java` 是 AnalyzeUrl 实例, 它带 `url`/`urlNoQuery`/`ruleUrl`
+  // 几个**当前请求地址**字段(`AnalyzeUrl.kt`)。某些书源的 loginCheckJs 直接用
+  // `result.url().includes("content")` 之外的判断, 或写 `java.url` 取地址 ——
+  // 缺这几个属性会直接抛 "cannot read property 'xxx' of undefined", 整个
+  // loginCheckJs 失败, 正文就再也加载不出来。
+  //
+  // 取值来源是"最近一次请求的响应"里的 url: 宿主在执行前已用当前响应初始化了
+  // 那个槽位(见 `apply_login_check_js`), 因此与 legado 的语义一致。
+  (function () {
+    function currentUrl() {
+      try {
+        var raw = JSON.parse(g.__last_response() || '{}');
+        return S(raw && raw.url);
+      } catch (_e) {
+        return '';
+      }
+    }
+    function defineUrlProp(name, getter) {
+      try {
+        Object.defineProperty(J, name, {
+          get: getter,
+          set: function () {},
+          configurable: true,
+          enumerable: false
+        });
+      } catch (_e) {}
+    }
+    defineUrlProp('url', currentUrl);
+    defineUrlProp('urlNoQuery', function () {
+      var u = currentUrl();
+      var i = u.indexOf('?');
+      return i < 0 ? u : u.slice(0, i);
+    });
+    defineUrlProp('ruleUrl', currentUrl);
+  })();
   J.upLoginData = function (data) { g.__login_update(JSON.stringify(data == null ? null : data)); };
   J.reLoginView = function () { g.__login_refresh(); };
   // legado: `java.refreshExplore()` 刷新发现页（只重算分类，不重跑登录）。
@@ -3649,6 +3719,104 @@ pub fn panel_digest(payload: &JsonValue) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `java.url` 必须取到当前请求地址, `urlNoQuery` 去掉 query。
+    ///
+    /// legado 里脚本的 `java` 是 `AnalyzeUrl` 实例, 上面有 `url`/`urlNoQuery`
+    /// 两个字段。这里没有那个对象, 用"最近响应"里的 url 代为提供 —— 宿主在
+    /// 执行 loginCheckJs 前已用当前响应初始化了该槽位。
+    #[test]
+    fn java_url_reflects_current_request() {
+        set_last_response(
+            &serde_json::json!({
+                "body": "{}",
+                "url": "https://api.example.test/content?item_id=1&x=2",
+                "code": 200,
+                "headers": {}
+            })
+            .to_string(),
+        );
+        let output = eval_js_with_bindings(
+            "java.url + '|' + java.urlNoQuery",
+            "{}",
+            "https://api.example.test/content?item_id=1&x=2",
+            &HashMap::new(),
+        )
+        .expect("java.url 应可读");
+        assert_eq!(
+            output,
+            "https://api.example.test/content?item_id=1&x=2|https://api.example.test/content"
+        );
+    }
+
+    /// `loginCheckJs` 里的两个 legado 兼容点: `java.url` 与
+    /// `Packages.io.legado.app.help.http.StrResponse`。
+    ///
+    /// 聚合类书源用它们把"接口返回的 JSON 包一层"变成正文:
+    /// ```js
+    /// if (result.url().includes("content")) {
+    ///     let c = JSON.parse(result.body());
+    ///     c = c.data?.content || c.message || '暂不支持';
+    ///     result = new Packages.io.legado.app.help.http.StrResponse(java.url, c);
+    /// }
+    /// result
+    /// ```
+    /// 两者缺任一都会让脚本抛错(实测报 `cannot read property 'legado' of
+    /// undefined`), loginCheckJs 因此失效, 正文再也加载不出来。
+    #[test]
+    fn login_check_js_supports_java_url_and_str_response() {
+        set_last_response(
+            &serde_json::json!({
+                "body": r#"{"data":{"content":"<p>正文</p>"}}"#,
+                "url": "https://api.example.test/content?item_id=1",
+                "code": 200,
+                "headers": {}
+            })
+            .to_string(),
+        );
+        let script = r#"
+            if (result.url().includes("content")) {
+                let c = JSON.parse(result.body());
+                c = c.data?.content || c.message || '暂不支持';
+                result = new Packages.io.legado.app.help.http.StrResponse(java.url, c);
+            }
+            result
+        "#;
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "result".to_string(),
+            resp_binding(&serde_json::json!({
+                "body": r#"{"data":{"content":"<p>正文</p>"}}"#,
+                "url": "https://api.example.test/content?item_id=1",
+                "code": 200,
+                "headers": {}
+            })),
+        );
+        let output = eval_js_with_bindings(
+            script,
+            r#"{"data":{"content":"<p>正文</p>"}}"#,
+            "https://api.example.test/content?item_id=1",
+            &bindings,
+        )
+        .expect("loginCheckJs 应执行成功");
+
+        let envelope: serde_json::Value = serde_json::from_str(&output).expect("应返回响应信封");
+        assert_eq!(
+            envelope.get("body").and_then(|v| v.as_str()),
+            Some("<p>正文</p>"),
+            "StrResponse(url, body) 的 body 必须被保留: {output}"
+        );
+        assert_eq!(
+            envelope.get("code").and_then(|v| v.as_u64()),
+            Some(200),
+            "StrResponse 构造的响应 code 固定为 200: {output}"
+        );
+        assert_eq!(
+            envelope.get("url").and_then(|v| v.as_str()),
+            Some("https://api.example.test/content?item_id=1"),
+            "java.url 应返回当前请求地址: {output}"
+        );
+    }
 
     #[test]
     fn java_date_format_to_chrono_converts_common_patterns() {
