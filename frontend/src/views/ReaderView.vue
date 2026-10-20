@@ -371,7 +371,7 @@
       :book="bookInfoBook"
     />
 
-    <SourceBrowserPanel :request="sourceBrowser" :background="chromeTheme.popup" :color="chromeTheme.fontColor" @close="sourceBrowser = null" @toast="(message: string) => appStore.showToast(message)" />
+    <SourceBrowserPanel :request="sourceBrowser" :background="chromeTheme.popup" :color="chromeTheme.fontColor" @close="sourceBrowser = null" @toast="(message: string) => appStore.showToast(message)" @import-link="importFromLink" />
   </div>
 </template>
 
@@ -431,6 +431,7 @@ import { useReaderSelection } from '../composables/useReaderSelection'
 import { useHorizontalPaging } from '../composables/useHorizontalPaging'
 import { useContinuousReading } from '../composables/useContinuousReading'
 import { useReaderAutoPlayback } from '../composables/useReaderAutoPlayback'
+import { useSourceImport } from '../composables/useSourceImport'
 
 const ReaderCatalog = defineAsyncComponent(() => import('../components/reader/ReaderCatalog.vue'))
 const ReadSettings = defineAsyncComponent(() => import('../components/reader/ReadSettings.vue'))
@@ -447,6 +448,8 @@ const ReaderSearchPanel = defineAsyncComponent(() => import('../components/reade
 const router = useRouter()
 const store = useReaderStore()
 const appStore = useAppStore()
+// 书源面板里点「一键导入」(yuedu:// / legado://) 时由这里完成入库。
+const { importFromLink } = useSourceImport()
 const READER_POSITION_PREFIX = 'reader-position:'
 const SERVER_PROGRESS_AUTOSAVE_MS = 10000
 

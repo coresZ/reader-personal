@@ -33,6 +33,8 @@ const emit = defineEmits<{
   loginData: [values: Record<string, unknown> | null]
   refreshLogin: []
   toast: [message: string]
+  /** 网页里点了书源仓库的「一键导入」链接(legado:// 或 yuedu://)。 */
+  importLink: [url: string]
 }>()
 type Panel = ShowBrowserRequest & {
   panelId: string
@@ -243,6 +245,11 @@ function handleMessage(event: MessageEvent) {
       clearConfirmation(panel.panelId)
       break
     case 'toast': message.value = String(data.message || ''); emit('toast', message.value); break
+    case 'importProtocol':
+      // 书源仓库的「一键导入」: 面板脚本截下 legado:// / yuedu:// 后转过来。
+      // 导入逻辑不放在这里 —— 面板只负责把链接送达, 由上层决定拉取与入库。
+      if (typeof data.url === 'string' && data.url) emit('importLink', data.url)
+      break
     case 'config':
       if (data.options && typeof data.options === 'object' && !Array.isArray(data.options)) {
         panel.options = { ...panel.options, ...data.options }

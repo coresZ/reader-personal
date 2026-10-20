@@ -904,19 +904,59 @@ pub struct RemoteSourceParam {
     url: String,
 }
 
+/// 从 `legado://` / `yuedu://` 一键导入链接里取出真正的 http(s) 地址。
+///
+/// 手机端这些是系统协议, PC 端没有注册, 用户在书源管理里直接粘贴整条链接
+/// 是自然用法 —— 直接把它交给 reqwest 会得到 `BadScheme`。这里按
+/// `?src=` / `?url=` 取值, 并只接受 http(s)(导入地址来自第三方网页,
+/// 不能让 `file:` 之类借道读取本地文件)。
+fn resolve_remote_source_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("legado://") || lower.starts_with("yuedu://")) {
+        // 普通 http(s) 地址: 原样使用, 保持既有行为。
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return Ok(trimmed.to_string());
+        }
+        return Err("请输入 http(s) 或 legado:// / yuedu:// 开头的一键导入链接".to_string());
+    }
+
+    let query = trimmed.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let mut candidate: Option<String> = None;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else { continue };
+        if key == "src" || key == "url" {
+            let decoded = urlencoding::decode(value).map(|v| v.into_owned()).unwrap_or_else(|_| value.to_string());
+            candidate = Some(decoded);
+            break;
+        }
+    }
+
+    let Some(candidate) = candidate else {
+        return Err("这个导入链接里没有 src 参数".to_string());
+    };
+    let candidate = candidate.trim();
+    let candidate_lower = candidate.to_ascii_lowercase();
+    if !(candidate_lower.starts_with("http://") || candidate_lower.starts_with("https://")) {
+        return Err("导入链接里的地址必须是 http(s)".to_string());
+    }
+    Ok(candidate.to_string())
+}
+
 #[tauri::command]
 pub async fn read_remote_source_file(
     state: tauri::State<'_, AppState>,
     req: RemoteSourceParam,
 ) -> Result<ApiResponse<Vec<String>>, AppError> {
     let client = state.book_service.http_client();
+    let target = resolve_remote_source_url(&req.url).map_err(AppError::BadRequest)?;
 
     let text = client
-        .get(&req.url)
+        .get(&target)
         .send()
         .await
         .map_err(|e| {
-            tracing::error!("Failed to fetch remote source from {}: {:?}", req.url, e);
+            tracing::error!("Failed to fetch remote source from {}: {:?}", target, e);
             AppError::BadRequest(format!("网络请求失败: {}", e))
         })?
         .text()
@@ -1014,6 +1054,39 @@ mod tests {
         let err = normalize_requested_source_urls(Some(&urls)).unwrap_err();
 
         assert!(matches!(err, AppError::BadRequest(message) if message.contains("100")));
+    }
+
+    /// 书源管理里的「网络导入」: 用户直接粘贴源仓库的一键导入链接是自然用法,
+    /// 直接交给 reqwest 会得到 `BadScheme`。这里必须把 src 取出来。
+    #[test]
+    fn resolve_remote_source_url_unwraps_import_links() {
+        assert_eq!(
+            resolve_remote_source_url(
+                "yuedu://booksource/importonline?src=https://www.yck2026.fun/yuedu/shuyuan/json/id/7965.json"
+            )
+            .unwrap(),
+            "https://www.yck2026.fun/yuedu/shuyuan/json/id/7965.json"
+        );
+        assert_eq!(
+            resolve_remote_source_url(
+                "legado://import/booksource?src=https%3A%2F%2Fexample.com%2Fs.json"
+            )
+            .unwrap(),
+            "https://example.com/s.json"
+        );
+        // 普通地址与前后空白照常处理。
+        assert_eq!(
+            resolve_remote_source_url("  https://example.com/a.json ").unwrap(),
+            "https://example.com/a.json"
+        );
+    }
+
+    #[test]
+    fn resolve_remote_source_url_rejects_unsafe_input() {
+        // 非 http(s) 目标不能被导入链接借道(避免读取本地文件)。
+        assert!(resolve_remote_source_url("legado://import/x?src=file:///C:/a.json").is_err());
+        assert!(resolve_remote_source_url("legado://import/x").is_err());
+        assert!(resolve_remote_source_url("mailto:a@b.c").is_err());
     }
 
     #[test]

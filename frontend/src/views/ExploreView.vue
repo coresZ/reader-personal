@@ -203,6 +203,7 @@
       :request="store.pendingBrowser"
       @close="store.closePendingBrowser()"
       @toast="onBrowserToast"
+      @import-link="importFromLink"
     />
   </div>
 </template>
@@ -219,6 +220,7 @@ import BookDetailModal from '../components/BookDetailModal.vue'
 import SourceBrowserPanel from '../components/SourceBrowserPanel.vue'
 import SourceLoginDialog from '../components/source-manager/SourceLoginDialog.vue'
 import { showContextMenu } from '../composables/useContextMenu'
+import { useSourceImport } from '../composables/useSourceImport'
 import type { Book, SearchBook } from '../types'
 import { exploreKindLabel, exploreKindType, type ExploreKind } from '../api/explore'
 import { searchMergeKey } from '../utils/searchRank'
@@ -356,6 +358,9 @@ function handleIntents() {
 function onBrowserToast(message: string) {
   appStore.showToast(message)
 }
+
+// 书源面板里点「一键导入」(yuedu:// / legado://) 时由这里完成入库。
+const { importFromLink } = useSourceImport()
 
 // 登录面板关闭后重新求值分类：登录态会决定部分分类能否取到数据
 //（聚合源的「晴天书架」「会员榜」未登录时是空的）。
