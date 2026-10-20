@@ -21,6 +21,7 @@ import {
 import { getReplaceRules } from '../api/replaceRule'
 import type { Book, BookChapter, Bookmark, ReplaceRule } from '../types'
 import { isLocalBook } from '../utils/localBook'
+import { PDF_PAGE_ATTR } from '../utils/pdfPages'
 import { saveRecentReadBook } from '../utils/recentBooks'
 import {
   DEFAULT_READER_BACKGROUND_OPACITY,
@@ -751,6 +752,10 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   function processContentForDisplay(text: string) {
+    // 本地 PDF 的「正文」是逐页占位元素 (页号写在 data-pdf-page 上), 页面内容
+    // 由 pdf.js 绘制: 简繁转换与净化替换都无从作用于图片, 却可能改写占位标记
+    // 本身, 因此原样返回。
+    if (text.includes(PDF_PAGE_ATTR)) return text
     // 与手机端 ContentProcessor 一致: 先简繁转换, 再应用净化替换。
     // 旧顺序会把替换结果再次交给 OpenCC, 例如「串行 → 序列」又会被 twp→cn
     // 词表改回「串行」, 表现为替换规则怎么设都无效。

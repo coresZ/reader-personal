@@ -39,7 +39,7 @@ reader-rust 是「阅读3.0」的 Rust 实现，当前形态为 **Tauri v2 桌�
 ### 模块结构
 
 - **`src/api/commands/`** — 全部 `#[tauri::command]`（原 axum handler 原地转型）。返回 `Result<ApiResponse<T>, AppError>` 信封。
-- **`src/api/protocol.rs`** — 自定义 URI 协议 `reader`（origin `http://reader.localhost`）：`/cover`、`/epub`、`/files`、`/bookSourceProxy`（登录代理 HTML 重写）、`/bookSourceClientLog`。
+- **`src/api/protocol.rs`** — 自定义 URI 协议 `reader`（origin `http://reader.localhost`）：`/cover`、`/epub`、`/pdf`、`/files`、`/bookSourceProxy`（登录代理 HTML 重写）、`/bookSourceClientLog`。
 - **`src/api/mod.rs`** — `AppState`（10 个 Arc service）+ `invoke_handler()` 聚合注册所有 command。
 - **`src/service/`** — 业务逻辑（book / book_source / book_group / local_txt / local_epub / json_document / ai_book / ai_model / update / user）。
 - **`src/parser/`** — 内容提取引擎（CSS/XPath/JSONPath/Regex/JS 模式自动识别）。
@@ -73,7 +73,7 @@ reader-rust 是「阅读3.0」的 Rust 实现，当前形态为 **Tauri v2 桌�
   - **症状**：无边框窗口在**最大化状态**下进全屏，客户区被钳到显示器工作区（`rcWork`，已排除任务栏），而窗口本身是整屏尺寸，于是露出高度等于任务栏的黑边。非最大化时 `showCmd` 不是 `SW_MAXIMIZE`，所以只有最大化状态能复现。
   - **打补丁的收益**：前端因此不必用「进全屏前先 `unmaximize`、退出后再 `maximize`」的变通。那个变通也能绕开黑边，但两次 `ShowWindow`（`SW_RESTORE` / `SW_MAXIMIZE`）都由 tao 异步派发到事件循环线程，退出全屏时会先看到一次窗口化动画、再来一次最大化动画。
   - **上游发布含此修复的版本后**：删除 `vendor/tao` 与 `Cargo.toml` 里的 `tao = { path = "vendor/tao" }` 条目即可，无需其它改动。
-- **本地 PDF 管线**（`src/service/local_pdf_book.rs`）：导入时一次性提取全文并按章落盘 `chapters/{index:05}.txt`（零填充五位，如 `00012.txt`），之后翻页是纯缓存直读（亚毫秒）。目录优先用 PDF 书签（`/Root/Outlines`），无书签时从正文认「第X回/章」标题（`detect_headings`），都没有才按 20 页/章分段。`collect_page_ids` 是页序的唯一来源，章节页号/正文提取/书签页映射都走它。提取出的每视觉行由 `merge_wrapped_lines` 重组回段落（栏宽 P85 估算 + 行尾句读双信号，标题/页码/缩进/空行独立成段；`EXTRACTOR_VERSION` 4，旧缓存读取时按新规则重提取）。
+- **本地 PDF 管线**（`src/service/local_pdf_book.rs` + `frontend/src/utils/pdfPages.ts`）：阅读形态与 Legado 的 `PdfFile` 一致——**按页渲染**，不做全文重排。导入只解析页数、书签、封面与 `/Info` 元数据，原文件落盘为书目录下的 `book.pdf`；章节正文是每页一个 `<div class="pdf-page" data-pdf-page="N">` 占位，前端经 `reader://` 的 `/pdf?bookUrl=` 取整本 PDF，用 pdf.js 逐页画到 canvas（扫描件、复杂版式都能原样显示）。目录优先用 PDF 书签（`/Root/Outlines`，深度优先扁平化），无书签时从正文认「第X回/章」标题（`detect_headings`），都没有才按 20 页/章分段；书签章超过 `PAGES_PER_CHAPTER` 页会再细分并加 `(1/n)` 序号，避免整本只标一个书签时出现上百页的巨型章节。`collect_page_ids` 仍是页序的唯一来源。本地 PDF 强制单章模式：不走左右翻页（会把整页图切块），也不进连续阅读（页渲染按单章创建与释放，换章要回收上一章的 canvas）。`EXTRACTOR_VERSION` 5，更早的文本缓存需重新导入同一文件升级。
 
 - **桌面 origin 迁移**：`http://127.0.0.1:*` → `http://tauri.localhost` 后 localStorage 偏好重置一次；书库数据（SQLite/文件）不受影响。
 

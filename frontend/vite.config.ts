@@ -24,6 +24,10 @@ export default defineConfig({
           if (id.includes('/src/utils/chinese.js')) {
             return 'chinese-convert'
           }
+          // pdf.js 只被本地 PDF 用到: 单独分块, 普通书籍不加载
+          if (id.includes('node_modules/pdfjs-dist')) {
+            return 'pdfjs'
+          }
           if (id.includes('node_modules/vue') || id.includes('node_modules/pinia') || id.includes('node_modules/vue-router')) {
             return 'vendor-core'
           }

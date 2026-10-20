@@ -392,6 +392,7 @@ import {
 } from '../utils/readerHoverControls'
 import { shouldPreferServerReadingPosition, type ReadingPositionSnapshot } from '../utils/readingPosition'
 import { isLocalBook, isLocalEpubBook } from '../utils/localBook'
+import { PDF_PAGE_ATTR, isPdfBook, releasePdfBook, renderPdfChapterPages } from '../utils/pdfPages'
 import { rewriteCssAssetUrls, toReaderAssetUrl } from '../utils/localEpubAsset'
 import { processSourceImageOptions } from '../utils/sourceImageOptions'
 import { repairSourceImageHtml } from '../utils/sourceImageHtml'
@@ -748,11 +749,23 @@ const readerProgressExitSaver = createReaderProgressExitSaver({
     await store.syncCurrentBookProgressFromLegadoOnExit()
   },
 })
-const isContinuousMode = computed(() =>
-  config.value.readMethod === '上下滚动' || config.value.readMethod === '上下滚动2',
+const isPdfBookMode = computed(() => isPdfBook(store.book))
+/**
+ * 本地 PDF 走「逐页 canvas」渲染, 既不参与按字号重排的左右翻页 (那会把一张
+ * 整页图切成几块), 也不进连续阅读: 那里的正文分散在多章块里, 而页渲染与
+ * 释放都是按单章做的 —— 一章一屏才能保证换章时把上一章的 canvas 全部回收。
+ */
+const isContinuousMode = computed(
+  () =>
+    !isPdfBookMode.value &&
+    (config.value.readMethod === '上下滚动' || config.value.readMethod === '上下滚动2'),
 )
-const hideReadChaptersMode = computed(() => config.value.readMethod === '上下滚动2')
-const isHorizontalPageMode = computed(() => config.value.readMethod === '左右翻页')
+const hideReadChaptersMode = computed(
+  () => !isPdfBookMode.value && config.value.readMethod === '上下滚动2',
+)
+const isHorizontalPageMode = computed(
+  () => config.value.readMethod === '左右翻页' && !isPdfBookMode.value,
+)
 const isIosWebkit = computed(() => {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : ''
   return /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && typeof navigator !== 'undefined' && navigator.maxTouchPoints > 1)
@@ -1262,7 +1275,59 @@ function renderChapterHtml(rawText: string) {
   return formatChapterHtml(store.processContentForDisplay(rawText || ''))
 }
 
-const formattedContent = computed(() => formatChapterHtml(store.displayContent || ''))
+/** 本地 PDF 的章节正文是逐页占位元素, 原样注入后交给 pdf.js 绘制。 */
+const isPdfPageChapter = computed(
+  () => isPdfBook(store.book) && (store.displayContent || '').includes(PDF_PAGE_ATTR),
+)
+
+const formattedContent = computed(() => {
+  if (isPdfPageChapter.value) return store.displayContent || ''
+  return formatChapterHtml(store.displayContent || '')
+})
+
+/** 上一章 PDF 页渲染的释放函数: 换章/卸载时必须调用, 否则 canvas 与文档常驻 */
+let disposePdfPages: (() => void) | null = null
+
+/** 每次发起渲染自增: 只有最后一次调用的结果才允许落到 DOM 上 */
+let pdfRenderToken = 0
+
+/**
+ * 把当前章的 PDF 页占位元素绘制成 canvas。
+ *
+ * 必须等 DOM 把 `formattedContent` 渲染完才有占位元素可画, 所以走 nextTick。
+ * 换章时先释放上一章的渲染结果, 否则 canvas 与整本 PDF 的文档会一直常驻
+ * (大书整本几十兆字节)。
+ */
+async function renderPdfPagesIfNeeded() {
+  const token = ++pdfRenderToken
+  disposePdfPages?.()
+  disposePdfPages = null
+  if (!isPdfPageChapter.value || !store.book) return
+  await nextTick()
+  // 这一拍里可能已经换过章 (正文监听是异步派发的): 过期的调用不能再画,
+  // 否则旧章的页会画进新章的容器。
+  if (token !== pdfRenderToken) return
+  const container = chapterTextRef.value
+  if (!container) return
+  const book = store.book
+  const contentSnapshot = store.displayContent
+  try {
+    const dispose = await renderPdfChapterPages(
+      container,
+      book,
+      () => token !== pdfRenderToken || store.displayContent !== contentSnapshot,
+    )
+    if (token !== pdfRenderToken) {
+      // 渲染期间又发起了新的渲染: 这一份结果作废, 连同已画的 canvas 一起释放
+      dispose()
+      return
+    }
+    disposePdfPages = dispose
+  } catch {
+    // PDF 读取或解析失败: 占位框会留下空白页, 不阻塞换章
+    if (token === pdfRenderToken) disposePdfPages = null
+  }
+}
 
 const {
   horizontalPageIndex,
@@ -3474,6 +3539,9 @@ onMounted(async () => {
   void store.fetchCustomFonts().catch(() => undefined)
   await waitForChapterListReady()
   if (readerViewUnmounted) return
+  // 直接进入阅读器(含刷新恢复)时正文已经就位, 不会再触发 store.content 的
+  // 变化监听 —— 本地 PDF 的页面渲染要在这里补一次。
+  void renderPdfPagesIfNeeded()
   loadSavedReadingPosition()
   window.addEventListener('keydown', handleKeydown)
   window.addEventListener('wheel', handleReaderWheel, { passive: false })
@@ -3539,6 +3607,10 @@ onUnmounted(() => {
     readerViewUnmounted = true
     persistReadingProgressKeepalive()
     appStore.stopReadingSession()
+  disposePdfPages?.()
+  disposePdfPages = null
+  // 离开阅读器: PDF 文档不再需要, 释放它占的内存
+  if (store.book?.bookUrl) void releasePdfBook(store.book.bookUrl)
   cancelPageScrollAnimation(scrollContainerRef.value)
   window.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('wheel', handleReaderWheel)
@@ -3650,6 +3722,7 @@ watch(
 // searchQuery, ...] 的 watch 负责(见下方), 它不动位置; 跳转落位交给 locateSearchMatch。
 watch(() => store.content, () => {
   loadedReaderImageSizes.clear()
+  void renderPdfPagesIfNeeded()
   if (!isHorizontalPageMode.value) return
   if (!pendingLegadoPageRestore.value) horizontalPageIndex.value = 0
   // 跨章回退时正文到达触发的这次重建, 才是"新章分页就绪"的主路径(见
@@ -3715,6 +3788,8 @@ watch(() => store.content, () => {
  * 一定是刷新前那一章, 不会再被 handleScroll 判成上一章。
  */
 watch(() => store.contentRefreshToken, async () => {
+  // 原地刷新(净化规则改动等)会重建正文 DOM: PDF 的 canvas 一并重画
+  void renderPdfPagesIfNeeded()
   if (!isContinuousMode.value) return
   const index = store.currentIndex
   const progress = store.chapterScrollProgress
@@ -3736,12 +3811,14 @@ watch(() => store.loading, (loading) => {
   }
 })
 
-watch(() => store.book?.bookUrl, () => {
+watch(() => store.book?.bookUrl, (_next, previous) => {
   // 换书(阅读器内切书、不重挂载)时清掉上一本残留的跳过标记与落位意图。
   // 标记现在是"命中的那一次进入即作废"的计数消费, 没有时间兜底: 换书后若
   // 恰好进入同号章节, 残留标记会误豁免那一次本该恢复的位置。
   skipPositionRestoreIndex = null
   clearPendingPrevChapterLanding()
+  // PDF 文档按 bookUrl 常驻内存, 换书时释放上一本, 否则整本 PDF 一直占着。
+  if (previous) void releasePdfBook(previous)
   loadSavedReadingPosition()
   scheduleRefreshOfflineCacheState()
 })
@@ -4122,6 +4199,41 @@ watch(
   user-select: text;
   -webkit-user-select: text;
   -webkit-touch-callout: default;
+}
+
+/* 本地 PDF: 每个占位块就是原书的一页, 由 pdf.js 画成 canvas。
+   渲染前先占住约一页的比例, 避免图片插入时正文跳动。 */
+.pdf-page {
+  display: flex;
+  justify-content: center;
+  margin: 0 auto 12px;
+  max-width: 100%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+  min-height: 60vh;
+  align-items: center;
+}
+
+.pdf-page-canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.pdf-page.pdf-page-ready {
+  min-height: 0;
+}
+
+.pdf-page.pdf-page-missing {
+  min-height: 120px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.pdf-page.pdf-page-missing::after {
+  content: '本页无法显示';
+  color: #999;
+  font-size: 0.9em;
 }
 
 /* 页内正文列：宽度 = 行宽(「页面宽度」设置, 由 JS 写进 --reader-text-width)。

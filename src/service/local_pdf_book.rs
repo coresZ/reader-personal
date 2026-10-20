@@ -18,11 +18,10 @@ const MIN_DOUBLED_RENDER_PAIRS: usize = 3;
 /// 无书签且正文里也认不出章节标题时, 按固定页数分段 (Legado 用 10,
 /// 大书取 20 平衡目录长度)
 pub const PAGES_PER_CHAPTER: usize = 20;
-/// chapters.json 结构/缓存语义版本。4 = 在 3 (导入期全量提取 + 章节级文本
-/// 缓存 chapters/{i}.txt) 基础上把提取行重组为段落 (merge_wrapped_lines)。
-/// 更早版本: <3 按页缓存在 pages/ 且章节切分规则不同, 3 行未合并段落,
-/// 读取时按本版本重新提取。
-const EXTRACTOR_VERSION: u32 = 4;
+/// chapters.json 结构版本。5 = 导入只做目录/封面/元数据, 正文按页交给前端
+/// 渲染 (Legado 的 PdfFile 分工)。更早版本 (≤4) 的缓存是文本提取产物,
+/// 用户重新导入同一文件即可升级 (hash 幂等覆盖)。
+const EXTRACTOR_VERSION: u32 = 5;
 /// 书签总条目/层级深度上限, 防损坏或恶意 PDF 的书签环拖垮导入。
 /// 同层兄弟 (Next 链) 走循环不占栈, 深度只计 First 嵌套层级, 因此可以
 /// 收得很紧; 环由 visited 去重截断。
@@ -37,6 +36,10 @@ struct StoredPdfChapter {
     index: i32,
     page_start: usize,
     page_end: usize,
+    /// 本章是「按页渲染成图片」的章节(本地 PDF 的默认形态), 前端据此走
+    /// canvas 渲染而不是纯文本展示。缺省为 false, 兼容旧索引。
+    #[serde(default)]
+    render_pages: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +54,12 @@ struct StoredPdfIndex {
     page_count: usize,
     #[serde(default)]
     extractor_version: u32,
+    /// PDF 文档级元数据 (/Info), 供书架显示书名与作者。缺失时用文件名与
+    /// 「本地导入」兜底。
+    #[serde(default)]
+    doc_title: Option<String>,
+    #[serde(default)]
+    doc_author: Option<String>,
     chapters: Vec<StoredPdfChapter>,
 }
 
@@ -180,30 +189,6 @@ fn extract_pages_serial(doc: &Document, page_ids: &[ObjectId]) -> Vec<String> {
             .unwrap_or_default()
         })
         .collect()
-}
-
-/// 载入 PDF 并提取指定页区间 (闭区间, 越界自动收敛)。CPU 密集, 交给
-/// blocking 线程池。
-async fn extract_page_range_blocking(
-    bytes: Vec<u8>,
-    start: usize,
-    end: usize,
-) -> Result<Vec<String>, AppError> {
-    tokio::task::spawn_blocking(move || {
-        let doc = load_pdf(&bytes)?;
-        let ids = collect_page_ids(&doc);
-        let lo = start.min(ids.len());
-        let hi = (end + 1).min(ids.len());
-        if lo >= hi {
-            return Ok(Vec::new());
-        }
-        Ok(extract_pages_from_doc(&doc, &ids[lo..hi])
-            .iter()
-            .map(|p| normalize_page_text(p))
-            .collect())
-    })
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("PDF 提取任务失败: {e}")))?
 }
 
 fn load_pdf(bytes: &[u8]) -> Result<Document, AppError> {
@@ -526,16 +511,16 @@ fn is_chapter_digit(c: char) -> bool {
         )
 }
 
-/// 丢弃没有任何文字的章节并重新编号。封面图页、插页会被切成空章,
-/// 打开就是一片空白 —— 与其让读者点进去报错, 不如目录里就不出现。
-fn drop_blank_chapters(
+/// 重新编号章节, 让 url 与 index 连续。
+///
+/// 旧的文本模式会在这里丢弃「没有任何文字的章节」(封面图页、插页), 但按页
+/// 渲染后每页都有画面: 扫描件整本都没有文本, 按文字判空会把整本书丢光。
+fn renumber_chapters(
     book_url: &str,
     chapters: Vec<StoredPdfChapter>,
-    pages: &[String],
 ) -> Vec<StoredPdfChapter> {
     chapters
         .into_iter()
-        .filter(|c| !join_pages(pages, c.page_start, c.page_end).trim().is_empty())
         .enumerate()
         .map(|(index, chapter)| StoredPdfChapter {
             url: build_chapter_url(book_url, index),
@@ -573,6 +558,7 @@ fn build_chapters(
             index: chapters.len() as i32,
             page_start: start,
             page_end: end,
+            render_pages: true,
         });
     };
 
@@ -587,7 +573,7 @@ fn build_chapters(
                 .get(i + 1)
                 .map(|(_, next_start)| next_start.saturating_sub(1))
                 .unwrap_or(page_count - 1);
-            push_chapter(&mut chapters, title.clone(), *start, end);
+            push_split_chapter(&mut chapters, &push_chapter, title, *start, end);
         }
     } else {
         let mut start = 0;
@@ -604,6 +590,37 @@ fn build_chapters(
         }
     }
     chapters
+}
+
+/// 书签章超过 PAGES_PER_CHAPTER 页时再按固定页数细分。
+///
+/// 有的 PDF 只有一个顶层书签覆盖整本正文 (例如整本书只标了「活着」一条,
+/// 147 页), 直接当一章就是「一个 147 页的巨型章节」: 目录只有一栏、进度条
+/// 无法定位、预加载也会一次拉完整章。细分后保留原书名, 加「(1/8)」序号,
+/// 与 Legado 按固定页数切段的做法一致。
+fn push_split_chapter(
+    chapters: &mut Vec<StoredPdfChapter>,
+    push: &impl Fn(&mut Vec<StoredPdfChapter>, String, usize, usize),
+    title: &str,
+    start: usize,
+    end: usize,
+) {
+    let span = end.saturating_sub(start) + 1;
+    if span <= PAGES_PER_CHAPTER {
+        push(chapters, title.to_string(), start, end);
+        return;
+    }
+    let parts = span.div_ceil(PAGES_PER_CHAPTER);
+    for part in 0..parts {
+        let part_start = start + part * PAGES_PER_CHAPTER;
+        let part_end = (part_start + PAGES_PER_CHAPTER - 1).min(end);
+        push(
+            chapters,
+            format!("{title} ({}/{parts})", part + 1),
+            part_start,
+            part_end,
+        );
+    }
 }
 
 /// 页序的唯一来源: 章节页号、正文提取、书签页映射都走这里, 三者不会错位。
@@ -741,9 +758,11 @@ impl LocalPdfBookService {
         }
     }
 
-    /// 导入: 解析页数/书签/封面, 并一次性提取全部页文本 (共享解析器,
-    /// 千页中文书约 1.5 秒), 按章节落盘。之后翻页全是缓存直读。
-    /// 顺带用全文补一件书签做不到的事: PDF 不带书签时从正文认出回目标题。
+    /// 导入: 只解析页数/书签/封面/元数据, 不做全文提取。
+    ///
+    /// 阅读形态与 Legado 的 PdfFile 一致: 正文按页渲染成图片, 目录优先用 PDF
+    /// 书签, 没有书签才按 PAGES_PER_CHAPTER 页一段。整本 PDF 原样落盘,
+    /// 由前端 pdf.js 按需渲染 —— 扫描件也能读, 不再有「提取不到文本」的失败。
     pub async fn import_pdf_book(
         &self,
         user_ns: &str,
@@ -754,32 +773,28 @@ impl LocalPdfBookService {
         let safe_file_name = sanitize_pdf_file_name(file_name);
 
         let owned = bytes.to_vec();
-        let (pages, outline, cover) = tokio::task::spawn_blocking(move || {
+        let parsed = tokio::task::spawn_blocking(move || {
             let doc = load_pdf(&owned)?;
             let page_ids = collect_page_ids(&doc);
             let cover = extract_cover(&doc);
-            let pages: Vec<String> = extract_pages_from_doc(&doc, &page_ids)
-                .iter()
-                .map(|p| normalize_page_text(p))
-                .collect();
-            // 书签是权威目录; 没有书签才退回从正文认标题
+            let meta = extract_doc_meta(&doc);
+            // 书签是权威目录; 没有书签才退回正文识别
             let mut outline = extract_outline(&doc, &page_ids);
             if outline.is_empty() {
+                let pages: Vec<String> = extract_pages_from_doc(&doc, &page_ids)
+                    .iter()
+                    .map(|p| normalize_page_text(p))
+                    .collect();
                 outline = detect_headings(&pages);
             }
-            Ok::<_, AppError>((pages, outline, cover))
+            Ok::<_, AppError>((page_ids.len(), outline, cover, meta))
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("PDF 解析任务失败: {e}")))??;
 
-        let page_count = pages.len();
+        let (page_count, outline, cover, meta) = parsed;
         if page_count == 0 {
             return Err(AppError::BadRequest("PDF 文件没有可读页面".to_string()));
-        }
-        if pages.iter().all(|p| p.trim().is_empty()) {
-            return Err(AppError::BadRequest(
-                "PDF 文件未提取到任何文本内容（可能是扫描件/图片 PDF）".to_string(),
-            ));
         }
 
         // hash 基于文件字节: 同一文件重复导入幂等覆盖
@@ -790,19 +805,16 @@ impl LocalPdfBookService {
             md5_hex_bytes(bytes)
         ));
         let book_url = format!("{}:{}", LOCAL_PDF_ORIGIN, hash);
-        let chapters = drop_blank_chapters(
+        let chapters = renumber_chapters(
             &book_url,
             build_chapters(&book_url, page_count, &outline),
-            &pages,
         );
         if chapters.is_empty() {
-            return Err(AppError::BadRequest(
-                "PDF 文件未提取到任何可读章节".to_string(),
-            ));
+            return Err(AppError::BadRequest("PDF 文件没有可读章节".to_string()));
         }
 
         let book_dir = self.book_dir(user_ns, &book_url)?;
-        fs::create_dir_all(book_dir.join("chapters"))
+        fs::create_dir_all(&book_dir)
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
         fs::write(book_dir.join("book.pdf"), bytes)
@@ -811,21 +823,29 @@ impl LocalPdfBookService {
         if let Some((cover_bytes, ext)) = &cover {
             let _ = fs::write(book_dir.join(format!("cover.{ext}")), cover_bytes).await;
         }
-        for chapter in &chapters {
-            let text = join_pages(&pages, chapter.page_start, chapter.page_end);
-            fs::write(chapter_text_path(&book_dir, chapter.index), text)
-                .await
-                .map_err(|e| AppError::Internal(e.into()))?;
-        }
 
+        let name = meta
+            .title
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| book_name_from_file_name(&safe_file_name));
+        let author = meta
+            .author
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| "本地导入".to_string());
         let index = StoredPdfIndex {
             book_url: book_url.clone(),
-            name: book_name_from_file_name(&safe_file_name),
+            name: name.clone(),
             file_name: safe_file_name,
             byte_len: bytes.len(),
-            char_len: pages.iter().map(|p| p.chars().count()).sum(),
+            char_len: 0,
             page_count,
             extractor_version: EXTRACTOR_VERSION,
+            doc_title: meta.title,
+            doc_author: meta.author,
             chapters,
         };
         let data =
@@ -835,14 +855,14 @@ impl LocalPdfBookService {
             .map_err(|e| AppError::Internal(e.into()))?;
 
         Ok(Book {
-            name: index.name,
-            author: "本地导入".to_string(),
+            name,
+            author,
             book_url: book_url.clone(),
             origin: LOCAL_PDF_ORIGIN.to_string(),
             origin_name: Some(LOCAL_PDF_ORIGIN_NAME.to_string()),
-            cover_url: cover.as_ref().map(|(_, ext)| {
-                format!("/local-pdf/{hash}/cover.{ext}")
-            }),
+            cover_url: cover
+                .as_ref()
+                .map(|(_, ext)| format!("/local-pdf/{hash}/cover.{ext}")),
             toc_url: Some(book_url),
             can_update: Some(false),
             dur_chapter_index: Some(0),
@@ -850,7 +870,7 @@ impl LocalPdfBookService {
             total_chapter_num: Some(index.chapters.len() as i32),
             latest_chapter_title: index.chapters.last().map(|c| c.title.clone()),
             kind: Some("本地PDF".to_string()),
-            word_count: Some(format!("{}字", index.char_len)),
+            word_count: Some(format!("{page_count} 页")),
             ..Book::default()
         })
     }
@@ -864,7 +884,11 @@ impl LocalPdfBookService {
         let pages = display_page_count(&index);
         Ok(Book {
             name: index.name,
-            author: "本地导入".to_string(),
+            author: index
+                .doc_author
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "本地导入".to_string()),
             book_url: index.book_url.clone(),
             origin: LOCAL_PDF_ORIGIN.to_string(),
             origin_name: Some(LOCAL_PDF_ORIGIN_NAME.to_string()),
@@ -874,11 +898,7 @@ impl LocalPdfBookService {
             total_chapter_num: Some(index.chapters.len() as i32),
             latest_chapter_title: index.chapters.last().map(|c| c.title.clone()),
             kind: Some("本地PDF".to_string()),
-            word_count: Some(if index.char_len > 0 {
-                format!("{}字", index.char_len)
-            } else {
-                format!("{pages} 页")
-            }),
+            word_count: Some(format!("{pages} 页")),
             ..Book::default()
         })
     }
@@ -915,12 +935,11 @@ impl LocalPdfBookService {
             .collect())
     }
 
-    /// 章节正文: 命中章节缓存时零解析直读。缓存缺失 (导入被打断、文件被
-    /// 清理) 时只重提取本章覆盖的页并回填, 不牵动整本。
+    /// 章节正文: 返回按页渲染的图片占位 HTML, 由前端用 pdf.js 逐页绘制。
     ///
-    /// 旧版本索引 (extractor_version < 4, 行未合并段落或切分规则不同) 不能
-    /// 借用其缓存, 也不就地升级版本号 (那需要重切章节、改动目录); 每次读
-    /// 都重提取本章。用户重新导入同一文件即可升级 (hash 幂等覆盖)。
+    /// `<img src="local-pdf-page:<bookUrl>?page=N">` 只是页号载体 —— 图片本身
+    /// 由前端渲染, 后端不产出位图。这样扫描件、复杂排版都能原样阅读, 也不
+    /// 再需要导入期全文提取与 chapters/ 缓存。
     pub async fn get_content(&self, user_ns: &str, chapter_url: &str) -> Result<String, AppError> {
         let (book_url, requested_index) = parse_chapter_url(chapter_url)?;
         let index = self.read_index(user_ns, &book_url).await?;
@@ -929,23 +948,20 @@ impl LocalPdfBookService {
             .iter()
             .find(|c| c.index == requested_index)
             .ok_or_else(|| AppError::BadRequest("章节不存在".to_string()))?;
-        let book_dir = self.book_dir(user_ns, &book_url)?;
-
-        if index.extractor_version >= EXTRACTOR_VERSION {
-            if let Ok(text) = fs::read_to_string(chapter_text_path(&book_dir, chapter.index)).await
-            {
-                return ensure_non_blank(text);
-            }
+        let start = chapter.page_start.min(index.page_count.saturating_sub(1));
+        let end = chapter.page_end.min(index.page_count.saturating_sub(1));
+        if index.page_count == 0 || end < start {
+            return Err(AppError::BadRequest("本章没有可显示的页面".to_string()));
         }
+        Ok(render_page_placeholders(start, end))
+    }
 
-        let bytes = fs::read(book_dir.join("book.pdf"))
+    /// 读取整本 PDF 原始字节, 供前端 pdf.js 解析渲染
+    pub async fn read_pdf_file(&self, user_ns: &str, book_url: &str) -> Result<Vec<u8>, AppError> {
+        let book_dir = self.book_dir(user_ns, book_url)?;
+        fs::read(book_dir.join("book.pdf"))
             .await
-            .map_err(map_local_pdf_read_error)?;
-        let pages = extract_page_range_blocking(bytes, chapter.page_start, chapter.page_end).await?;
-        let text = join_pages(&pages, 0, pages.len().saturating_sub(1));
-        let _ = fs::create_dir_all(book_dir.join("chapters")).await;
-        let _ = fs::write(chapter_text_path(&book_dir, chapter.index), &text).await;
-        ensure_non_blank(text)
+            .map_err(map_local_pdf_read_error)
     }
 
     /// 读取已落盘的封面文件 (protocol.rs 的 /local-pdf/ 路由调用)
@@ -1031,10 +1047,55 @@ fn map_local_pdf_read_error(err: std::io::Error) -> AppError {
     }
 }
 
-fn chapter_text_path(book_dir: &Path, chapter_index: i32) -> PathBuf {
-    book_dir
-        .join("chapters")
-        .join(format!("{chapter_index:05}.txt"))
+/// 章节正文的图片占位 HTML: 每页一个占位元素, 页号写在 `data-pdf-page` 里。
+///
+/// 这是给前端 pdf.js 的「页清单」, 不是真的图片地址 —— 页面内容由前端按
+/// bookUrl 取整本 PDF 后逐页绘制 (与 Legado 把 PdfRenderer 的输出当章节内容
+/// 同一分工)。`src` 只是占位符, 不发起请求, 免得 404 污染控制台。
+fn render_page_placeholders(start: usize, end: usize) -> String {
+    (start..=end)
+        .map(|page| {
+            format!(
+                "<div class=\"pdf-page\" data-pdf-page=\"{page}\"></div>"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// PDF 文档元数据 (/Info 的 Title/Author)。解码与书签标题同源, 读不到返回空。
+fn extract_doc_meta(doc: &Document) -> PdfDocMeta {
+    let mut meta = PdfDocMeta::default();
+    let Ok(trailer) = doc.trailer.get(b"Info") else {
+        return meta;
+    };
+    let Some(info) = deref_dict(doc, trailer) else {
+        return meta;
+    };
+    let read = |key: &[u8]| {
+        info.get(key).ok().and_then(|obj| match obj {
+            Object::String(bytes, _) => {
+                let value = decode_pdf_text_string(bytes);
+                let trimmed = value.trim().trim_start_matches('\u{FEFF}');
+                // calibre 等工具常把标题写成乱码字节, 长度异常或全是控制字符时丢弃
+                if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            _ => None,
+        })
+    };
+    meta.title = read(b"Title");
+    meta.author = read(b"Author");
+    meta
+}
+
+#[derive(Debug, Default)]
+struct PdfDocMeta {
+    title: Option<String>,
+    author: Option<String>,
 }
 
 /// 索引里的页数: 新数据存 page_count, 旧数据从最后一章推
@@ -1046,186 +1107,6 @@ fn display_page_count(index: &StoredPdfIndex) -> usize {
     }
 }
 
-/// 段落重组 —— 把 PDF 提取出的「每视觉行一段」拼回真正的段落。
-///
-/// PDF 排版只有行的概念没有段的概念, 提取出的文本每一视觉行一个换行,
-/// 直接展示就是一句被拆成几段。判据有三层:
-/// 1. 行宽信号: 写满整行 (≥ 85% 栏宽) 且行尾无句读 → 排版换行, 与下一行
-///    拼回同段; 没写满的短行是段落末行 (或诗行/对话), 断段。
-/// 2. 句读信号: 行尾是句末标点 (。!?… 及其后的收尾引号) → 断段。宁可断在
-///    句界, 也绝不把句子从中间截断。
-/// 3. 结构信号: 章节标题行 (第X回/章…)、页码行、空行永远独立成段;
-///    行首缩进 (全角空格开头) 之前断段。
-///
-/// 栏宽按本章非短行行宽的 P85 估算 (正文行大多写满整行)。栏宽过窄
-/// (< MIN_MERGE_COLUMN_WIDTH, 如整章诗行) 时判定不可信, 放弃合并维持
-/// 逐行分段; 混排在正文章节里的诗句/对话行宽必然远小于栏宽, 不受影响。
-fn merge_wrapped_lines(text: &str) -> String {
-    /// 整行判定阈值: 行宽达到栏宽的这个比例视为「写满」
-    const FULL_LINE_RATIO: f64 = 0.85;
-    const MIN_COLUMN_SAMPLE_WIDTH: f64 = 4.0;
-    /// 启用合并的最小栏宽: 常见书页正文栏约 25-40 全角字宽, 诗行/竖排等
-    /// 窄栏说明栏宽估计是在一串等宽短行上做的, 不可信
-    const MIN_MERGE_COLUMN_WIDTH: f64 = 16.0;
-
-    let lines: Vec<&str> = text.lines().collect();
-    let column = estimate_column_width(&lines, MIN_COLUMN_SAMPLE_WIDTH);
-    let full_line_width = if column < MIN_MERGE_COLUMN_WIDTH {
-        f64::INFINITY
-    } else {
-        column * FULL_LINE_RATIO
-    };
-
-    let mut paragraphs: Vec<String> = Vec::new();
-    let mut pending: Option<String> = None;
-    for line in &lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            if let Some(p) = pending.take() {
-                paragraphs.push(p);
-            }
-            continue;
-        }
-        if is_standalone_line(trimmed) {
-            if let Some(p) = pending.take() {
-                paragraphs.push(p);
-            }
-            paragraphs.push(trimmed.to_string());
-            continue;
-        }
-        // 行首缩进检测必须看原始行: trim() 会把全角空格一并剥掉
-        let indented = line.starts_with('\u{3000}') || line.starts_with("  ");
-        let merge_with_prev = pending.as_ref().is_some_and(|prev| {
-            !indented
-                && !ends_with_sentence_terminal(prev)
-                && line_width_units(prev) >= full_line_width
-        });
-        if merge_with_prev {
-            let prev = pending.as_mut().expect("is_some_and 已确认");
-            if needs_ascii_join(prev, trimmed) {
-                prev.push(' ');
-            }
-            prev.push_str(trimmed);
-        } else {
-            if let Some(p) = pending.take() {
-                paragraphs.push(p);
-            }
-            pending = Some(trimmed.to_string());
-        }
-    }
-    if let Some(p) = pending.take() {
-        paragraphs.push(p);
-    }
-    paragraphs.join("\n")
-}
-
-/// 估算版心栏宽 (全角字宽单位): 正文行大多写满整行, 取高分位 (P85) 抗
-/// 标题/段落末行等短行干扰。可用行不足时返回 0, 由调用方决定不启用合并。
-fn estimate_column_width(lines: &[&str], min_sample_width: f64) -> f64 {
-    let mut widths: Vec<f64> = lines
-        .iter()
-        .map(|l| line_width_units(l.trim()))
-        .filter(|w| *w >= min_sample_width)
-        .collect();
-    if widths.is_empty() {
-        return 0.0;
-    }
-    widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let idx = (widths.len() * 85 / 100).min(widths.len() - 1);
-    widths[idx]
-}
-
-/// 字宽单位: CJK 与全角字符计 1, 半角字符与空格计 0.5 (近似排版宽度)
-fn char_width_units(c: char) -> f64 {
-    if c >= '\u{2E80}' || c == '\u{3000}' {
-        1.0
-    } else {
-        0.5
-    }
-}
-
-fn line_width_units(line: &str) -> f64 {
-    line.chars().map(char_width_units).sum()
-}
-
-/// 行尾是否句末标点: 先剥掉收尾引号/括号, 看剩下的最后一个字。
-/// 分号/冒号是句内停顿, 不算段末。
-fn ends_with_sentence_terminal(line: &str) -> bool {
-    let mut chars: Vec<char> = line.trim_end().chars().collect();
-    while matches!(chars.last(), Some(c) if is_closing_delimiter(*c)) {
-        chars.pop();
-    }
-    matches!(
-        chars.last(),
-        Some('。' | '！' | '？' | '…' | '.' | '!' | '?')
-    )
-}
-
-fn is_closing_delimiter(c: char) -> bool {
-    matches!(
-        c,
-        '」' | '』' | '”' | '’' | '"' | '）' | ')' | ']' | '】' | '〉' | '》'
-    )
-}
-
-/// 独立成段的行: 章节标题 (第X回/章…) 与页码行
-fn is_standalone_line(line: &str) -> bool {
-    is_heading_line(line, 40) || is_page_number_like(line)
-}
-
-/// 页码行: 短行, 由数字 (阿拉伯/汉字/罗马) 加装饰符构成,
-/// 如「12」「- 3 -」「· 一百二十 ·」
-fn is_page_number_like(line: &str) -> bool {
-    const MAX_PAGE_NUMBER_WIDTH: f64 = 6.0;
-    let mut width = 0.0;
-    let mut has_numeral = false;
-    for c in line.trim().chars() {
-        if c.is_ascii_digit() || is_chapter_digit(c) {
-            has_numeral = true;
-            width += 1.0;
-        } else if matches!(
-            c,
-            '-' | '—' | '－' | '·' | '.' | '。' | ' ' | '\u{3000}' | 'V' | 'v'
-                | 'X' | 'x' | 'I' | 'i' | 'L' | 'l' | 'C' | 'c' | 'D' | 'M' | 'm'
-        ) {
-            width += 0.5;
-        } else {
-            return false;
-        }
-    }
-    has_numeral && width <= MAX_PAGE_NUMBER_WIDTH
-}
-
-/// 拼接两行时, 两侧都是半角字母数字则补一个空格 (西文按空格分词)
-fn needs_ascii_join(prev: &str, next: &str) -> bool {
-    prev.ends_with(|c: char| c.is_ascii_alphanumeric())
-        && next.starts_with(|c: char| c.is_ascii_alphanumeric())
-}
-
-/// 拼接 [start, end] 闭区间的页文本并重组段落 (页与页之间保持分段, 页
-/// 眉页脚不会被并进正文), 空白页不留多余分隔
-fn join_pages(pages: &[String], start: usize, end: usize) -> String {
-    if start >= pages.len() {
-        return String::new();
-    }
-    let joined = pages[start..=end.min(pages.len() - 1)]
-        .iter()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    merge_wrapped_lines(&joined)
-}
-
-/// 全空白视为不可读 (扫描件/图片型 PDF), 让上层给出可理解的报错
-fn ensure_non_blank(text: String) -> Result<String, AppError> {
-    if text.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "本章未提取到文本（PDF 可能是扫描件/图片型）".to_string(),
-        ));
-    }
-    Ok(text)
-}
 
 #[cfg(test)]
 mod tests {
@@ -1291,135 +1172,12 @@ mod tests {
     }
 
     #[test]
-    fn join_pages_skips_blank_pages() {
-        let pages = vec![
-            "第一页".to_string(),
-            "   ".to_string(),
-            "第三页".to_string(),
-        ];
-        // 段落重组后页与页之间单换行分段 (空行被折叠)
-        assert_eq!(join_pages(&pages, 0, 2), "第一页\n第三页");
-        assert_eq!(join_pages(&pages, 2, 99), "第三页");
-        assert_eq!(join_pages(&pages, 99, 120), "");
-    }
-
-    /// 21 全角字宽、行尾无句读的「写满行」
-    fn full_line(suffix: &str) -> String {
-        let mut line = "一二三四五六七八九十一二三四五六七八九十".to_string();
-        line.push_str(suffix);
-        line
-    }
-
-    #[test]
-    fn merge_wrapped_lines_rejoins_split_sentences() {
-        // 首行写满且以逗号结尾 → 是排版换行, 与下一行拼回同段;
-        // 拼回后的段以句号收尾, 下一段从「新的段落」开始
-        let text = format!("{}\n周了。\n新的段落。", full_line("，"));
-        assert_eq!(
-            merge_wrapped_lines(&text),
-            format!("{}\n新的段落。", full_line("，周了。"))
-        );
-    }
-
-    #[test]
-    fn merge_wrapped_lines_breaks_after_sentence_terminal() {
-        // 写满行以句号收尾 → 句界断段 (即使下一行其实是同段的延续也不会
-        // 从句子中间截断)
-        let text = format!("{}\n他接着说。", full_line("。"));
-        assert_eq!(
-            merge_wrapped_lines(&text),
-            format!("{}\n他接着说。", full_line("。"))
-        );
-    }
-
-    #[test]
-    fn merge_wrapped_lines_keeps_short_lines_separate() {
-        // 整章短行 (栏宽 < 16 字宽, 如诗行): 放弃合并, 逐行分段
-        let verse = "床前明月光，\n疑是地上霜。\n举头望明月，\n低头思故乡。";
-        assert_eq!(merge_wrapped_lines(verse), verse);
-        // 对话短行同理, 即使章节里有正文行拉高栏宽估计: 短行永远断段
-        let mixed = format!("{}\n好的。\n他也点头。", full_line("，"));
-        let merged = merge_wrapped_lines(&mixed);
-        assert!(merged.starts_with(&full_line("，好的。")));
-        assert!(merged.ends_with("\n他也点头。"));
-    }
-
-    #[test]
-    fn merge_wrapped_lines_keeps_headings_standalone() {
-        // 标题行前后都断段, 不被并进正文
-        let text = format!("{}\n第一回　灵根育孕源流出\n正文从这里开始", full_line("，"));
-        assert_eq!(
-            merge_wrapped_lines(&text),
-            format!("{}\n第一回　灵根育孕源流出\n正文从这里开始", full_line("，"))
-        );
-    }
-
-    #[test]
-    fn merge_wrapped_lines_keeps_page_numbers_standalone() {
-        // 页码行独立成段, 不被并进页尾正文, 也不吞掉下一页开头
-        let text = format!("{}\n12\n他继续说了下去。", full_line("，"));
-        assert_eq!(
-            merge_wrapped_lines(&text),
-            format!("{}\n12\n他继续说了下去。", full_line("，"))
-        );
-        assert!(is_page_number_like("- 3 -"));
-        assert!(is_page_number_like("· 一百二十 ·"));
-        assert!(!is_page_number_like("第12章 标题"));
-        assert!(!is_page_number_like("abc123"));
-    }
-
-    #[test]
-    fn merge_wrapped_lines_breaks_before_indented_line() {
-        // 行首全角空格缩进 = 新段落, 即便上一行写满且无句读
-        let text = format!("{}\n\u{3000}\u{3000}新段从这里开始。", full_line("，"));
-        assert_eq!(
-            merge_wrapped_lines(&text),
-            format!("{}\n新段从这里开始。", full_line("，"))
-        );
-    }
-
-    #[test]
-    fn merge_wrapped_lines_adds_ascii_space_when_merging_ascii() {
-        // 西文合并补空格; 中西混排直接拼接
-        let long_ascii = "the quick brown fox jumps over the lazy dog now";
-        let text = format!("{long_ascii}\nand then it ran away");
-        let merged = merge_wrapped_lines(&text);
-        assert!(merged.contains("lazy dog now and then it ran away"));
-
-        let mixed = format!("{}\nOK 继续说", full_line("，"));
-        assert!(merge_wrapped_lines(&mixed).contains("，OK 继续说"));
-    }
-
-    #[test]
-    fn ends_with_sentence_terminal_handles_quotes_and_ellipses() {
-        // 句末标点后跟收尾引号/括号
-        assert!(ends_with_sentence_terminal("他说：「住手！」"));
-        assert!(ends_with_sentence_terminal("「我走了。」"));
-        assert!(ends_with_sentence_terminal("也许吧……"));
-        assert!(ends_with_sentence_terminal("It was over."));
-        // 句内停顿/未收尾
-        assert!(!ends_with_sentence_terminal("他说："));
-        assert!(!ends_with_sentence_terminal("其一、"));
-        assert!(!ends_with_sentence_terminal("然而"));
-    }
-
-    #[test]
-    fn join_pages_merges_paragraphs_within_chapter() {
-        let pages = vec![
-            format!("{}\n周了。", full_line("，")),
-            "第二页开头。".to_string(),
-        ];
-        // 页内重组, 页与页之间保持分段
-        assert_eq!(
-            join_pages(&pages, 0, 1),
-            format!("{}\n第二页开头。", full_line("，周了。"))
-        );
-    }
-
-    #[test]
-    fn ensure_non_blank_rejects_empty() {
-        assert!(ensure_non_blank("  \n ".to_string()).is_err());
-        assert_eq!(ensure_non_blank("正文".to_string()).unwrap(), "正文");
+    fn render_page_placeholders_lists_each_page_once() {
+        let html = render_page_placeholders(2, 4);
+        assert!(html.contains("data-pdf-page=\"2\""));
+        assert!(html.contains("data-pdf-page=\"4\""));
+        assert!(!html.contains("data-pdf-page=\"5\""));
+        assert_eq!(html.matches("class=\"pdf-page\"").count(), 3);
     }
 
     #[test]
@@ -1464,43 +1222,26 @@ mod tests {
     }
 
     #[test]
-    fn drop_blank_chapters_removes_and_reindexes() {
+    fn renumber_chapters_keeps_every_page_and_reindexes() {
         let url = "local-pdf:abc";
-        let pages = vec![
-            "   ".to_string(),   // 封面图页, 无文字
-            "正文一".to_string(),
-            "正文二".to_string(),
-        ];
         let chapters = build_chapters(url, 3, &[
             chapter_outline("封面", 0),
             chapter_outline("第一章", 1),
             chapter_outline("第二章", 2),
         ]);
         assert_eq!(chapters.len(), 3);
-        let kept = drop_blank_chapters(url, chapters, &pages);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].title, "第一章");
-        // 重新编号: index 与 url 连续
+        // 按页渲染后不按「有无文字」丢章: 扫描件每页都没文字, 丢了就整本空白
+        let kept = renumber_chapters(url, chapters);
+        assert_eq!(kept.len(), 3);
+        assert!(kept.iter().all(|c| c.render_pages));
         assert_eq!(kept[0].index, 0);
         assert_eq!(kept[0].url, format!("{url}#0"));
         assert_eq!(kept[1].index, 1);
         assert_eq!(kept[1].url, format!("{url}#1"));
         // 页范围不受影响
-        assert_eq!(kept[0].page_start, 1);
-        assert_eq!(kept[1].page_start, 2);
-    }
-
-    #[test]
-    fn chapter_text_path_is_stable() {
-        let dir = Path::new("data");
-        assert_eq!(
-            chapter_text_path(dir, 0),
-            dir.join("chapters").join("00000.txt")
-        );
-        assert_eq!(
-            chapter_text_path(dir, 121),
-            dir.join("chapters").join("00121.txt")
-        );
+        assert_eq!(kept[0].page_start, 0);
+        assert_eq!(kept[1].page_start, 1);
+        assert_eq!(kept[2].page_start, 2);
     }
 
     fn chapter_outline(title: &str, page_index: usize) -> OutlineItem {
@@ -1539,19 +1280,27 @@ mod tests {
             chapter_outline("第三回", 88),
         ];
         let chapters = build_chapters(url, 100, &outline);
-        // 引导章 [0,4] + 3 个书签章
-        assert_eq!(chapters.len(), 4);
-        assert_eq!(chapters[0].page_start, 0);
-        assert_eq!(chapters[0].page_end, 4);
-        assert_eq!(chapters[0].title, "开头 (P1-P5)");
-        assert_eq!(chapters[1].title, "第一回");
-        assert_eq!(chapters[1].page_start, 5);
-        assert_eq!(chapters[1].page_end, 29);
-        assert_eq!(chapters[2].page_start, 30);
-        assert_eq!(chapters[2].page_end, 87);
-        // 末章延伸到最后一页
-        assert_eq!(chapters[3].page_start, 88);
-        assert_eq!(chapters[3].page_end, 99);
+        // 引导章 [0,4] + 第一回 (25 页 → 2 段) + 第二回 (58 页 → 3 段) +
+        // 第三回 (12 页, 不细分)
+        let titles: Vec<&str> = chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "开头 (P1-P5)",
+                "第一回 (1/2)",
+                "第一回 (2/2)",
+                "第二回 (1/3)",
+                "第二回 (2/3)",
+                "第二回 (3/3)",
+                "第三回",
+            ]
+        );
+        assert_eq!((chapters[0].page_start, chapters[0].page_end), (0, 4));
+        assert_eq!((chapters[1].page_start, chapters[1].page_end), (5, 24));
+        assert_eq!((chapters[2].page_start, chapters[2].page_end), (25, 29));
+        assert_eq!((chapters[6].page_start, chapters[6].page_end), (88, 99));
+        // 所有章节都标记为按页渲染
+        assert!(chapters.iter().all(|c| c.render_pages));
     }
 
     #[test]
@@ -1583,10 +1332,25 @@ mod tests {
         ];
         let chapters = build_chapters(url, 100, &outline);
         let titles: Vec<&str> = chapters.iter().map(|c| c.title.as_str()).collect();
-        assert_eq!(titles, ["开头 (P1-P2)", "前言", "第一章", "第二章"]);
+        // 第一章 (40 页) 与第二章 (50 页) 都超过 PAGES_PER_CHAPTER, 各分成 2 与 3 段
+        assert_eq!(
+            titles,
+            [
+                "开头 (P1-P2)",
+                "前言",
+                "第一章 (1/2)",
+                "第一章 (2/2)",
+                "第二章 (1/3)",
+                "第二章 (2/3)",
+                "第二章 (3/3)",
+            ]
+        );
+        // 页区间连续且覆盖全书
         assert_eq!((chapters[1].page_start, chapters[1].page_end), (2, 9));
-        assert_eq!((chapters[2].page_start, chapters[2].page_end), (10, 49));
-        assert_eq!((chapters[3].page_start, chapters[3].page_end), (50, 99));
+        assert_eq!((chapters[2].page_start, chapters[2].page_end), (10, 29));
+        assert_eq!((chapters[3].page_start, chapters[3].page_end), (30, 49));
+        assert_eq!((chapters[4].page_start, chapters[4].page_end), (50, 69));
+        assert_eq!((chapters[6].page_start, chapters[6].page_end), (90, 99));
     }
 
     #[test]
