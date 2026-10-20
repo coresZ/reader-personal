@@ -751,7 +751,7 @@ fn register_rss_panel(
 /// 只做**字面量**判定: 主机名是 IP 时检查其网段。不做 DNS 解析(解析后再连会引入
 /// TOCTOU, 且本地单机应用的用户本就对自己的网络有完全控制权 —— 这里的目标是拦住
 /// "导入的源偷偷探测内网", 而非防御本机用户)。
-fn reject_non_public_target(target: &str) -> Result<(), AppError> {
+pub(crate) fn reject_non_public_target(target: &str) -> Result<(), AppError> {
     let parsed = url::Url::parse(target)
         .map_err(|e| AppError::BadRequest(format!("网页地址无效: {e}")))?;
     let Some(host) = parsed.host_str() else {

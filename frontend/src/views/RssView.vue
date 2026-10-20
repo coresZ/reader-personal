@@ -119,9 +119,9 @@
               <div class="content-head-meta">
                 <div class="content-head-origin">{{ panelRequest.url }}</div>
                 <div v-if="store.singleUrlResolved" class="content-head-time">已自动选用可用节点</div>
-                <!-- 页面内的链接会被桥拦下并交给系统浏览器: 在 iframe 内直接导航
-                     会被上游的 X-Frame-Options 拒绝渲染(白屏)。 -->
-                <div class="content-head-time">页面内的链接将在系统浏览器中打开</div>
+                <!-- 页面内链接经后端代理在面板内打开(代理不透传上游的
+                     X-Frame-Options/CSP), 不会跳出应用。 -->
+                <div class="content-head-time">页面内的链接将在当前面板中打开</div>
               </div>
             </div>
             <button class="ghost-btn" @click="reloadPanel" :disabled="panelLoading">重新加载</button>
