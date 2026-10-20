@@ -45,6 +45,14 @@ pub struct Book {
     pub total_chapter_num: Option<i32>,
     pub r#type: Option<i32>,
     pub group: Option<i64>,
+    /// Legado 的 `order`: 手动排序(书架排序方式=「手动排序」)时的位置。
+    ///
+    /// 之前顺序完全靠 bookshelf.json 的数组下标表达, 与 Legado 的备份格式
+    /// 互不相认 —— 从 Legado 恢复的书架会把 order 一路丢弃, 「手动排序」
+    /// 退化成导入顺序; 反过来导出给 Legado 也没有 order 可用。
+    /// 缺失时前端把这本书排在所有有 order 的书之后, 老数据无需迁移。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
     pub word_count: Option<String>,
     pub info_html: Option<String>,
     pub toc_html: Option<String>,

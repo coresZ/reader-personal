@@ -38,6 +38,8 @@ export interface Book {
   totalChapterNum?: number
   type?: number
   group?: number
+  /** Legado 的 `order`: 手动排序时的位置。缺失时该书排在已有序号之后。 */
+  order?: number
   wordCount?: string
   infoHtml?: string
   tocHtml?: string
@@ -149,6 +151,9 @@ export interface BookGroup {
   groupId: number
   groupName: string
   orderNo?: number
+  /** 该分组使用的书架排序方式; 缺省或 -1 表示跟随全局设置。
+   *  取值见 `utils/bookshelfSort.ts` 的 `BOOK_SORT_KEYS`。 */
+  bookSort?: number
 }
 
 // ─── 应用更新 ───

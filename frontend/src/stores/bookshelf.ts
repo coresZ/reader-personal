@@ -12,7 +12,44 @@ import {
 } from '../api/bookshelf'
 import type { Book, BookGroup, SearchBook } from '../types'
 import { clearGroupsFromBook } from '../utils/bookGroupBits'
+import {
+  DEFAULT_BOOK_SORT,
+  applyManualOrder,
+  isRetiredBookSort,
+  normalizeBookSort,
+  sortBooks,
+  toAvailableBookSort,
+} from '../utils/bookshelfSort'
 import { clearRecentReadBooks, getRecentReadBookKey, loadRecentReadBooks, removeRecentReadBook } from '../utils/recentBooks'
+
+/** 书架排序方式的存储键。与 Legado 的 `bookshelfSort` 偏好同名同义。 */
+const BOOK_SORT_KEY = 'bookshelf-sort'
+
+/** 读取持久化的排序方式; 存储不可用或值非法时回落到默认。
+ *
+ *  「手动排序」已从菜单下架, 存量的 3 在这里直接迁移到默认档并写回 —— 否则
+ *  用户会卡在一个菜单里选不出来的状态(书架按 order 排, 却无法再选中它)。 */
+function readStoredSort(): number {
+  try {
+    const raw = localStorage.getItem(BOOK_SORT_KEY)
+    const sort = toAvailableBookSort(raw)
+    if (raw !== null && normalizeBookSort(raw) !== sort) {
+      writeStoredSort(sort)
+    }
+    return sort
+  } catch {
+    return DEFAULT_BOOK_SORT
+  }
+}
+
+/** 写入排序方式; 存储不可用时只保留内存态, 不影响本次会话。 */
+function writeStoredSort(value: number) {
+  try {
+    localStorage.setItem(BOOK_SORT_KEY, String(value))
+  } catch {
+    // Ignore unavailable storage.
+  }
+}
 
 export const useBookshelfStore = defineStore('bookshelf', () => {
   // ─── Bookshelf ───
@@ -72,11 +109,32 @@ export const useBookshelfStore = defineStore('bookshelf', () => {
   const groups = ref<BookGroup[]>([])
   const activeGroupId = ref<number>(-1) // -1 = all
 
+  /** 内置标签名: 同名分组再出现一次同样是重复项。 */
+  const BUILTIN_GROUP_NAMES = new Set(['全部', '未分组'])
+
   const displayGroups = computed(() => {
     const all: BookGroup = { groupId: -1, groupName: '全部' }
     const ungrouped: BookGroup = { groupId: 0, groupName: '未分组' }
-    return [all, ...groups.value, ungrouped]
+    // 只展示正 id 的真实分组: Legado 的保留分组(-1 全部 / -2 本地 / -3 音频 /
+    // -4 网络未分组 / -5 本地未分组 / -6 视频 / -11 更新失败)是查询投影而非位域,
+    // `filteredBooks` 的 `group & groupId` 对负数恒为 0, 点进去永远是空书架;
+    // id 为 -1 的那条还会与上面内置的「全部」并排重复。
+    //
+    // 只在展示层过滤, 不从 store 里删数据 —— 分组本身仍要原样保留:
+    // 备份恢复与写回要把 Legado 的完整分组表还给对方。
+    return [all, ...visibleGroups.value, ungrouped]
   })
+
+  /** 可被用户管理的真实分组: 正 id 且不与内置标签重名。
+   *
+   *  分组管理弹窗用的是这一份而不是 `groups` —— 否则用户在弹窗里会看到
+   *  「全部 / 本地 / 音频」这些 Legado 虚拟分组, 还能把它们删掉, 删了就直接
+   *  污染备份数据; 而标签栏里又看不到它们, 前后不一致。 */
+  const visibleGroups = computed(() => (
+    groups.value.filter((group) => (
+      group.groupId > 0 && !BUILTIN_GROUP_NAMES.has(group.groupName)
+    ))
+  ))
 
   const filteredBooks = computed(() => {
     if (activeGroupId.value === -1) return books.value
@@ -88,15 +146,64 @@ export const useBookshelfStore = defineStore('bookshelf', () => {
     )
   })
 
+  // ─── 书架排序 ───
+  /** 全局排序方式(持久化到 localStorage, 对齐 Legado 的 `AppConfig.bookshelfSort`)。 */
+  const sortMode = ref(toAvailableBookSort(readStoredSort()))
+  /** 当前分组自己的排序方式; 分组没有单独设置时返回 null, 由全局设置兜底。 */
+  const activeGroupSort = computed<number | null>(() => {
+    const id = activeGroupId.value
+    if (id <= 0) return null
+    const group = groups.value.find((g) => g.groupId === id)
+    // Legado 用 -1 表示「跟随全局」, 缺失/null 同理。
+    if (!group || typeof group.bookSort !== 'number' || group.bookSort < 0) return null
+    // 分组上若还留着已下架的「手动排序」, 同样按「跟随全局」处理 —— 否则这个
+    // 分组会永远按 order 排序, 而菜单里没有能改回来的选项。
+    if (isRetiredBookSort(group.bookSort)) return null
+    return group.bookSort
+  })
+  /** 当前实际生效的排序方式: 分组级设置优先于全局。 */
+  const effectiveSortMode = computed(() => activeGroupSort.value ?? sortMode.value)
+
+  /** 按当前排序方式排好序的书架(标签栏与书目网格都用它)。
+   *
+   *  `effectiveSortMode` 已不含下架值; 这里再过一次 `toAvailableBookSort` 是
+   *  为了 defensive: 菜单只暴露可选项, 排序计算也只用可选项 —— 「手动排序」的
+   *  比较分支保留在 `sortBooks` 里, 供仍需按 order 排列的调用方(如备份往返)使用。 */
+  const sortedBooks = computed(() => sortBooks(filteredBooks.value, effectiveSortMode.value))
+
+  function setSortMode(value: number) {
+    sortMode.value = toAvailableBookSort(value)
+    writeStoredSort(sortMode.value)
+  }
+
+  /** 设置当前分组的排序方式。`null` 表示跟随全局(写回 -1, 与 Legado 同义)。 */
+  async function setActiveGroupSort(value: number | null) {
+    const id = activeGroupId.value
+    if (id <= 0) return
+    const group = groups.value.find((g) => g.groupId === id)
+    if (!group) return
+    const nextSort = value === null ? -1 : toAvailableBookSort(value)
+    await apiSaveBookGroup({
+      groupId: group.groupId,
+      groupName: group.groupName,
+      orderNo: group.orderNo ?? 0,
+      bookSort: nextSort,
+    })
+    await fetchGroups()
+  }
+
   async function fetchGroups() {
     try {
       groups.value = await getBookGroups()
     } catch {
       groups.value = []
     }
+    // 当前选中的分组若已不在标签栏(被删掉, 或本身就是不展示的 Legado 虚拟分组
+    // -2 本地 / -3 音频 等), 筛选会指向一个看不到的空列表 —— 回到「全部」。
     if (
-      activeGroupId.value > 0
-      && !groups.value.some((group) => group.groupId === activeGroupId.value)
+      activeGroupId.value !== -1
+      && activeGroupId.value !== 0
+      && !displayGroups.value.some((group) => group.groupId === activeGroupId.value)
     ) {
       activeGroupId.value = -1
     }
@@ -275,17 +382,31 @@ export const useBookshelfStore = defineStore('bookshelf', () => {
     clearSelection()
   }
 
+  /** 拖拽调整顺序。
+   *
+   *  以前是直接调换 `books` 数组元素的位置, 顺序只存在于 JSON 数组下标里 ——
+   *  从 Legado 恢复的书架没有 order, 一刷新就回到导入顺序。
+   *
+   *  `order` 是**全局**序号: 必须在全体书上重排再统一编号, 不能只对当前可见
+   *  分组编号 —— 那样 `0..n-1` 会与其他分组的序号重复, 「手动排序」下两组书
+   *  交叠排列、顺序不稳定。
+   *
+   *  `filteredBooks` 是 `books` 的子序列且保持相对顺序, 所以「把 A 拖到 B 的
+   *  位置」这个操作在全体列表上做与在可见列表上做等价。 */
   async function reorderBooks(draggedUrl: string, targetUrl: string) {
     if (!draggedUrl || !targetUrl || draggedUrl === targetUrl) return
 
     const snapshot = books.value.slice()
-    const fromIndex = snapshot.findIndex((book) => book.bookUrl === draggedUrl)
-    const toIndex = snapshot.findIndex((book) => book.bookUrl === targetUrl)
-    if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) return
+    const manualOrder = sortBooks(books.value, 3)
+    const changed = applyManualOrder(manualOrder, draggedUrl, targetUrl, (book) => book.bookUrl)
+    if (!changed.length) return
 
-    const next = snapshot.slice()
-    const [moved] = next.splice(fromIndex, 1)
-    next.splice(toIndex, 0, moved)
+    const changedByUrl = new Map(changed.map((book) => [book.bookUrl, book.order as number]))
+    const next = books.value.map((book) => (
+      changedByUrl.has(book.bookUrl)
+        ? { ...book, order: changedByUrl.get(book.bookUrl) }
+        : book
+    ))
 
     books.value = next
     sorting.value = true
@@ -299,16 +420,30 @@ export const useBookshelfStore = defineStore('bookshelf', () => {
     }
   }
 
+  /** 打开一本书时把它排到手动顺序的最前。
+   *
+   *  同样走「全体重排 + 统一编号」, 序号永远是干净的 0..n-1, 不会像
+   *  「最小值减一」那样持续变负。只在「手动排序」下影响可见位置, 其余排序
+   *  方式会立刻用各自规则覆盖展示顺序。 */
   async function moveBookToFront(bookUrl: string) {
     if (!bookUrl || books.value.length <= 1) return
 
     const snapshot = books.value.slice()
-    const fromIndex = snapshot.findIndex((book) => book.bookUrl === bookUrl)
+    const manualOrder = sortBooks(books.value, 3)
+    const fromIndex = manualOrder.findIndex((book) => book.bookUrl === bookUrl)
     if (fromIndex <= 0) return
 
-    const next = snapshot.slice()
-    const [moved] = next.splice(fromIndex, 1)
-    next.unshift(moved)
+    const reordered = manualOrder.slice()
+    const [moved] = reordered.splice(fromIndex, 1)
+    reordered.unshift(moved!)
+
+    // 按 bookUrl 定位新序号, 而不是 `indexOf(book)`: 后者依赖「sortBooks 返回
+    // 的是同一批对象引用」这个隐式约定, 哪天比较器改成克隆就会静默失效。
+    const indexByUrl = new Map(reordered.map((book, index) => [book.bookUrl, index]))
+    const next = books.value.map((book) => {
+      const index = indexByUrl.get(book.bookUrl)
+      return index === undefined || book.order === index ? book : { ...book, order: index }
+    })
 
     books.value = next
     sorting.value = true
@@ -326,7 +461,9 @@ export const useBookshelfStore = defineStore('bookshelf', () => {
     books, recentBooks, loading, sorting,
     fetchBooks, removeBook,
     refreshRecentBooks, removeRecentBook, clearAllRecentBooks,
-    groups, activeGroupId, displayGroups, filteredBooks,
+    groups, activeGroupId, displayGroups, visibleGroups, filteredBooks,
+    sortMode, activeGroupSort, effectiveSortMode, sortedBooks,
+    setSortMode, setActiveGroupSort,
     fetchGroups, saveGroup, removeGroup, removeGroups,
     searchResults, isSearching, searchKey,
     searchScope, searchGroup, searchSourceUrl, startSearch, clearSearch, isSearchMode,

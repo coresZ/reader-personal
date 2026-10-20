@@ -57,6 +57,11 @@ impl BookGroupService {
             if g.group_id == group.group_id {
                 g.group_name = group.group_name.clone();
                 g.order_no = group.order_no;
+                // 改名等只关心名字的调用方不传 book_sort(None), 此时保留原值;
+                // 想显式重置为「跟随全局」的前端传 -1(Legado 同义)。
+                if group.book_sort.is_some() {
+                    g.book_sort = group.book_sort;
+                }
                 found = true;
                 break;
             }
@@ -208,6 +213,7 @@ impl BookGroupService {
                         group_id: *new_id,
                         group_name: String::new(),
                         order_no: 0,
+                        book_sort: None,
                     })
                     .collect::<Vec<_>>(),
             );
@@ -257,6 +263,7 @@ impl BookGroupService {
                         group_id: *new_id,
                         group_name: g.group_name.clone(),
                         order_no: g.order_no,
+                        book_sort: g.book_sort,
                     },
                     None => g.clone(),
                 }
@@ -297,6 +304,7 @@ mod tests {
             group_id: id,
             group_name: name.to_string(),
             order_no: 0,
+            book_sort: None,
         }
     }
 

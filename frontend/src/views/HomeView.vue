@@ -107,16 +107,57 @@
             {{ group.groupName }}
           </button>
         </div>
+        <div ref="sortMenuRef" class="sort-trigger-wrap">
+          <button
+            type="button"
+            class="sort-trigger"
+            :class="{ open: sortMenuOpen }"
+            :aria-expanded="sortMenuOpen"
+            aria-haspopup="listbox"
+            title="书架排序方式"
+            @click="toggleSortMenu"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M3 6h12M3 12h9M3 18h6" />
+              <path d="m17 8 3-3 3 3M20 5v14" />
+            </svg>
+            <span>{{ bookSortLabel(shelfStore.effectiveSortMode) }}</span>
+            <svg class="sort-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </button>
+          <Transition name="sort-pop">
+            <div v-if="sortMenuOpen" class="sort-popover" role="listbox" aria-label="书架排序方式">
+              <button
+                v-for="option in BOOK_SORT_OPTIONS"
+                :key="option.value"
+                type="button"
+                class="sort-option"
+                :class="{ active: option.value === shelfStore.effectiveSortMode }"
+                role="option"
+                :aria-selected="option.value === shelfStore.effectiveSortMode"
+                @click="chooseSort(option.value)"
+              >
+                <span class="sort-option-dot" aria-hidden="true">
+                  <svg v-if="option.value === shelfStore.effectiveSortMode" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+                    <path d="M20 6 9 17l-5-5" />
+                  </svg>
+                </span>
+                <span class="sort-option-label">{{ option.label }}</span>
+              </button>
+            </div>
+          </Transition>
+        </div>
       </div>
 
       <!-- Book Grid -->
       <div class="shelf-grid-wrapper">
         <BookGrid
-          :books="shelfStore.filteredBooks"
+          :books="shelfStore.sortedBooks"
           :edit-mode="shelfStore.editMode"
           :selected-urls="shelfStore.selectedBookUrls"
           :loading="shelfStore.loading"
-          :sortable="!shelfStore.editMode && !shelfStore.loading && !shelfStore.sorting && !shelfStore.isSearchMode"
+          :sortable="sortable"
           empty-text="书架空空如也，搜索添加新书吧"
         @click="handleBookClick"
         @info="handleBookInfo"
@@ -170,7 +211,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useBookshelfStore } from '../stores/bookshelf'
 import { useReaderStore } from '../stores/reader'
@@ -184,6 +225,7 @@ import SearchResults from '../components/SearchResults.vue'
 import CacheLibraryModal from '../components/CacheLibraryModal.vue'
 import ExportBookModal from '../components/ExportBookModal.vue'
 import { showContextMenu } from '../composables/useContextMenu'
+import { BOOK_SORT_KEYS, BOOK_SORT_OPTIONS, bookSortLabel } from '../utils/bookshelfSort'
 import type { Book, SearchBook } from '../types'
 
 const router = useRouter()
@@ -398,6 +440,71 @@ async function handleReorderBooks(payload: { draggedUrl: string; targetUrl: stri
   }
 }
 
+/** 书架拖拽排序。
+ *
+ *  「手动排序」已从排序菜单移除, 排序模式不再可能等于 3, 因此拖拽实际不可用
+ *  —— 保留这个判断而不是写死 `false`: `reorderBooks` 与 BookGrid 的拖拽能力
+ *  仍在, 将来若把该项加回菜单, 只需放开这一行即可。 */
+const sortable = computed(() => (
+  shelfStore.effectiveSortMode === BOOK_SORT_KEYS.manual
+  && !shelfStore.editMode
+  && !shelfStore.loading
+  && !shelfStore.sorting
+  && !shelfStore.isSearchMode
+))
+
+// ─── 排序下拉 ───
+const sortMenuOpen = ref(false)
+const sortMenuRef = ref<HTMLElement | null>(null)
+
+/** 应用排序方式。选中具体分组时写该分组的 bookSort, 否则写全局偏好。 */
+async function applySort(value: number) {
+  if (shelfStore.activeGroupId > 0) {
+    await shelfStore.setActiveGroupSort(value)
+  } else {
+    shelfStore.setSortMode(value)
+  }
+}
+
+async function chooseSort(value: number) {
+  sortMenuOpen.value = false
+  try {
+    await applySort(value)
+  } catch (e: any) {
+    appStore.showToast(e.message || '排序设置失败', 'error')
+  }
+}
+
+function toggleSortMenu() {
+  sortMenuOpen.value = !sortMenuOpen.value
+}
+
+function onSortMenuOutsideClick(event: MouseEvent) {
+  const target = event.target as Node | null
+  if (target && sortMenuRef.value?.contains(target)) return
+  sortMenuOpen.value = false
+}
+
+function onSortMenuKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') sortMenuOpen.value = false
+}
+
+watch(sortMenuOpen, (open) => {
+  if (open) {
+    // 捕获阶段: 触发按钮自己的 click 已经在冒泡阶段处理完, 不会立刻自关。
+    window.addEventListener('click', onSortMenuOutsideClick, true)
+    window.addEventListener('keydown', onSortMenuKeydown)
+  } else {
+    window.removeEventListener('click', onSortMenuOutsideClick, true)
+    window.removeEventListener('keydown', onSortMenuKeydown)
+  }
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('click', onSortMenuOutsideClick, true)
+  window.removeEventListener('keydown', onSortMenuKeydown)
+})
+
 </script>
 
 <style scoped>
@@ -501,16 +608,140 @@ async function handleReorderBooks(payload: { draggedUrl: string; targetUrl: stri
 }
 
 .group-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
   border-bottom: 1px solid var(--color-border-light);
   margin-bottom: var(--space-2);
 }
 
 .tabs-scroll {
+  flex: 1;
+  min-width: 0;
   display: flex;
   gap: 0;
   overflow-x: auto;
   scrollbar-width: none;
   -ms-overflow-style: none;
+}
+
+.sort-trigger-wrap {
+  flex-shrink: 0;
+  position: relative;
+}
+
+.sort-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px 5px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+  transition: color var(--duration-fast), background var(--duration-fast), border-color var(--duration-fast);
+}
+
+.sort-trigger svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.sort-trigger .sort-caret {
+  width: 12px;
+  height: 12px;
+  opacity: 0.65;
+  transition: transform var(--duration-fast);
+}
+
+.sort-trigger:hover {
+  color: var(--color-text-secondary);
+  background: var(--color-bg-hover);
+}
+
+.sort-trigger.open {
+  color: var(--color-text);
+  background: var(--color-bg-hover);
+  border-color: var(--color-border);
+}
+
+.sort-trigger.open .sort-caret {
+  transform: rotate(180deg);
+}
+
+.sort-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: var(--z-dropdown, 60);
+  min-width: 156px;
+  padding: 5px;
+  border: 1px solid color-mix(in srgb, var(--color-border) 80%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--color-bg-elevated) 94%, transparent);
+  box-shadow: var(--shadow-xl);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+}
+
+.sort-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--text-xs);
+  text-align: left;
+  transition: background var(--duration-fast), color var(--duration-fast);
+}
+
+.sort-option:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+.sort-option.active {
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.sort-option-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.sort-option-dot svg {
+  width: 13px;
+  height: 13px;
+}
+
+.sort-option-label {
+  flex: 1;
+}
+
+.sort-pop-enter-active,
+.sort-pop-leave-active {
+  transition: opacity var(--duration-fast), transform var(--duration-fast);
+}
+
+.sort-pop-enter-from,
+.sort-pop-leave-to {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
 }
 
 .tabs-scroll::-webkit-scrollbar {

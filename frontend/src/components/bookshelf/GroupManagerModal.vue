@@ -21,7 +21,7 @@
 
             <div class="group-list">
               <div
-                v-for="group in shelfStore.groups"
+                v-for="group in shelfStore.visibleGroups"
                 :key="group.groupId"
                 class="group-item"
                 :class="{ 'is-selected': selectedIds.has(group.groupId) }"
@@ -45,11 +45,11 @@
                   <button class="ghost-btn danger" @click="deleteGroup(group.groupId, group.groupName)">删除</button>
                 </div>
               </div>
-              <p v-if="!shelfStore.groups.length" class="empty-hint">还没有分组</p>
+              <p v-if="!shelfStore.visibleGroups.length" class="empty-hint">还没有分组</p>
             </div>
           </div>
 
-          <div v-if="shelfStore.groups.length" class="modal-footer">
+          <div v-if="shelfStore.visibleGroups.length" class="modal-footer">
             <label class="select-all">
               <input
                 type="checkbox"
@@ -59,7 +59,7 @@
               />
               <span>全选</span>
             </label>
-            <span class="selection-count">已选 {{ selectedIds.size }} / {{ shelfStore.groups.length }}</span>
+            <span class="selection-count">已选 {{ selectedIds.size }} / {{ shelfStore.visibleGroups.length }}</span>
             <button
               class="danger-btn"
               :disabled="!selectedIds.size || deleting"
@@ -93,11 +93,11 @@ const selectedIds = reactive(new Set<number>())
 const deleting = ref(false)
 
 const allSelected = computed(() => (
-  shelfStore.groups.length > 0 && selectedIds.size === shelfStore.groups.length
+  shelfStore.visibleGroups.length > 0 && selectedIds.size === shelfStore.visibleGroups.length
 ))
 const someSelected = computed(() => selectedIds.size > 0)
 
-watch(() => shelfStore.groups, (groups) => {
+watch(() => shelfStore.visibleGroups, (groups) => {
   groups.forEach((group) => {
     editingNames[group.groupId] = group.groupName
   })
@@ -117,7 +117,7 @@ function toggleSelectAll() {
   if (allSelected.value) {
     selectedIds.clear()
   } else {
-    shelfStore.groups.forEach((group) => selectedIds.add(group.groupId))
+    shelfStore.visibleGroups.forEach((group) => selectedIds.add(group.groupId))
   }
 }
 
