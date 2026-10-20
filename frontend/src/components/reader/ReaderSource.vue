@@ -28,7 +28,17 @@
           <div class="book-brief-meta">{{ store.book.author || '未知作者' }}</div>
           <div class="book-brief-meta" v-if="store.currentChapter?.title">当前章节：{{ store.currentChapter.title }}</div>
           <div class="book-brief-meta" v-if="store.book.latestChapterTitle">最新章节：{{ store.book.latestChapterTitle }}</div>
-          <div class="book-brief-intro" v-if="store.book.intro">{{ store.book.intro }}</div>
+          <div
+            class="book-brief-intro"
+            :class="{ collapsed: !introExpanded }"
+            v-if="store.book.intro"
+            @click="toggleIntro"
+          >{{ store.book.intro }}</div>
+          <button
+            v-if="store.book.intro"
+            class="book-brief-intro-toggle"
+            @click="toggleIntro"
+          >{{ introExpanded ? '收起' : '展开全部' }}</button>
         </div>
       </div>
 
@@ -153,6 +163,12 @@ const appStore = useAppStore()
 const sourceStore = useSourceStore()
 const theme = computed(() => store.chromeTheme)
 const isLocal = computed(() => isLocalBook(store.book))
+// 书源详情里的 `intro` 常常是**整块信息**（最新/点击/评分/简介拼接在一起），
+// 固定行数会把真正的简介截掉。默认展示足够多行，并允许展开查看全部。
+const introExpanded = ref(false)
+function toggleIntro() {
+  introExpanded.value = !introExpanded.value
+}
 const searching = ref(false)
 const sourcesIncomplete = ref(false)
 const loadingMore = ref(false)
@@ -524,14 +540,36 @@ async function handleSwitch(res: SearchBook) {
   line-height: 1.4;
 }
 
+/* 书源的 `intro` 通常是一整块信息：最新更新、点击、评分，最后才是简介。
+   限制成 3 行会让真正的简介整段不可见，因此收起态给足行数并支持展开。 */
 .book-brief-intro {
   font-size: 12px;
   line-height: 1.45;
   opacity: 0.76;
+  white-space: pre-wrap;
+  cursor: pointer;
+}
+
+.book-brief-intro.collapsed {
   display: -webkit-box;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 12;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.book-brief-intro-toggle {
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-primary, #c97f3a);
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0.8;
+}
+
+.book-brief-intro-toggle:hover {
+  opacity: 1;
 }
 
 .section-label {
