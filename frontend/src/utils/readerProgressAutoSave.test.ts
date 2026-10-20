@@ -146,4 +146,66 @@ describe('readerProgressAutoSave', () => {
     expect(flushToServerKeepalive).toHaveBeenCalledTimes(1)
     expect(flushToServer).toHaveBeenCalledTimes(1)
   })
+
+  it('unsticks navigation when the progress write never settles', async () => {
+    vi.useFakeTimers()
+    try {
+      const disposeAutoSave = vi.fn()
+      const savePosition = vi.fn()
+      // 后端卡死(例如目录缓存缺失时同步联网抓目录): 这个 Promise 永远不 resolve。
+      const flushToServer = vi.fn().mockReturnValue(new Promise<void>(() => {}))
+      const flushToServerKeepalive = vi.fn()
+      const saver = createReaderProgressExitSaver({
+        disposeAutoSave,
+        savePosition,
+        flushToServer,
+        flushToServerKeepalive,
+      })
+
+      let settled = false
+      const navigation = saver.flushBeforeRouteLeave().then(() => {
+        settled = true
+      })
+
+      // 本地位置必须已经落盘, 即使服务端那份还没写完。
+      expect(savePosition).toHaveBeenCalledTimes(1)
+      expect(settled).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(1200)
+      await navigation
+
+      expect(settled).toBe(true)
+      expect(flushToServer).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not wait for the route timeout when the flush settles quickly', async () => {
+    vi.useFakeTimers()
+    try {
+      const flushToServer = vi.fn().mockResolvedValue(undefined)
+      const saver = createReaderProgressExitSaver({
+        disposeAutoSave: vi.fn(),
+        savePosition: vi.fn(),
+        flushToServer,
+        flushToServerKeepalive: vi.fn(),
+      })
+
+      let settled = false
+      const navigation = saver.flushBeforeRouteLeave().then(() => {
+        settled = true
+      })
+
+      await vi.advanceTimersByTimeAsync(0)
+      await navigation
+
+      expect(settled).toBe(true)
+      expect(flushToServer).toHaveBeenCalledTimes(1)
+      // 计时器要清掉, 不能留一个 1.2s 的悬挂定时器。
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

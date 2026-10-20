@@ -1071,38 +1071,19 @@ pub async fn delete_book_cache(
         .or(req.url)
         .ok_or_else(|| AppError::BadRequest("bookUrl required".to_string()))?;
 
-    let mut deleted_chapter_list = false;
-
     // Delete all chapter content cache for this book
     let deleted_content = state
         .book_service
         .delete_book_cache(&user_ns, &book_url)
         .await?;
 
-    // Try to delete chapter list cache by shelf book toc_url first, then book_url fallback
-    let mut candidate_toc_urls = vec![book_url.clone()];
-    if let Ok(Some(shelf_book)) = state.book_service.get_shelf_book(&user_ns, &book_url).await {
-        if let Some(toc_url) = shelf_book.toc_url {
-            if !candidate_toc_urls.contains(&toc_url) {
-                candidate_toc_urls.push(toc_url);
-            }
-        }
-    }
-
-    for toc_url in candidate_toc_urls {
-        if state
-            .book_service
-            .chapter_list_cache_exists(&user_ns, &toc_url)
-            .await
-        {
-            state
-                .book_service
-                .delete_chapter_list_cache(&user_ns, &toc_url)
-                .await?;
-            deleted_chapter_list = true;
-        }
-    }
-
+    // 目录缓存**不在这里删**。
+    //
+    // 「清本地」清的是正文本地缓存, 目录缓存不是正文: 它是打开这本书的先决条件。
+    // 一并删掉之后, 再次点开这本书要先把整个目录同步联网抓一遍 —— 单次请求超时
+    // 15s、失败重试 2 次, 分页目录还要逐页串行, 于是一分钟内既进不去也退不出
+    // (阅读页的离开守卫会等进度写入, 而进度写入当时也要读目录)。目录需要重抓时
+    // 走 `get_chapter_list` 的 `refresh: 1` 入口, 不靠删缓存来触发。
     let _ = state
         .book_service
         .delete_book_sources_cache(&user_ns, &book_url)
@@ -1125,7 +1106,8 @@ pub async fn delete_book_cache(
     Ok(ApiResponse::ok(serde_json::json!({
         "deleted": true,
         "contentCache": deleted_content,
-        "chapterListCache": deleted_chapter_list
+        // 目录缓存始终保留, 因此这里恒为 false。
+        "chapterListCache": false
     })))
 }
 
@@ -1138,21 +1120,20 @@ pub async fn clear_search_cover_cache(
     state: tauri::State<'_, AppState>,
     req: ClearSearchCoverCacheRequest,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
-    let unique_urls: std::collections::HashSet<String> = req
+    let unique_urls: Vec<String> = req
         .cover_urls
         .into_iter()
         .map(|url| url.trim().to_string())
         .filter(|url| !url.is_empty())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
         .collect();
-    let mut deleted = 0usize;
-    for url in &unique_urls {
-        state
-            .book_service
-            .delete_cover_cache("public", url)
-            .await?;
-        crate::api::protocol::remove_cover_cache_url(url);
-        deleted += 1;
-    }
+    let deleted = unique_urls.len();
+    state
+        .book_service
+        .delete_cover_caches("public", &unique_urls)
+        .await?;
+    crate::api::protocol::remove_cover_cache_urls(&unique_urls);
     Ok(ApiResponse::ok(serde_json::json!({ "deleted": deleted })))
 }
 
@@ -1622,16 +1603,21 @@ pub async fn save_book_progress(
                 updated.latest_chapter_title = Some(last.title.clone());
             }
         }
-    } else if let (Some(toc_url), Ok(Some(source))) = (
-        shelf_book.toc_url.clone(),
-        state
-            .book_source_service
-            .get(&user_ns, &shelf_book.origin)
-            .await,
-    ) {
-        if let Ok(chapters) = state
+    } else if let Some(toc_url) = shelf_book
+        .toc_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+    {
+        // 只用**目录缓存**补章节标题, 绝不在这里联网抓目录。
+        //
+        // 保存阅读进度是每几秒一次、且离开阅读页时必须完成的高频操作。此前这里走
+        // `get_chapter_list`, 目录缓存缺失时会同步抓整棵目录(单请求 15s 超时 ×
+        // 3 次尝试, 分页目录还要逐页串行), 于是「清本地」之后点开书再返回, 导航会
+        // 被离开守卫卡到近一分钟。缓存没有就跳过 —— 标题只是展示信息, 下次真正
+        // 加载目录时会自然补上。
+        if let Ok(Some(chapters)) = state
             .book_service
-            .get_chapter_list(&user_ns, &source, &toc_url)
+            .load_chapter_list_cache(&user_ns, toc_url)
             .await
         {
             if index >= 0 && (index as usize) < chapters.len() {

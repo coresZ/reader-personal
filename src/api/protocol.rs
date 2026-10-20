@@ -922,12 +922,14 @@ fn cover_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, 
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Drop one URL from the in-process cover cache. Disk cleanup alone is not
+/// Drop released URLs from the in-process cover cache. Disk cleanup alone is not
 /// enough: the current process would otherwise keep serving the deleted bytes
 /// until the 200-entry cap clears the whole map.
-pub(crate) fn remove_cover_cache_url(url: &str) {
+pub(crate) fn remove_cover_cache_urls(urls: &[String]) {
     if let Ok(mut cache) = cover_cache().lock() {
-        cache.remove(url);
+        for url in urls {
+            cache.remove(url);
+        }
     }
 }
 

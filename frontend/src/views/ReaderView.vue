@@ -409,7 +409,7 @@ import {
   readerLandingPageIndexAfterPrevChapter,
   readerPageIndexFromProgress,
 } from '../utils/readerPageIndex'
-import { splitBrParagraphs } from '../utils/readerParagraph'
+import { splitParagraphsAroundExisting } from '../utils/readerParagraph'
 import { resolveReaderBackground } from '../utils/readerColor'
 import {
   hotkeyIdFromEvent,
@@ -1006,37 +1006,6 @@ const currentFontFamily = computed(() => {
   return ''
 })
 
-/** 给「有 HTML 但没有 <p>」的正文补上段落间距与首行缩进。
- *
- *  书源正文常见两种形态:
- *  1. <br> 分段的纯文本流 —— 按 <br> 拆成独立 <p>, 间距与缩进才能逐段生效
- *     (与纯文本分支一致)。拆段规则见 utils/readerParagraph(已单测覆盖),
- *     它在「含结构化标签」或「标签跨 <br>」时返回 null, 此时不做重组。
- *  2. <div>/<section> 等块级分段 —— 已有天然分段, 只需补 margin。 */
-function applyParagraphSpacingToBlockChildren(wrapper: HTMLElement) {
-  const spacing = `${config.value.paragraphSpacing}em`
-
-  if (wrapper.querySelector('br')) {
-    const split = splitBrParagraphs(wrapper.innerHTML, {
-      spacingEm: config.value.paragraphSpacing,
-      firstLineIndent: config.value.firstLineIndent,
-    })
-    if (split !== null) {
-      wrapper.innerHTML = split
-      return
-    }
-  }
-
-  // 块级分段(或不能安全重组): 只补间距, 不动结构。
-  const blocks = Array.from(wrapper.children) as HTMLElement[]
-  blocks.forEach((block) => {
-    if (block.tagName === 'BR') return
-    if (!(block.textContent || '').trim()) return
-    block.style.marginTop = '0'
-    block.style.marginBottom = spacing
-  })
-}
-
 /**
  * 当前章节是否来自本地 EPUB 的自带排版。
  *
@@ -1104,24 +1073,28 @@ function formatChapterHtml(rawText: string) {
     wrapper.innerHTML = repairSourceImageHtml(text)
     normalizeSourceTypography(wrapper)
     const paragraphs = Array.from(wrapper.querySelectorAll('p')) as HTMLParagraphElement[]
-    if (paragraphs.length) {
-      paragraphs.forEach((paragraph) => {
-        const plainText = (paragraph.textContent || '').replace(/^[\u3000\u00A0 \t]+/, '').trim()
-        const hasRenderableChildren = Boolean(paragraph.querySelector('img, br, ruby, table, ul, ol'))
-        if (!plainText && !hasRenderableChildren) {
-          paragraph.remove()
-          return
-        }
-        paragraph.innerHTML = paragraph.innerHTML.replace(/^[\u3000\u00A0 \t]+/, '')
-        paragraph.style.marginTop = '0'
-        paragraph.style.marginBottom = `${config.value.paragraphSpacing}em`
-        paragraph.classList.toggle('reader-indent', config.value.firstLineIndent)
-      })
-    } else {
-      // 有 HTML 但没有 <p>: 书源常用 <br> 或 <div> 分段, 这时上面的段落处理
-      // 一个都不命中, 「段落间距」就完全没作用。按同样规则补一遍间距。
-      applyParagraphSpacingToBlockChildren(wrapper)
-    }
+    paragraphs.forEach((paragraph) => {
+      const plainText = (paragraph.textContent || '').replace(/^[\u3000\u00A0 \t]+/, '').trim()
+      const hasRenderableChildren = Boolean(paragraph.querySelector('img, br, ruby, table, ul, ol'))
+      if (!plainText && !hasRenderableChildren) {
+        paragraph.remove()
+        return
+      }
+      paragraph.innerHTML = paragraph.innerHTML.replace(/^[\u3000\u00A0 \t]+/, '')
+      paragraph.style.marginTop = '0'
+      paragraph.style.marginBottom = `${config.value.paragraphSpacing}em`
+      paragraph.classList.toggle('reader-indent', config.value.firstLineIndent)
+    })
+    // 章节里「有 <p>」不代表整章都成段: 番茄系书源只在插图下方给署名加一个
+    // `<p>`, 正文主体仍是裸文本行。旧实现以 paragraphs.length 作二选一条件,
+    // 于是只要出现任何一个 <p>, 剩余几十上百行裸文本就完全跳过分段处理,
+    // 整章塌成一大段(issue #17 的截图正是这种章节)。
+    // 现在按原顺序切段: 已有 <p> 原样保留, 其余片段各自重组, 见
+    // utils/readerParagraph.splitParagraphsAroundExisting(已单测覆盖)。
+    wrapper.innerHTML = splitParagraphsAroundExisting(wrapper.innerHTML, {
+      spacingEm: config.value.paragraphSpacing,
+      firstLineIndent: config.value.firstLineIndent,
+    })
   } else {
     wrapper.innerHTML = text
       .split(/\n/)

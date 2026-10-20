@@ -2755,6 +2755,38 @@ impl BookService {
             }
         }
 
+        // 历史遗留: 早先 `sanitize_book_urls` 会把封面地址里的 `%3D` 反转义成
+        // `=`, 于是书架记下的 URL 与搜索页缓存那份对不上。读缓存时按原始变体
+        // 再找一次, 命中就把映射搬到当前 URL 下 —— 用户不必重新搜一遍。
+        //
+        // 搬的是映射本身而不是重新落一份内容文件: 内容文件是内容寻址的, 重写
+        // 只会因为扩展名规则变化而多出一份等价的孤儿。
+        //
+        // 目标映射已存在时只读不搬: 两条只差 `=` 的 URL 可能都还在用, 把旧映射
+        // 删掉会让另一条下次白白重新回源。
+        if let Some(legacy_url) = reencode_cover_signature(url) {
+            let legacy_mapping = cover_dir
+                .join("urls")
+                .join(format!("{}.json", md5_hex(&legacy_url)));
+            if let Ok(mapped) = fs::read_to_string(&legacy_mapping).await {
+                let entry: serde_json::Value =
+                    serde_json::from_str(&mapped).unwrap_or(serde_json::Value::Null);
+                let file = entry.get("file").and_then(serde_json::Value::as_str);
+                let content_type = entry
+                    .get("contentType")
+                    .and_then(serde_json::Value::as_str);
+                if let (Some(file), Some(content_type)) = (file, content_type) {
+                    if let Ok(data) = fs::read(cover_dir.join(file)).await {
+                        if !mapping_path.exists() {
+                            let _ = fs::write(&mapping_path, &mapped).await;
+                            let _ = fs::remove_file(&legacy_mapping).await;
+                        }
+                        return Ok((data, content_type.to_string()));
+                    }
+                }
+            }
+        }
+
         // Compatibility with the previous URL-addressed layout. A hit is
         // promoted into the content-addressed layout before returning.
         let ext = file_ext_from_url(url).unwrap_or_else(|| "png".to_string());
@@ -2786,8 +2818,8 @@ impl BookService {
             Some(format!("{}://{}", scheme, host))
         });
 
-        let build_request = |client: &reqwest::Client| {
-            let mut req = client.get(url);
+        let build_request = |client: &reqwest::Client, target: &str| {
+            let mut req = client.get(target);
             // Add necessary headers to bypass anti-hotlinking
             req = req
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -2798,7 +2830,7 @@ impl BookService {
             req
         };
 
-        let mut res = build_request(&self.http.client()).send().await;
+        let mut res = build_request(&self.http.client(), url).send().await;
         // 封面请求此前只走系统代理。共享代理 IP 被站点 WAF 整段拦下时(该源
         // 某书源的排行榜页就是代理 403 / 直连 200), 正文链路有直连回退
         // 而封面没有, 于是列表能出来、封面全部 404。与 `retry_direct_when_proxy_blocked`
@@ -2810,11 +2842,44 @@ impl BookService {
         };
         if cover_needs_direct_retry(self.http.active_proxy().is_some(), retry_status) {
             if let Ok(direct) = self.http.client_direct() {
-                if let Ok(direct_res) = build_request(&direct).send().await {
+                if let Ok(direct_res) = build_request(&direct, url).send().await {
                     if direct_res.status().is_success() {
                         tracing::info!(url = %url, "proxy cover request blocked; used direct retry");
                         res = Ok(direct_res);
                     }
+                }
+            }
+        }
+        // 书架里可能还留着旧版本写坏的地址(`%3D` 已被反转义成 `=`)。这类地址
+        // 回源必然被站点拒掉, 但把签名还原成 `%3D` 后站点就认了 —— 重试一次,
+        // 让历史条目不必等用户重新搜索。缓存仍按传入的 URL 存, 保持调用方看到的一致。
+        //
+        // 只在**被拒**(403/407/451) 时重试: 超时或连接失败时换条地址重发, 只会
+        // 让一次卡住的封面等成两次。重试同样先走代理客户端, 失败再走直连, 与上面
+        // 那条回退保持同一套判据。
+        let rejected_status = match &res {
+            Ok(response) => Some(response.status().as_u16()),
+            Err(_) => None,
+        };
+        if cover_needs_direct_retry(self.http.active_proxy().is_some(), rejected_status) {
+            if let Some(repaired_url) = reencode_cover_signature(url) {
+                let mut repaired_res = build_request(&self.http.client(), &repaired_url)
+                    .send()
+                    .await
+                    .ok()
+                    .filter(|r| r.status().is_success());
+                if repaired_res.is_none() {
+                    if let Ok(direct) = self.http.client_direct() {
+                        repaired_res = build_request(&direct, &repaired_url)
+                            .send()
+                            .await
+                            .ok()
+                            .filter(|r| r.status().is_success());
+                    }
+                }
+                if let Some(repaired_res) = repaired_res {
+                    tracing::info!(url = %url, "cover signature was unescaped; retried with %3D");
+                    res = Ok(repaired_res);
                 }
             }
         }
@@ -2833,6 +2898,13 @@ impl BookService {
             .await
             .map_err(|e| AppError::Internal(e.into()))?
             .to_vec();
+        // 服务器没给 Content-Type 时, 上面的兜底会拿 URL 后缀猜, 而番茄一类的
+        // `…:1200:0.image` 猜不出来。图就在手里, 按魔数认格式最可靠。
+        let content_type = if is_unknown_image_type(&content_type) {
+            sniff_image_content_type(&bytes).unwrap_or(content_type)
+        } else {
+            content_type
+        };
         if let Err(err) = self
             .store_cover_mapping(url, &bytes, &content_type, &cover_dir)
             .await
@@ -2850,7 +2922,7 @@ impl BookService {
         cover_dir: &Path,
     ) -> std::io::Result<()> {
         let digest = hex::encode(Sha256::digest(bytes));
-        let extension = file_ext_from_url(url).unwrap_or_else(|| "image".to_string());
+        let extension = cover_file_extension(url, content_type);
         let file_name = format!("{digest}.{extension}");
         fs::create_dir_all(cover_dir.join("urls")).await?;
         let content_path = cover_dir.join(&file_name);
@@ -2869,35 +2941,73 @@ impl BookService {
         .await
     }
 
-    /// Remove a cover's URL mapping and the content file when no other URL
-    /// still references the same bytes.
-    pub async fn delete_cover_cache(&self, user_ns: &str, url: &str) -> Result<(), AppError> {
-        if url.trim().is_empty() {
+    /// Remove several cover URL mappings in one pass.
+    ///
+    /// The mappings are removed first, then one scan of the remaining mappings
+    /// determines which deduplicated content files are still shared. This avoids
+    /// rescanning `urls/` once per URL when a search session releases many covers.
+    pub async fn delete_cover_caches(
+        &self,
+        user_ns: &str,
+        urls: &[String],
+    ) -> Result<(), AppError> {
+        let mut seen = HashSet::new();
+        let urls: Vec<&str> = urls
+            .iter()
+            .map(|url| url.trim())
+            .filter(|url| !url.is_empty() && seen.insert(*url))
+            .collect();
+        if urls.is_empty() {
             return Ok(());
         }
+
         let cover_dir = self
             .storage_dir
             .join("cache")
             .join(user_ns)
             .join("cover");
-        let mapping_path = cover_dir.join("urls").join(format!("{}.json", md5_hex(url)));
-        let mapped = fs::read_to_string(&mapping_path).await.ok();
-        let _ = fs::remove_file(&mapping_path).await;
 
-        if let Some(mapped) = mapped {
-            let entry: serde_json::Value =
-                serde_json::from_str(&mapped).unwrap_or(serde_json::Value::Null);
-            if let Some(file) = entry.get("file").and_then(serde_json::Value::as_str) {
-                if !mappings_reference_file(&cover_dir, file).await {
-                    let _ = fs::remove_file(cover_dir.join(file)).await;
+        let mut candidate_files = HashSet::new();
+        for url in urls {
+            let mapping_path = cover_dir
+                .join("urls")
+                .join(format!("{}.json", md5_hex(url)));
+            if let Ok(mapped) = fs::read_to_string(&mapping_path).await {
+                let entry: serde_json::Value =
+                    serde_json::from_str(&mapped).unwrap_or(serde_json::Value::Null);
+                if let Some(file) = entry.get("file").and_then(serde_json::Value::as_str) {
+                    candidate_files.insert(file.to_string());
                 }
+            }
+            let _ = fs::remove_file(&mapping_path).await;
+
+            // Remove the old URL-addressed file as well during migration. 旧写入用
+            // `file_ext_from_url(..).unwrap_or("image")` 兜底, 所以 `.image` 也要清。
+            let ext = file_ext_from_url(url).unwrap_or_else(|| "png".to_string());
+            let _ = fs::remove_file(cover_dir.join(format!("{}.{}", md5_hex(url), ext))).await;
+            if ext != "image" {
+                let _ = fs::remove_file(cover_dir.join(format!("{}.image", md5_hex(url)))).await;
             }
         }
 
-        // Remove the old URL-addressed file as well during migration.
-        let ext = file_ext_from_url(url).unwrap_or_else(|| "png".to_string());
-        let _ = fs::remove_file(cover_dir.join(format!("{}.{}", md5_hex(url), ext))).await;
+        match collect_referenced_cover_files(&cover_dir).await {
+            Ok(referenced) => {
+                for file_name in candidate_files.difference(&referenced) {
+                    let _ = fs::remove_file(cover_dir.join(file_name)).await;
+                }
+            }
+            Err(err) => {
+                // 引用扫描失败时只保留内容文件，不冒险误删共享图片。
+                tracing::warn!("扫描封面内容引用失败，跳过内容文件清理: {err:?}");
+            }
+        }
         Ok(())
+    }
+
+    /// Remove a cover's URL mapping and the content file when no other URL
+    /// still references the same bytes.
+    pub async fn delete_cover_cache(&self, user_ns: &str, url: &str) -> Result<(), AppError> {
+        self.delete_cover_caches(user_ns, &[url.to_string()]).await
     }
 
     /// Safety net for crashes or forced exits that bypass the search-session
@@ -3715,8 +3825,14 @@ fn sanitize_book_urls(book: &mut Book) {
     if let Some(toc_url) = &book.toc_url {
         book.toc_url = Some(repair_encoded_url(toc_url));
     }
+    // 封面地址只 trim, 不做百分号反转义。
+    //
+    // `repair_encoded_url` 会把 `%3D` 换成 `=`。页面地址上这没问题(站点能容忍),
+    // 但封面地址里的 `x-signature=…%3D` 是被站点按原始串校验的签名: 解码后回源
+    // 直接 403。而封面缓存是**按 URL** 造键的, 一旦地址被改写, 搜索页缓存的那份
+    // 就再也命中不了 —— 表现正是「搜索时有封面, 加入书架后没封面」。
     if let Some(cover_url) = &book.cover_url {
-        book.cover_url = Some(repair_encoded_url(cover_url));
+        book.cover_url = Some(normalize_source_url(cover_url));
     }
 }
 
@@ -3777,6 +3893,104 @@ fn file_ext_from_url(url: &str) -> Option<String> {
     }
 }
 
+/// 一个「没认出是哪种图片」的 Content-Type: 空、octet-stream, 或根本不是图片。
+fn is_unknown_image_type(content_type: &str) -> bool {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    !matches!(
+        mime.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/webp"
+            | "image/gif"
+            | "image/bmp"
+            | "image/avif"
+            | "image/svg+xml"
+    )
+}
+
+/// 按文件头认图片格式。只覆盖封面实际会用到的几种。
+fn sniff_image_content_type(bytes: &[u8]) -> Option<String> {
+    let mime = if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(b"BM") {
+        "image/bmp"
+    } else if bytes.len() > 12 && &bytes[4..8] == b"ftyp" && &bytes[8..12] == b"avif" {
+        "image/avif"
+    } else {
+        return None;
+    };
+    Some(mime.to_string())
+}
+
+/// 封面落盘用的扩展名。
+///
+/// 以服务端给的 `Content-Type` 为准: 番茄一类图床的地址形如 `…:1200:0.image`,
+/// 按 URL 取后缀会落下 `.image` —— 文件本身是正常 JPEG, 只是系统没有这个后缀的
+/// 缩略图/打开方式, 在资源管理器里看着像「空白文件」。`Content-Type` 认不出时
+/// 才回退到 URL 后缀, 再兜底 `img`(不写 `image`, 免得继续冒充未知类型)。
+fn cover_file_extension(url: &str, content_type: &str) -> String {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "image/png" => "png".to_string(),
+        "image/jpeg" | "image/jpg" => "jpg".to_string(),
+        "image/webp" => "webp".to_string(),
+        "image/gif" => "gif".to_string(),
+        "image/bmp" => "bmp".to_string(),
+        "image/avif" => "avif".to_string(),
+        "image/svg+xml" => "svg".to_string(),
+        _ => file_ext_from_url(url).unwrap_or_else(|| "img".to_string()),
+    }
+}
+
+/// 把封面地址里裸的 `=` 重新转义成 `%3D`, 用于找回历史上被反转义过的缓存。
+///
+/// 只处理**查询串里**的 `=`, 路径、fragment 和参数名中间的 `=` 一概不动: 前者
+/// 才是签名载荷, 后者一旦改动整条地址就废了。找不到可回退的写法时返回 `None`。
+fn reencode_cover_signature(url: &str) -> Option<String> {
+    let (before_fragment, fragment) = match url.split_once('#') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (url, None),
+    };
+    let (path, query) = before_fragment.split_once('?')?;
+    let rebuilt = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            // 只转义值里的 `=`(签名载荷), 键与键之间的分隔符不动。
+            Some((key, value)) if value.contains('=') => {
+                format!("{key}={}", value.replace('=', "%3D"))
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    if rebuilt == query {
+        return None;
+    }
+    let mut out = format!("{path}?{rebuilt}");
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    Some(out)
+}
+
 fn content_type_from_ext(ext: &str) -> String {
     match ext {
         "png" => "image/png",
@@ -3821,6 +4035,7 @@ async fn prune_stale_cover_mappings(cover_dir: &Path, max_age: Duration) -> Resu
 
 /// 回收没有任何映射引用的内容文件; 同样只看超过 `max_age` 未更新的文件。
 async fn remove_orphan_cover_files(cover_dir: &Path, max_age: Duration) -> Result<usize, AppError> {
+    let referenced = collect_referenced_cover_files(cover_dir).await?;
     let mut entries = match fs::read_dir(cover_dir).await {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -3846,7 +4061,7 @@ async fn remove_orphan_cover_files(cover_dir: &Path, max_age: Duration) -> Resul
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if mappings_reference_file(cover_dir, file_name).await {
+        if referenced.contains(file_name) {
             continue;
         }
         if fs::remove_file(path).await.is_ok() {
@@ -3856,13 +4071,17 @@ async fn remove_orphan_cover_files(cover_dir: &Path, max_age: Duration) -> Resul
     Ok(removed)
 }
 
-async fn mappings_reference_file(cover_dir: &Path, file_name: &str) -> bool {
+async fn collect_referenced_cover_files(
+    cover_dir: &Path,
+) -> Result<HashSet<String>, AppError> {
     let urls_dir = cover_dir.join("urls");
     let mut entries = match fs::read_dir(&urls_dir).await {
         Ok(entries) => entries,
-        Err(_) => return false,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(err) => return Err(AppError::Internal(err.into())),
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    let mut referenced = HashSet::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|e| AppError::Internal(e.into()))? {
         if entry
             .path()
             .extension()
@@ -3872,7 +4091,7 @@ async fn mappings_reference_file(cover_dir: &Path, file_name: &str) -> bool {
             continue;
         }
         if let Ok(mapped) = fs::read_to_string(entry.path()).await {
-            if serde_json::from_str::<serde_json::Value>(&mapped)
+            if let Some(file) = serde_json::from_str::<serde_json::Value>(&mapped)
                 .ok()
                 .and_then(|value| {
                     value
@@ -3880,14 +4099,12 @@ async fn mappings_reference_file(cover_dir: &Path, file_name: &str) -> bool {
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_string)
                 })
-                .as_deref()
-                == Some(file_name)
             {
-                return true;
+                referenced.insert(file);
             }
         }
     }
-    false
+    Ok(referenced)
 }
 
 #[cfg(test)]
@@ -3964,6 +4181,201 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_dir(&cover_dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    #[tokio::test]
+    async fn batch_cover_delete_preserves_shared_content_still_referenced() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-batch-delete-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let cover_dir = storage_dir.join("cache").join("public").join("cover");
+        let shared = b"shared-cover-bytes";
+
+        for url in [
+            "https://img.example/a.png",
+            "https://img.example/b.png",
+            "https://img.example/keep.png",
+        ] {
+            service
+                .store_cover_mapping(url, shared, "image/png", &cover_dir)
+                .await
+                .unwrap();
+        }
+        service
+            .store_cover_mapping(
+                "https://img.example/unique.png",
+                b"unique-cover-bytes",
+                "image/png",
+                &cover_dir,
+            )
+            .await
+            .unwrap();
+
+        service
+            .delete_cover_caches(
+                "public",
+                &[
+                    "https://img.example/a.png".to_string(),
+                    "https://img.example/b.png".to_string(),
+                    "https://img.example/unique.png".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_dir(cover_dir.join("urls")).unwrap().count(), 1);
+        let content_files: Vec<_> = std::fs::read_dir(&cover_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .collect();
+        assert_eq!(content_files.len(), 1, "仅保留仍被 keep.png 引用的共享内容");
+
+        let (data, content_type) = service
+            .get_cover("public", "https://img.example/keep.png")
+            .await
+            .unwrap();
+        assert_eq!(data, shared);
+        assert_eq!(content_type, "image/png");
+
+        service
+            .delete_cover_cache("public", "https://img.example/keep.png")
+            .await
+            .unwrap();
+        assert!(!content_files[0].path().exists());
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn sniffs_image_type_when_the_server_omits_it() {
+        // 服务器不回 Content-Type 时, 图床的 `.image` 地址只能靠魔数认。
+        assert!(is_unknown_image_type("application/octet-stream"));
+        assert!(is_unknown_image_type(""));
+        assert!(!is_unknown_image_type("image/jpeg"));
+        assert_eq!(
+            sniff_image_content_type(&[0xFF, 0xD8, 0xFF, 0xE0]).as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            sniff_image_content_type(b"\x89PNG\r\n\x1a\n").as_deref(),
+            Some("image/png")
+        );
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBPVP8 ");
+        assert_eq!(
+            sniff_image_content_type(&webp).as_deref(),
+            Some("image/webp")
+        );
+        assert_eq!(sniff_image_content_type(b"<html>"), None);
+    }
+
+    #[test]
+    fn cover_extension_follows_content_type_not_url_suffix() {
+        // 番茄图床: 地址以 `…:1200:0.image?…%3D` 结尾, 实际是 JPEG。
+        let url = "https://img.example/novel-pic-r/abc~tplv:1200:0.image?x-signature=a%3D";
+        assert_eq!(cover_file_extension(url, "image/jpeg"), "jpg");
+        assert_eq!(cover_file_extension(url, "image/webp"), "webp");
+        assert_eq!(
+            cover_file_extension("https://img.example/a.PNG?x=1", "image/png"),
+            "png"
+        );
+        // 认不出的 Content-Type 才回退 URL 后缀, 再兜底 img。
+        assert_eq!(
+            cover_file_extension("https://img.example/a.gif", "application/octet-stream"),
+            "gif"
+        );
+        assert_eq!(
+            cover_file_extension("https://img.example/no-ext", "application/octet-stream"),
+            "img"
+        );
+    }
+
+    #[test]
+    fn reencodes_only_the_signature_payload() {
+        // 历史上被反转义过的地址: 签名末尾的 `=` 需要还原成 `%3D`。
+        assert_eq!(
+            reencode_cover_signature(
+                "https://img.example/c.jpg?lk=ae4&x-expires=1797656168&x-signature=eizdm5i4RB58HkAj3MkxtkLWJp4="
+            )
+            .as_deref(),
+            Some(
+                "https://img.example/c.jpg?lk=ae4&x-expires=1797656168&x-signature=eizdm5i4RB58HkAj3MkxtkLWJp4%3D"
+            )
+        );
+        // 参数名里的 `=` 与不含签名的地址都不改。
+        assert_eq!(
+            reencode_cover_signature("https://img.example/c.jpg?a=1&b=2"),
+            None
+        );
+        assert_eq!(reencode_cover_signature("https://img.example/c.jpg"), None);
+        // fragment 不是查询串, 不参与转义, 且原样保留。
+        assert_eq!(
+            reencode_cover_signature("https://img.example/c.jpg?sig=ab=#frag=1").as_deref(),
+            Some("https://img.example/c.jpg?sig=ab%3D#frag=1")
+        );
+    }
+
+    #[test]
+    fn sanitizing_a_book_keeps_the_cover_signature_intact() {
+        // 封面地址里的 `%3D` 是站点按原始串校验的签名, 反转义后回源 403;
+        // 而且封面缓存按 URL 造键, 改写会让搜索页已缓存的那份彻底失配。
+        let mut book = Book {
+            book_url: "https://books.example/1.html".to_string(),
+            origin: "https://books.example".to_string(),
+            cover_url: Some(
+                "https://img.example/c.jpg?x-expires=1&x-signature=eiz%2Bdm5%3D".to_string(),
+            ),
+            ..Default::default()
+        };
+        sanitize_book_urls(&mut book);
+        assert_eq!(
+            book.cover_url.as_deref(),
+            Some("https://img.example/c.jpg?x-expires=1&x-signature=eiz%2Bdm5%3D")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_signature_mapping_migrates_to_the_shelf_url() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-migrate-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let cover_dir = storage_dir.join("cache").join("public").join("cover");
+        let original = "https://img.example/c.jpg?x-signature=eiz%3D";
+        let escaped = "https://img.example/c.jpg?x-signature=eiz=";
+        // 模拟旧版本: 缓存按原始 URL 存, 书架记的是被反转义的地址。
+        service
+            .store_cover_mapping(original, b"cover-bytes", "image/jpeg", &cover_dir)
+            .await
+            .unwrap();
+
+        let (data, content_type) = service.get_cover("public", escaped).await.unwrap();
+        assert_eq!(data, b"cover-bytes");
+        assert_eq!(content_type, "image/jpeg");
+        // 映射被搬到书架用的地址下, 旧映射已释放。
+        assert!(cover_dir
+            .join("urls")
+            .join(format!("{}.json", md5_hex(escaped)))
+            .exists());
+        assert!(!cover_dir
+            .join("urls")
+            .join(format!("{}.json", md5_hex(original)))
+            .exists());
         let _ = std::fs::remove_dir_all(storage_dir);
     }
 
