@@ -12,7 +12,7 @@
       <div class="shelf-header">
         <h1 class="shelf-title">
           书架
-          <span class="book-count">({{ shelfStore.filteredBooks.length }})</span>
+          <span class="book-count">({{ visibleShelfBooks.length }})</span>
         </h1>
         <div class="shelf-actions">
           <template v-if="shelfStore.editMode">
@@ -107,6 +107,32 @@
             {{ group.groupName }}
           </button>
         </div>
+        <!-- 编辑模式(全选/批量删除)作用于整个分组, 此时隐藏搜索框: 显示筛选
+             子集却批量操作看不见的书, 对不可撤销的删除是危险的歧义。 -->
+        <div v-if="!shelfStore.editMode" class="shelf-search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m20 20-3.5-3.5" />
+          </svg>
+          <input
+            v-model.trim="bookSearchText"
+            type="text"
+            class="shelf-search-input"
+            placeholder="搜索书架"
+            aria-label="搜索书架"
+          />
+          <button
+            v-if="bookSearchText"
+            type="button"
+            class="shelf-search-clear"
+            aria-label="清空书架搜索"
+            @click="bookSearchText = ''"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
+              <path d="M6 6l12 12M18 6 6 18" />
+            </svg>
+          </button>
+        </div>
         <div ref="sortMenuRef" class="sort-trigger-wrap">
           <button
             type="button"
@@ -114,7 +140,8 @@
             :class="{ open: sortMenuOpen }"
             :aria-expanded="sortMenuOpen"
             aria-haspopup="listbox"
-            title="书架排序方式"
+            :title="`书架排序方式:${bookSortLabel(shelfStore.effectiveSortMode)}`"
+            :aria-label="`书架排序方式:${bookSortLabel(shelfStore.effectiveSortMode)}`"
             @click="toggleSortMenu"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
@@ -153,12 +180,12 @@
       <!-- Book Grid -->
       <div class="shelf-grid-wrapper">
         <BookGrid
-          :books="shelfStore.sortedBooks"
+          :books="visibleShelfBooks"
           :edit-mode="shelfStore.editMode"
           :selected-urls="shelfStore.selectedBookUrls"
           :loading="shelfStore.loading"
           :sortable="sortable"
-          empty-text="书架空空如也，搜索添加新书吧"
+          :empty-text="shelfEmptyText"
         @click="handleBookClick"
         @info="handleBookInfo"
         @delete="handleDeleteBook"
@@ -226,6 +253,7 @@ import CacheLibraryModal from '../components/CacheLibraryModal.vue'
 import ExportBookModal from '../components/ExportBookModal.vue'
 import { showContextMenu } from '../composables/useContextMenu'
 import { BOOK_SORT_KEYS, BOOK_SORT_OPTIONS, bookSortLabel } from '../utils/bookshelfSort'
+import { filterShelfBooks } from '../utils/bookshelfFilter'
 import type { Book, SearchBook } from '../types'
 
 const router = useRouter()
@@ -234,6 +262,18 @@ const readerStore = useReaderStore()
 const appStore = useAppStore()
 
 const showDetail = ref(false)
+/** 书架搜索关键词: 只在已加载的书里筛, 不发起网络搜索。 */
+const bookSearchText = ref('')
+/** 书架网格实际展示的书: 当前分组按排序排好后, 再按关键词过滤。 */
+const visibleShelfBooks = computed(() => (
+  filterShelfBooks(shelfStore.sortedBooks, bookSearchText.value)
+))
+/** 空态文案要区分「书架没有书」和「关键词没命中」, 否则搜不到时像把书弄丢了。 */
+const shelfEmptyText = computed(() => (
+  bookSearchText.value.trim()
+    ? '没有找到匹配的书籍'
+    : '书架空空如也,搜索添加新书吧'
+))
 const showGroupSelect = ref(false)
 /** 右键「调整分组」时记住目标书; 为空表示走批量(编辑模式多选)路径。 */
 const groupTargetBookUrl = ref('')
@@ -382,6 +422,13 @@ function toggleEditMode() {
     shelfStore.clearSelection()
   }
 }
+
+/** 编辑模式的「全选」「批量删除」作用于整个分组, 而搜索只筛显示。
+ *  进入编辑时清掉关键词, 否则用户看到的是筛选后的几本, 实际操作却包含
+ *  看不见的书 —— 删除不可撤销, 这种歧义必须避免。 */
+watch(() => shelfStore.editMode, (editing) => {
+  if (editing) bookSearchText.value = ''
+})
 
 async function handleBulkDelete() {
   const count = shelfStore.selectedBookUrls.size
@@ -625,6 +672,71 @@ onBeforeUnmount(() => {
   -ms-overflow-style: none;
 }
 
+/* 书架搜索: 与分组标签同一行, 排在排序入口左侧。 */
+.shelf-search {
+  flex: 0 1 190px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  color: var(--color-text-tertiary);
+  transition: border-color var(--duration-fast), color var(--duration-fast);
+}
+
+.shelf-search:focus-within {
+  border-color: rgba(201, 127, 58, 0.32);
+  color: var(--color-text-secondary);
+}
+
+.shelf-search > svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.shelf-search-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  padding: 7px 0;
+  font-size: var(--text-xs);
+  color: var(--color-text);
+  outline: none;
+}
+
+.shelf-search-input::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+.shelf-search-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  transition: color var(--duration-fast);
+}
+
+.shelf-search-clear:hover {
+  color: var(--color-text);
+}
+
+.shelf-search-clear svg {
+  width: 10px;
+  height: 10px;
+}
+
 .sort-trigger-wrap {
   flex-shrink: 0;
   position: relative;
@@ -858,6 +970,11 @@ onBeforeUnmount(() => {
     padding: 0 var(--space-4);
   }
 
+  /* 窄屏把搜索框压窄, 让分组标签仍有足够横向空间滚动。 */
+  .shelf-search {
+    flex: 0 1 116px;
+  }
+
   .shelf-header {
     align-items: center;
     gap: var(--space-3);
@@ -915,5 +1032,26 @@ onBeforeUnmount(() => {
     justify-content: space-between;
   }
   .batch-info { display: none; }
+}
+
+@media (max-width: 420px) {
+  /* 窄屏手机(小屏 Android 与 iPhone SE/标准款普遍在 375–414px): 排序入口只留
+     图标, 把横向空间让给分组标签(标签栏本身仍可横向滚动)。
+     断点取 420px 而不是更小: 行内空间是先满足搜索框与排序入口、剩下的才归
+     tabs-scroll, 所以只有图标化这一步能改变分配 —— 若只在 360px 以下生效,
+     361–420px 反而比 360px 更挤。按钮保留 aria-label 与 title, 当前排序方式
+     仍能读出; min-width/height 保住触摸目标。 */
+  .sort-trigger {
+    gap: 0;
+    justify-content: center;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 5px 6px;
+  }
+
+  .sort-trigger > span,
+  .sort-trigger .sort-caret {
+    display: none;
+  }
 }
 </style>

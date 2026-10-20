@@ -113,7 +113,14 @@
           <!-- Intro -->
           <div v-if="displayBook.intro" class="book-intro">
             <h3>简介</h3>
-            <p>{{ displayBook.intro }}</p>
+            <p
+              :class="{ collapsed: !introExpanded }"
+              @click="introExpanded = !introExpanded"
+            >{{ displayBook.intro }}</p>
+            <button
+              class="intro-toggle"
+              @click="introExpanded = !introExpanded"
+            >{{ introExpanded ? '收起' : '展开全部' }}</button>
           </div>
 
           <!-- Available Sources -->
@@ -279,7 +286,7 @@
 <script setup lang="ts">
 import { ref, watch, computed, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
-import { getCoverUrl, getChapterList, saveBook, setBookSource } from '../api/bookshelf'
+import { getCoverUrl, getChapterList, saveBook, setBookSource, getBookInfo } from '../api/bookshelf'
 import { getAvailableBookSourceSSE } from '../api/search'
 import type { SseLike } from '../api/sse'
 import { useSourceStore } from '../stores/source'
@@ -383,6 +390,17 @@ const displayChapters = computed(() => {
   return chapters.value.slice(0, 50)
 })
 
+/** 简介是否展开。书源的 `intro` 往往是一整块信息(最新/点击/评分/简介),
+ *  收起时给足行数, 需要时再展开看全文。 */
+const introExpanded = ref(false)
+
+/** 从书源详情页取回的完整简介。
+ *
+ *  搜索/发现页的 `ruleSearch.intro` 常常是站点摘要（末尾带 `..`），而完整的
+ *  `ruleBookInfo.intro` 只有访问详情页才拿得到。弹窗打开时补拉一次，避免
+ *  「手机端简介很长、桌面端只有一行」这种差异。 */
+const detailIntro = ref('')
+
 /** 非编辑态展示用的书籍信息: 优先用刚保存的结果, 其次才是 props。
  *  props.book 是打开弹窗时的对象引用, 保存后不会自动更新。 */
 const displayBook = computed(() => {
@@ -398,7 +416,8 @@ const displayBook = computed(() => {
   return {
     name: base.name,
     author: base.author || '',
-    intro: base.intro || '',
+    // 详情页拿到的简介比搜索结果里的摘要完整，优先用它。
+    intro: detailIntro.value || base.intro || '',
   }
 })
 
@@ -509,6 +528,21 @@ function resetDetailState() {
   catalogTarget.value = ''
   chapterError.value = ''
   loadedCatalogIdentity.value = ''
+  detailIntro.value = ''
+}
+
+/** 补拉书源详情页的完整简介（搜索结果的 intro 通常只是站点摘要）。
+ *  失败时保持搜索结果的简介，不影响其它信息展示。 */
+async function loadDetailIntro(loadId: number, bookKey: string) {
+  const b = props.book as Book | null
+  if (!b || !b.bookUrl || isLocal.value) return
+  try {
+    const info = await getBookInfo(b.bookUrl, b.origin)
+    if (!isCurrentDetail(loadId, bookKey)) return
+    if (info?.intro) detailIntro.value = info.intro
+  } catch {
+    // 详情页拉取失败就退回搜索结果里的简介，不打扰用户。
+  }
 }
 
 function closeSourceSSE() {
@@ -715,6 +749,9 @@ watch([() => props.modelValue, detailKey], async ([visible, bookKey]) => {
     await loadChaptersFor(b.bookUrl, b.origin, loadId, bookKey)
     return
   }
+
+  // 详情页的简介比搜索结果的摘要完整，先补拉（不阻塞目录加载）。
+  void loadDetailIntro(loadId, bookKey)
 
   sourcesLoading.value = true
   // The source manager force-refreshes this shared store after source changes.
@@ -932,6 +969,8 @@ watch([() => props.modelValue, detailKey], ([visible]) => {
   pendingCoverUploads.value = []
   // 换了另一本书就丢掉旧的覆盖值, 否则会显示成上一本改后的名字/封面。
   savedOverride.value = null
+  // 简介的展开状态同理: 换书后回到收起态。
+  introExpanded.value = false
   // 书架右键「编辑信息」进来时直接落到编辑态。
   // 用 nextTick 让书架数据/详情先就位, findShelfBook 才找得到这本书。
   if (visible && props.startInEdit) {
@@ -1222,6 +1261,31 @@ async function removeFromShelf() {
   color: var(--color-text-secondary);
   line-height: var(--leading-relaxed);
   white-space: pre-wrap;
+  cursor: pointer;
+}
+
+/* 书源的 `intro` 通常是一整块信息(最新更新/点击/评分/简介), 限死行数会把
+   真正的简介截掉。收起态保留足够行数, 需要时再展开看全文。 */
+.book-intro p.collapsed {
+  display: -webkit-box;
+  -webkit-line-clamp: 12;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.book-intro .intro-toggle {
+  margin-top: var(--space-1, 4px);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-primary, #c97f3a);
+  font-size: var(--text-xs, 11px);
+  cursor: pointer;
+  opacity: 0.8;
+}
+
+.book-intro .intro-toggle:hover {
+  opacity: 1;
 }
 
 .source-section {

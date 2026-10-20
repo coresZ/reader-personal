@@ -57,6 +57,7 @@ import BookGrid from '../components/BookGrid.vue'
 import { showContextMenu } from '../composables/useContextMenu'
 import { useBookshelfStore } from '../stores/bookshelf'
 import { useReaderStore } from '../stores/reader'
+import { filterShelfBooks } from '../utils/bookshelfFilter'
 import type { Book, SearchBook } from '../types'
 
 const router = useRouter()
@@ -69,6 +70,8 @@ const openingBookUrl = ref('')
 const activeFilter = ref<'all' | 'book' | 'rss'>('all')
 const searchText = ref('')
 
+/** 关键词过滤复用书架那一套(`filterShelfBooks`): 两处搜索同一批书, 匹配字段
+ *  与大小写规则必须一致, 否则同一关键词在书架能搜到、在最近阅读却搜不到。 */
 const filteredRecentBooks = computed(() => {
   let list = shelfStore.recentBooks
   if (activeFilter.value === 'book') {
@@ -77,22 +80,7 @@ const filteredRecentBooks = computed(() => {
     list = list.filter((book) => book.recentKind === 'rss')
   }
 
-  const keyword = searchText.value.trim().toLowerCase()
-  if (!keyword) return list
-
-  return list.filter((book) =>
-    [
-      book.name,
-      book.author,
-      book.intro,
-      book.originName,
-      book.origin,
-      book.latestChapterTitle,
-      book.durChapterTitle,
-    ]
-      .filter(Boolean)
-      .some((value) => String(value).toLowerCase().includes(keyword)),
-  )
+  return filterShelfBooks(list, searchText.value)
 })
 
 onMounted(async () => {
