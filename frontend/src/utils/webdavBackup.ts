@@ -33,16 +33,28 @@ import type { BackupArchiveFile } from '../api/webdav'
 import type { Book, BookGroup, Bookmark, BookSource, ReplaceRule, RssSource } from '../types'
 
 const BACKUP_VERSION = 2
+/**
+ * 不进入备份的 localStorage key。
+ *
+ * `reader-background-image` / `reader-page-background-image` 存的是整张背景图的
+ * base64(实测一张 webp 就有 361 KB), 体积远大于其它所有备份内容之和, 而且每次
+ * 备份都会重复带上同一张图。备份应当保存"难以重建的元数据", 背景图是用户手边
+ * 就有的文件, 重新选一次的成本远低于它带来的体积与超限风险。
+ */
+const LOCAL_STORAGE_KEYS_EXCLUDED = new Set([
+  'reader-background-image',
+  'reader-page-background-image',
+])
+
 const LOCAL_STORAGE_KEYS = [
   'theme',
   'reader-stats',
   'readConfig',
   'reader-themeIndex',
   'reader-isNight',
-  'reader-background-image',
-  // 阅读页专属背景图与透明度: 存在独立的 key 里(不随 readConfig 走),
-  // 漏掉它会导致恢复备份后阅读页背景图丢失。
-  'reader-page-background-image',
+  // 两个背景图 key 本来也在这份清单里, 现已在 LOCAL_STORAGE_KEYS_EXCLUDED 中
+  // 显式排除(体积原因), 故不再列入 —— 排除集合对它们仍然生效, 将来的过滤逻辑
+  // 统一走那里。
   'reader-speechConfig',
   'reader-last-session',
   'reader-currentIndex',
@@ -114,6 +126,7 @@ type JsonRecord = Record<string, unknown>
 
 function captureLocalState() {
   return LOCAL_STORAGE_KEYS.reduce<Record<string, string>>((acc, key) => {
+    if (LOCAL_STORAGE_KEYS_EXCLUDED.has(key)) return acc
     const value = localStorage.getItem(key)
     if (value != null) {
       acc[key] = value
@@ -124,6 +137,8 @@ function captureLocalState() {
 
 function applyLocalState(localState: Record<string, string> = {}) {
   LOCAL_STORAGE_KEYS.forEach((key) => {
+    // 背景图不参与备份, 恢复时也就不能因为"备份里没有"而删掉用户当前那张图。
+    if (LOCAL_STORAGE_KEYS_EXCLUDED.has(key)) return
     const value = localState[key]
     if (value == null) {
       localStorage.removeItem(key)

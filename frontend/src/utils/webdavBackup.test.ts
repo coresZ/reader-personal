@@ -360,12 +360,16 @@ describe('backup payload v2', () => {
     }
   })
 
-  it('backfills reader page background image and hotkeys', async () => {
-    // 回归测试: 阅读页专属背景图与自定义快捷键都存在**独立的** localStorage key
-    // 里(不随 readConfig 走)。它们漏在备份清单外时, 恢复备份后背景图与用户
-    // 自定义的按键会一并丢失, 且不会有任何提示。
+  it('keeps hotkeys in the backup but leaves the background image out', async () => {
+    // 自定义快捷键存在**独立的** localStorage key 里(不随 readConfig 走),
+    // 漏在备份清单外时恢复后按键会静默丢失 —— 它必须进备份。
+    //
+    // 背景图相反: 一张 webp base64 就有 361 KB, 比其余所有备份内容之和还大得多,
+    // 每次备份都重复带同一张图。备份只存"难以重建的元数据", 图是用户手边的文件,
+    // 因此显式排除(见 webdavBackup.ts 的 LOCAL_STORAGE_KEYS_EXCLUDED)。
     const store: Record<string, string> = {
-      'reader-page-background-image': 'data:image/png;base64,AAAA',
+      'reader-background-image': 'data:image/webp;base64,MAINDESKTOP',
+      'reader-page-background-image': 'data:image/png;base64,AAAAREADER',
       'reader-hotkeys': JSON.stringify({ 'Control+f': ['search'] }),
     }
     vi.stubGlobal('localStorage', {
@@ -376,17 +380,21 @@ describe('backup payload v2', () => {
     try {
       const payload = await createWebdavBackupPayload()
 
-      expect(payload.localState['reader-page-background-image']).toBe('data:image/png;base64,AAAA')
+      expect(payload.localState['reader-background-image']).toBeUndefined()
+      expect(payload.localState['reader-page-background-image']).toBeUndefined()
       expect(payload.localState['reader-hotkeys']).toBe(JSON.stringify({ 'Control+f': ['search'] }))
     } finally {
       vi.unstubAllGlobals()
     }
   })
 
-  it('round-trips those keys through restore', async () => {
-    // 恢复侧: 备份里有值就写回; 备份里没有才清除。验证读-写闭环而不是只看单边。
+  it('restores hotkeys but never touches the existing background images', async () => {
+    // 恢复侧: 备份里有值就写回, 没有才清除 —— 但排除项除外。
+    // 背景图不在备份里, 若照"没有就删除"的规则处理, 恢复一次就会把用户当前
+    // 那张图删掉, 这是不可接受的副作用。
     const store: Record<string, string> = {
-      'reader-page-background-image': 'data:image/png;base64,OLD',
+      'reader-background-image': 'data:image/webp;base64,KEEP_DESKTOP',
+      'reader-page-background-image': 'data:image/png;base64,KEEP_READER',
       'reader-hotkeys': '{"old":["back"]}',
     }
     vi.stubGlobal('localStorage', {
@@ -398,13 +406,15 @@ describe('backup payload v2', () => {
       const payload = createPayload()
       payload.localState = {
         ...payload.localState,
-        'reader-page-background-image': 'data:image/png;base64,NEW',
+        // 即使旧备份里确实带了图, 也不该用它覆盖本机现有的
+        'reader-background-image': 'data:image/webp;base64,FROM_BACKUP',
         'reader-hotkeys': '{"new":["catalog"]}',
       }
 
       await restoreWebdavBackup(payload)
 
-      expect(store['reader-page-background-image']).toBe('data:image/png;base64,NEW')
+      expect(store['reader-background-image']).toBe('data:image/webp;base64,KEEP_DESKTOP')
+      expect(store['reader-page-background-image']).toBe('data:image/png;base64,KEEP_READER')
       expect(store['reader-hotkeys']).toBe('{"new":["catalog"]}')
     } finally {
       vi.unstubAllGlobals()
