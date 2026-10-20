@@ -191,6 +191,21 @@ impl RuleEngine {
         }
     }
 
+    /// 测试用入口: 在给定 item 上求值一条搜索字段规则。
+    #[doc(hidden)]
+    pub fn field_probe_for_test(
+        &self,
+        rule: &str,
+        item: &Value,
+        base_url: &str,
+        source: &BookSource,
+    ) -> Option<String> {
+        let mut ctx = HashMap::new();
+        with_source(source, || {
+            eval_field_json_with_ctx(rule, item, base_url, &mut ctx)
+        })
+    }
+
     pub fn search_books(&self, source: &BookSource, body: &str, base_url: &str) -> Vec<SearchBook> {
         with_source(source,|| {
             if let Some(pattern) = source.book_url_pattern.as_deref().filter(|p| !p.trim().is_empty()) {
@@ -2007,9 +2022,34 @@ fn strip_url_config(url: &str) -> &str {
         &url[..idx]
     } else if let Some(idx) = url.find(",{\"webView\"") {
         &url[..idx]
+    } else if let Some(idx) = url.find(",{") {
+        // legado 的 URL option 语法: `地址,{"headers":{…},"method":"POST"}`。
+        // 书源常把 headers 直接拼在**资源地址**上(封面、图片), 例如
+        // `img.0@src` 后接 `gethdi(result)` 返回 `https://img/1.jpg,{"headers":{…}}`。
+        // 这种值只能当请求参数用, 存成封面/图片地址会让前端加载失败。
+        //
+        // 判定要足够保守: `,{` 之后必须是合法的 JSON 对象开头, 且整段能闭合,
+        // 避免误切本身就含 `,{` 的地址(极少, 但存在)。`data:` 地址里的逗号是
+        // 数据分隔符, 不能切 —— 那会把 base64 内容砍断。
+        if !url.starts_with("data:") && looks_like_url_option(&url[idx + 1..]) {
+            &url[..idx]
+        } else {
+            url
+        }
     } else {
         url
     }
+}
+
+/// `,{...}` 之后的部分是否是 legado 的 URL option(合法 JSON 对象)。
+fn looks_like_url_option(rest: &str) -> bool {
+    let trimmed = rest.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .map(|value| value.is_object())
+        .unwrap_or(false)
 }
 
 /// 把元素转成 JS 侧可用的只读快照(`java.getElement` / `getElements` 的返回值)。
@@ -2259,8 +2299,31 @@ fn eval_field_html_single_with_ctx(
     }
 
     if let Some(script) = js {
-        if let Ok(res) = eval_js(script, &text, base_url) {
-            text = res;
+        // 脚本里的 `result` 必须是**当前元素**(JSoup Element): 书源普遍写
+        // `result.select('p.gray').first()`、`result.html()`、`result.text()`。
+        // 只传 HTML 文本时这些调用都会抛 "not a function", 字段取值全部落空。
+        //
+        // 这里把元素快照按 `@element:` 绑定注入, 由 `__wrapElement` 还原成
+        // 带 select/text/html/attr 的元素对象; 脚本仍可用 `String(result)`
+        // 得到 outerHtml(与 legado 的 Element 字符串化一致)。
+        if script_uses_element_api(script) {
+            let snapshot = element_binding_from_ref(el);
+            let bindings = HashMap::from([("result".to_string(), snapshot)]);
+            if let Ok(res) = eval_js_with_bindings(script, &text, base_url, &bindings) {
+                text = res;
+            }
+        } else {
+            // legado 的 `AnalyzeRule.content` 在这层就是**当前元素**, 因此字段
+            // 脚本里的 `java.getString('a.0@href')` 是在该元素内查, 而不是整页。
+            // 不设置的话 `a.0@href` 会选到页面第一个链接(或选不到), 拼出的
+            // 书籍地址随之错误/为空。
+            let scoped = format!(
+                "try{{java.setContent({});}}catch(e){{}}\n{script}",
+                serde_json::to_string(&el.html()).unwrap_or_else(|_| "\"\"".to_string())
+            );
+            if let Ok(res) = eval_js(&scoped, &text, base_url) {
+                text = res;
+            }
         }
     }
 
@@ -2523,13 +2586,91 @@ fn eval_json_item_js(script: &str, item: &Value, base_url: &str) -> anyhow::Resu
     if !item.is_object() && (!item.is_array() || pipe_row) {
         return eval_js(script, &input, base_url);
     }
-    let bindings = HashMap::from([("result".to_string(), item.clone())]);
+    // 元素快照(`bookList`/`chapterList` 交回的元素)必须按 JSoup Element 注入:
+    // legado 里 `result` 就是 Element, 书源会对它调用 `result.select('p.gray')`、
+    // `result.html()`、`result.text()`。只注入纯 JSON 时这些方法都不存在,
+    // 字段取值全部落空 —— 表现为搜索结果 0 条(本源的 name/author/intro/kind
+    // 全部依赖 `result.select(...)`)。
+    let binding = if is_element_snapshot(item) {
+        crate::parser::js::element_binding(item)
+    } else {
+        item.clone()
+    };
+    let bindings = HashMap::from([("result".to_string(), binding)]);
     // Gson/JSON objects in Legado support member access and stringify to JSON.
     // Keep JSON.parse(result) rules working alongside result.book_id rules.
-    let script = format!(
-        "Object.defineProperty(globalThis.result, Symbol.toPrimitive, {{value: function () {{ return JSON.stringify(this); }}}});\n{script}"
-    );
+    //
+    // 元素快照不能加 `Symbol.toPrimitive` 转 JSON: 那会让 `String(result)`
+    // 得到快照 JSON 而不是元素文本, 与 JSoup Element 的行为不符。
+    let script = if is_element_snapshot(item) {
+        script.to_string()
+    } else {
+        format!(
+            "Object.defineProperty(globalThis.result, Symbol.toPrimitive, {{value: function () {{ return JSON.stringify(this); }}}});\n{script}"
+        )
+    };
     eval_js_with_bindings(&script, &input, base_url, &bindings)
+}
+
+/// 脚本是否用到了 JSoup Element 的方法(`select`/`html`/`text`/`attr`/`ownText`)。
+///
+/// 只在用到时注入元素对象, 其余脚本保持"`result` 是 HTML/文本"的既有语义,
+/// 避免影响大量依赖字符串 result 的书源。
+fn script_uses_element_api(script: &str) -> bool {
+    ["select(", ".html(", ".ownText(", ".attr(", ".attr (", ".hasAttr(", ".children(", ".parent("]
+        .iter()
+        .any(|needle| script.contains(needle))
+}
+
+/// 把 `scraper` 元素转成元素快照绑定(供 `__wrapElement` 还原)。
+fn element_binding_from_ref(el: &scraper::ElementRef) -> serde_json::Value {
+    let attrs: serde_json::Map<String, serde_json::Value> = el
+        .value()
+        .attrs()
+        .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+        .collect();
+    let snapshot = serde_json::json!({
+        "tag": el.value().name(),
+        "text": html::select_text_from_element(el, "").unwrap_or_else(|| el.text().collect::<String>()),
+        "ownText": el.text().collect::<String>(),
+        "innerHtml": el.inner_html(),
+        "outerHtml": el.html(),
+        "attrs": attrs,
+    });
+    crate::parser::js::element_binding(&snapshot)
+}
+
+/// 判断一个 JSON 值是否是**元素快照**(`{tag,text,ownText,innerHtml,outerHtml,attrs}`)。
+///
+/// 依据是快照必备的 `outerHtml`/`innerHtml`: 纯 JSON 数据(JSONPath 结果)不会有
+/// 这两个键, 而 `tag`/`text` 之类可能撞名, 不足以判定。
+fn is_element_snapshot(item: &Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    object.contains_key("outerHtml") || object.contains_key("innerHtml")
+}
+
+/// 把元素快照还原成 HTML 片段, 交给 CSS 引擎求值。
+///
+/// 优先用 `outerHtml`(含元素自身, 与 legado 一致: `result` 就是那个元素);
+/// 缺它时用 `tag` + `innerHtml` 拼一个。
+fn element_snapshot_html(item: &Value) -> String {
+    if let Some(outer) = item.get("outerHtml").and_then(Value::as_str) {
+        if !outer.trim().is_empty() {
+            return format!("<body>{outer}</body>");
+        }
+    }
+    let tag = item
+        .get("tag")
+        .and_then(Value::as_str)
+        .filter(|tag| !tag.trim().is_empty())
+        .unwrap_or("div");
+    let inner = item
+        .get("innerHtml")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    format!("<body><{tag}>{inner}</{tag}></body>")
 }
 
 fn eval_field_json_with_ctx(
@@ -2538,6 +2679,22 @@ fn eval_field_json_with_ctx(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
+    // 元素快照(``bookList``/``chapterList`` 交回的元素)上的字段规则必须按 **CSS**
+    // 求值, 不能当成 JSON 字段名。legado 里这一层 `result` 是 JSoup `Element`,
+    // 规则 `h4@text` / `p.gray@html` / `img.0@src` 都是 CSS 选择器。
+    //
+    // 走 JSON 分支时 `h4@text` 会被当成"取 JSON 的 h4 字段", 恒为空 ——
+    // 表现为搜索结果 0 条、目录 0 章。
+    if is_element_snapshot(v) {
+        let doc_html = element_snapshot_html(v);
+        let doc = html::parse_document(&doc_html);
+        let root_sel = scraper::Selector::parse("body > *").ok()?;
+        let root: Vec<_> = doc.select(&root_sel).collect();
+        return match root.first() {
+            Some(el) => eval_field_html_with_ctx(rule, el, base_url, &mut HashMap::new()),
+            None => None,
+        };
+    }
     if let Some(res) = try_put_get_json(rule, v, base_url, ctx) {
         return Some(res);
     }

@@ -373,6 +373,22 @@ pub fn resp_binding(value: &serde_json::Value) -> JsonValue {
     ))
 }
 
+/// 构造 `Elements` 语义的绑定值(JSON 数组 + 标记前缀)。
+///
+/// 用于把 `bookList`/`chapterList` 交回的**元素快照**逐条注入字段规则的
+/// `result`: legado 里 `result` 是 JSoup `Element`, 书源普遍对它调用
+/// `result.select('p.gray')` / `result.html()` / `result.text()`。只注入纯 JSON
+/// 时这些方法不存在, 字段取值全部落空(表现为搜索结果 0 条)。
+pub const ELEMENT_BINDING_PREFIX: &str = "@element:";
+
+/// 构造元素快照绑定值(单个快照 + 标记前缀)。
+pub fn element_binding(value: &serde_json::Value) -> JsonValue {
+    JsonValue::String(format!(
+        "{ELEMENT_BINDING_PREFIX}{}",
+        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+    ))
+}
+
 pub fn eval_js_with_bindings(
     script: &str,
     input: &str,
@@ -894,7 +910,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
         return Object.prototype.hasOwnProperty.call(s, S(name));
       };
       jsonNode.tagName = function () { return ''; };
-      jsonNode.select = function () { return []; };
+      jsonNode.select = function () { return elementsApi([]); };
       jsonNode.toString = function () { return JSON.stringify(s); };
       return jsonNode;
     }
@@ -934,10 +950,15 @@ const JS_PRELUDE: &str = r#"(function (g) {
       tagName: function () { return S(s.tag); },
       // 在元素内部继续查询: 用 innerHtml 作为内容, 只匹配**后代**
       // (JSoup 的 element.select() 不含元素自身; 用 outerHtml 会把自己也选进来)
+      //
+      // JSoup 的 `Element.select()` 返回 `Elements`, 必须带 size()/get()/first()
+      // 等方法: 书源普遍写 `result.select('p.gray').first()`、
+      // `.size()`、`.eachText()`。只返回普通数组会让这些调用抛 "not a function",
+      // 字段取值全部落空(搜索结果为 0 条)。
       select: function (rule) {
         var inner = S(s.innerHtml);
-        if (!inner) return [];
-        return wrapElements(g.__rule_get(S(rule), inner, 'elements'));
+        if (!inner) return elementsApi([]);
+        return elementsApi(wrapElements(g.__rule_get(S(rule), inner, 'elements')));
       },
       toString: function () { return S(s.outerHtml); },
       // 保留原始快照: JSoup 桥需要在元素间复制/合并时重建包装对象。
@@ -945,6 +966,10 @@ const JS_PRELUDE: &str = r#"(function (g) {
     };
     return el;
   }
+  // 宿主把"元素快照"注入为字段规则的 `result` 时要用同一套包装(见
+  // `ELEMENT_BINDING_PREFIX`): legado 的 result 是 JSoup Element, 书源会对它
+  // 调用 select()/html()/text()。桥接函数必须挂到全局, 宿主才能按名字调用。
+  g.__wrapElement = wrapElement;
   function wrapElements(json) {
     var list;
     try { list = JSON.parse(S(json)); } catch (e) { return []; }
@@ -991,6 +1016,32 @@ const JS_PRELUDE: &str = r#"(function (g) {
       }
       return out;
     });
+    // JSoup `Elements` 的其余取首元素方法: 书源常用
+    // `java.getElement('.list').attr('href')` / `.html()` 直接拿第一个。
+    def('attr', function (name) {
+      return list.length && list[0] && list[0].attr ? list[0].attr(name) : '';
+    });
+    def('html', function () {
+      return list.length && list[0] && list[0].html ? list[0].html() : '';
+    });
+    def('outerHtml', function () {
+      return list.length && list[0] && list[0].outerHtml ? list[0].outerHtml() : '';
+    });
+    def('select', function (rule) {
+      var out = [];
+      for (var i = 0; i < list.length; i++) {
+        var sub = list[i] && list[i].select ? list[i].select(rule) : [];
+        for (var j = 0; j < sub.length; j++) out.push(sub[j]);
+      }
+      return elementsApi(out);
+    });
+    def('toString', function () {
+      var out = [];
+      for (var i = 0; i < list.length; i++) {
+        out.push(list[i] && list[i].outerHtml ? list[i].outerHtml() : '');
+      }
+      return out.join('');
+    });
     return list;
   }
   // mContent 省略时用当前页面内容(与 legado 默认 this.content 一致)
@@ -1009,9 +1060,19 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.getElements = function (rule) {
     return elementsApi(wrapElements(g.__rule_get(S(rule), '', 'elements')));
   };
+  // legado 的 `getElement` 对 CSS/XPath 规则返回的是 **Elements 集合**而不是
+  // 单个元素: `AnalyzeRule.getElement` 的 else 分支是
+  // `getAnalyzeByJSoup(result).getElements(rule)`(见 AnalyzeRule.kt)。
+  //
+  // 书源普遍依赖这一点, 把 getElement 的返回值直接当作章节/搜索结果列表交回
+  // 宿主: 例如 `result = java.getElement('#jieqi_page_contents>div')`。这里若
+  // 只返回第一个元素, 序列化出来是单个 `{__snapshot:{…}}` 对象, 宿主会当成
+  // "一本书"来套字段规则, 于是每项都取不到值, 结果是 0 条。
+  //
+  // 用 Elements 语义(带 size/get/first/eachText/toJSON)同时兼容两种用法:
+  // `getElement(r)[0]`、`getElement(r).size()` 与"直接当列表交回"都成立。
   J.getElement = function (rule) {
-    var list = wrapElements(g.__rule_get(S(rule), '', 'elements'));
-    return list.length ? list[0] : null;
+    return elementsApi(wrapElements(g.__rule_get(S(rule), '', 'elements')));
   };
   // legado AnalyzeRule.setContent: 替换后续 getString/getElement 的解析对象。
   J.setContent = function (content) { g.__rule_set_content(content == null ? '' : S(content)); };
@@ -1509,6 +1570,26 @@ const JS_PRELUDE: &str = r#"(function (g) {
       g.__store_put(prefix + S(o[keyField]) + ':' + S(k), S(v));
       return true;
     };
+    // legado 的 `book` 是**一个** Book 对象, 贯穿同一本书的所有字段规则:
+    // 书源常在 `name` 里写 `book.bookUrl = …`, 再由 `bookUrl` 规则
+    // (`@js:book.bookUrl`) 读回 —— 搜索结果的详情链接就是这么来的。
+    //
+    // 我们的 JS 上下文按次重建, 直接赋值会随上下文丢失, `bookUrl` 于是恒为空
+    // (表现为搜索结果全部点不进去)。这里把 `book.bookUrl` 的写入落到持久化
+    // 存储, 并在重建时优先读回, 等价于 legado 的跨字段共享。
+    var stateKey = prefix + 'shared:' + S(o[keyField] || 'search');
+    var initial = S(o[keyField]);
+    try {
+      Object.defineProperty(o, keyField, {
+        get: function () {
+          var stored = g.__store_get(stateKey);
+          return stored === null || stored === undefined || stored === '' ? initial : stored;
+        },
+        set: function (value) { g.__store_put(stateKey, S(value)); },
+        configurable: true,
+        enumerable: true
+      });
+    } catch (_e) {}
     // legado 的 Book/BookChapter 只实现 RuleDataInterface(没有 getKey), 只有
     // BookSource 才有。但插件常做 `book.getKey ? book.getKey() : book.bookUrl` 式探测,
     // 因此按"主键即 bookUrl / 章节 url"补上 —— 与 `source.getKey()`（书源地址）
@@ -2241,6 +2322,24 @@ fn eval_js_inner_with_source(
                     let literal = serde_json::to_string(raw.trim_start_matches(RESP_BINDING_PREFIX))
                         .unwrap_or_else(|_| "\"\"".to_string());
                     let js_value = eval_script(ctx.clone(), &format!("Resp({literal})"))?;
+                    globals.set(key.as_str(), js_value)?;
+                    continue;
+                }
+                // `@element:` 前缀: 值是**元素快照**, 必须按 JSoup Element 语义
+                // 包装, 书源才能对它调用 select()/html()/text()/attr()。
+                if let Some(raw) = value
+                    .as_str()
+                    .filter(|raw| raw.starts_with(ELEMENT_BINDING_PREFIX))
+                {
+                    let literal = serde_json::to_string(
+                        raw.trim_start_matches(ELEMENT_BINDING_PREFIX),
+                    )
+                    .unwrap_or_else(|_| "\"{}\"".to_string());
+                    // 前缀里承载的是一段 **JSON 文本**, 必须先 parse 成对象再包装:
+                    // 直接传字符串会让 `wrapElement` 走 JSON 节点分支, innerHtml
+                    // 读不到, `select()` 恒为空。
+                    let js_value =
+                        eval_script(ctx.clone(), &format!("__wrapElement(JSON.parse({literal}))"))?;
                     globals.set(key.as_str(), js_value)?;
                     continue;
                 }
@@ -4145,14 +4244,24 @@ mod tests {
         .unwrap();
         assert_eq!(out, "2|7|内层|div");
 
+        // legado 的 `getElement` 对 CSS 返回 **Elements**(见 AnalyzeRule.getElement
+        // 的 else 分支调 getElements), 所以能继续按索引/方法取值。
         assert_eq!(
             eval_js("java.getElement('.item').attr('data-id')", html, "").unwrap(),
             "7"
         );
-        // 没有匹配时返回 null
         assert_eq!(
-            eval_js("String(java.getElement('.nope'))", html, "").unwrap(),
-            "null"
+            eval_js("java.getElement('.item').size()", html, "").unwrap(),
+            "2"
+        );
+        assert_eq!(
+            eval_js("java.getElement('.item')[1].attr('data-id')", html, "").unwrap(),
+            "8"
+        );
+        // 没有匹配时是空集合, 不是 null
+        assert_eq!(
+            eval_js("java.getElement('.nope').isEmpty()", html, "").unwrap(),
+            "true"
         );
     }
 
@@ -4176,9 +4285,9 @@ mod tests {
             eval_js("java.getElements('p.a').length", html, "").unwrap(),
             "2"
         );
-        // XPath 取单个元素时也要能取到内容
+        // XPath 取单个元素时也要能取到内容(集合语义: .text() 拼接全部)。
         assert_eq!(
-            eval_js("java.getElement('@xpath://p').text()", html, "").unwrap(),
+            eval_js("java.getElement('@xpath://p').first().text()", html, "").unwrap(),
             "第一"
         );
         // XPath 快照必须保留 tag 与属性: 无 ::extractor 时 XPath 只给纯文本,
