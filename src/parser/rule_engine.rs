@@ -23,7 +23,11 @@ fn inline_js_re() -> &'static regex::Regex {
 
 fn inline_js_lazy_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\{\{(.*?)\}\}").unwrap())
+    // `(?s)`: 让 `.` 也匹配换行。书源的 `{{…}}` 常常是**多行 JS**(开头几行
+    // 是 `let`/`for`,最后才给出表达式), 而 Rust 的 `.` 默认不匹配 `\n` ——
+    // 不开 dotall 时这种块整个匹配不上, 会被当成 CSS 选择器去解析, 结果是
+    // 空值。典型症状: 规则里明明写着取简介的 JS, 详情页简介却始终为空。
+    RE.get_or_init(|| regex::Regex::new(r"(?s)\{\{(.*?)\}\}").unwrap())
 }
 
 fn get_template_re() -> &'static regex::Regex {
@@ -284,9 +288,18 @@ impl RuleEngine {
             // 这里不再额外重跑书链规则：发现页解析完的 `java.put` 已由
             // `putVariable` 落到持久 KV（见 js.rs 的 `book.putVariable`），
             // 而详情页自己也会通过 `kind` 字段补齐。
-            let prepared = rule.init.as_deref().filter(|s| !s.trim().is_empty()).map(|init| {
-                self.prepare_rule_body(init, body, base_url).unwrap_or_default()
-            });
+            // `init` 的返回值会替换后续字段规则的解析对象(legado 的
+            // `java.setContent`)。但**执行失败或返回空串时必须保留原响应**:
+            // 早先这里 `unwrap_or_default()` 会把 body 换成空串, 结果是
+            // init 一失败, 详情页的书名/作者/简介全部解析不出来 ——
+            // 界面表现成「简介为空/只有搜索结果的摘要」。
+            let original_body = body;
+            let prepared = rule
+                .init
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|init| self.prepare_rule_body(init, body, base_url).ok())
+                .filter(|output| !output.trim().is_empty());
             let body = prepared.as_deref().unwrap_or(body);
 
             let mode = self.detect_mode(rule.name.as_deref().unwrap_or(""), body);
@@ -315,7 +328,26 @@ impl RuleEngine {
                 }
                 _ => {}
             }
-            parse_book_info_html(source, body, base_url, &rule, book_url, &mut context)
+            let book =
+                parse_book_info_html(source, body, base_url, &rule, book_url, &mut context);
+            // init 把解析对象换掉了(典型是 init 内部 `java.ajax` 打到了别处,
+            // 拿到首页之类的无关页面), 此时书名等字段全为空。详情页响应本身
+            // 往往可用, 不该因为 init 跑偏就丢掉全部信息 —— 用原始响应再解析
+            // 一次, 只有它确实能取到书名才采用。
+            if book.name.trim().is_empty() && prepared.is_some() {
+                let retry = parse_book_info_html(
+                    source,
+                    original_body,
+                    base_url,
+                    &rule,
+                    book_url,
+                    &mut HashMap::new(),
+                );
+                if !retry.name.trim().is_empty() {
+                    return retry;
+                }
+            }
+            book
         })
     }
 
@@ -2025,7 +2057,7 @@ fn strip_url_config(url: &str) -> &str {
     } else if let Some(idx) = url.find(",{") {
         // legado 的 URL option 语法: `地址,{"headers":{…},"method":"POST"}`。
         // 书源常把 headers 直接拼在**资源地址**上(封面、图片), 例如
-        // `img.0@src` 后接 `gethdi(result)` 返回 `https://img/1.jpg,{"headers":{…}}`。
+        // `img.0@src` 后接 `withImageHeaders(result)` 返回 `https://img/1.jpg,{"headers":{…}}`。
         // 这种值只能当请求参数用, 存成封面/图片地址会让前端加载失败。
         //
         // 判定要足够保守: `,{` 之后必须是合法的 JSON 对象开头, 且整段能闭合,
@@ -2300,7 +2332,7 @@ fn eval_field_html_single_with_ctx(
 
     if let Some(script) = js {
         // 脚本里的 `result` 必须是**当前元素**(JSoup Element): 书源普遍写
-        // `result.select('p.gray').first()`、`result.html()`、`result.text()`。
+        // `result.select('p.meta').first()`、`result.html()`、`result.text()`。
         // 只传 HTML 文本时这些调用都会抛 "not a function", 字段取值全部落空。
         //
         // 这里把元素快照按 `@element:` 绑定注入, 由 `__wrapElement` 还原成
@@ -2367,7 +2399,11 @@ fn eval_field_html_doc_with_ctx(
     let had_templates = interpolated_rule != rule;
     let (pure, js) = extract_js(&interpolated_rule);
     let mut text = if pure.is_empty() {
-        "".to_string()
+        // 纯 JS 规则: legado 里 `result` 就是**当前内容**(整页响应),
+        // 脚本普遍写 `Packages.org.jsoup.Jsoup.parse(String(result))`
+        // 再 `select(...)`。这里传空串会让解析拿到空文档, 选择器必然为空 ——
+        // 详情页的书名/作者/简介因此全部解析不出来。
+        doc.html()
     } else {
         html::select_text(doc, pure).unwrap_or_default()
     };
@@ -2587,7 +2623,7 @@ fn eval_json_item_js(script: &str, item: &Value, base_url: &str) -> anyhow::Resu
         return eval_js(script, &input, base_url);
     }
     // 元素快照(`bookList`/`chapterList` 交回的元素)必须按 JSoup Element 注入:
-    // legado 里 `result` 就是 Element, 书源会对它调用 `result.select('p.gray')`、
+    // legado 里 `result` 就是 Element, 书源会对它调用 `result.select('p.meta')`、
     // `result.html()`、`result.text()`。只注入纯 JSON 时这些方法都不存在,
     // 字段取值全部落空 —— 表现为搜索结果 0 条(本源的 name/author/intro/kind
     // 全部依赖 `result.select(...)`)。
@@ -2603,7 +2639,15 @@ fn eval_json_item_js(script: &str, item: &Value, base_url: &str) -> anyhow::Resu
     // 元素快照不能加 `Symbol.toPrimitive` 转 JSON: 那会让 `String(result)`
     // 得到快照 JSON 而不是元素文本, 与 JSoup Element 的行为不符。
     let script = if is_element_snapshot(item) {
-        script.to_string()
+        // legado 在求值列表项字段规则前会 `analyzeRule.setContent(item)`:
+        // 脚本里的 `java.getString('h4@text')` / 插件封装的 `gets(...)`
+        // 因此是**在该条目内**取值, 而不是整页。
+        //
+        // 不设置时每条都会命中页面上的第一个匹配(或取不到), 典型后果是
+        // 列表项地址为空 —— 发现页的书全部解析不出来(书海空白)。
+        let scope = serde_json::to_string(&element_snapshot_html(item))
+            .unwrap_or_else(|_| "\"\"".to_string());
+        format!("try{{java.setContent({scope});}}catch(e){{}}\n{script}")
     } else {
         format!(
             "Object.defineProperty(globalThis.result, Symbol.toPrimitive, {{value: function () {{ return JSON.stringify(this); }}}});\n{script}"
@@ -2638,6 +2682,39 @@ fn element_binding_from_ref(el: &scraper::ElementRef) -> serde_json::Value {
         "attrs": attrs,
     });
     crate::parser::js::element_binding(&snapshot)
+}
+
+/// 元素快照上的字段规则是否**需要选择器**求值。
+///
+/// 分流依据是规则里有没有选择器语法:
+/// - 裸字段名(`text` / `ownText` / `html` / `href` / `title`): 按快照字段取,
+///   见 `pick_json_field` 的快照兼容(顶层键 → `attrs`)。
+///   若把这类规则交给 CSS 引擎,`text` 会被当成标签选择器 `text`, 结果是 0 章 ——
+///   书源普遍写 `chapterName: text` / `chapterUrl: href`。
+/// - 纯 JS(`<js>` / `@js:` / `js:`): 走 JSON 分支, 那里会把快照注入成
+///   JSoup Element, 脚本可以直接 `result.select(...)`。
+/// - 其余(`.title@text` / `h4@text` / `p.meta@html` / `img.0@src` / `@css:…` /
+///   `{{…}}`): 需要选择器, 走 CSS/HTML 求值。
+fn rule_needs_css_from_snapshot(rule: &str) -> bool {
+    let rule = rule.trim();
+    if rule.is_empty() {
+        return false;
+    }
+    if rule.starts_with("<js>") || rule.starts_with("@js:") || rule.starts_with("js:") {
+        return false;
+    }
+    // 显式模式前缀与模板插值都交给 HTML 路径。
+    if rule.starts_with("{{") {
+        return true;
+    }
+    let bare = rule
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && rule
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    !bare
 }
 
 /// 判断一个 JSON 值是否是**元素快照**(`{tag,text,ownText,innerHtml,outerHtml,attrs}`)。
@@ -2681,11 +2758,11 @@ fn eval_field_json_with_ctx(
 ) -> Option<String> {
     // 元素快照(``bookList``/``chapterList`` 交回的元素)上的字段规则必须按 **CSS**
     // 求值, 不能当成 JSON 字段名。legado 里这一层 `result` 是 JSoup `Element`,
-    // 规则 `h4@text` / `p.gray@html` / `img.0@src` 都是 CSS 选择器。
+    // 规则 `h4@text` / `p.meta@html` / `img.0@src` 都是 CSS 选择器。
     //
     // 走 JSON 分支时 `h4@text` 会被当成"取 JSON 的 h4 字段", 恒为空 ——
     // 表现为搜索结果 0 条、目录 0 章。
-    if is_element_snapshot(v) {
+    if is_element_snapshot(v) && rule_needs_css_from_snapshot(rule) {
         let doc_html = element_snapshot_html(v);
         let doc = html::parse_document(&doc_html);
         let root_sel = scraper::Selector::parse("body > *").ok()?;
@@ -4131,3 +4208,4 @@ mod tests {
         );
     }
 }
+

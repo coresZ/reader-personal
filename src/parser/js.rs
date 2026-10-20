@@ -377,7 +377,7 @@ pub fn resp_binding(value: &serde_json::Value) -> JsonValue {
 ///
 /// 用于把 `bookList`/`chapterList` 交回的**元素快照**逐条注入字段规则的
 /// `result`: legado 里 `result` 是 JSoup `Element`, 书源普遍对它调用
-/// `result.select('p.gray')` / `result.html()` / `result.text()`。只注入纯 JSON
+/// `result.select('p.meta')` / `result.html()` / `result.text()`。只注入纯 JSON
 /// 时这些方法不存在, 字段取值全部落空(表现为搜索结果 0 条)。
 pub const ELEMENT_BINDING_PREFIX: &str = "@element:";
 
@@ -578,7 +578,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
   // 合法 UTF-8, 一处落单代理项就会让整次宿主调用失败:
   //   Conversion from string failed: invalid utf-8 sequence of 1 bytes from index N
   // 书源侧很容易造出这种字符 —— 例如 `String(x).substring(0,20)` 正好把 emoji 的
-  // 代理对切成两半(番茄段评源就是这么生成面板去重键的)。legado 跑 Rhino/Java
+  // 代理对切成两半(某类带段评的书源就是这么生成面板去重键的)。legado 跑 Rhino/Java
   // 字符串不受影响, 这里由宿主统一兜底: 成对代理项原样保留, 落单的替换成 U+FFFD,
   // 保证过桥的永远是合法 UTF-8。
   //
@@ -680,6 +680,18 @@ const JS_PRELUDE: &str = r#"(function (g) {
     return JSON.stringify(h);
   }
   var evaluatingHeaders = false;
+  // 去掉 legado 的 URL option 尾巴(`地址,{"headers":{…}}`), 只留纯地址。
+  // 用于记录"原始请求地址", 与宿主回的最终地址比较以判断重定向。
+  function stripUrlOption(url) {
+    var text = S(url);
+    var idx = text.indexOf(',{');
+    if (idx <= 0) return text;
+    if (text.slice(0, 5) === 'data:') return text;
+    try {
+      if (!JSON.parse(text.slice(idx + 1))) return text;
+    } catch (_e) { return text; }
+    return text.slice(0, idx);
+  }
   function requestHeaders(extra) {
     var raw = headerJson(extra);
     if (!g.__source_header_script || evaluatingHeaders) return raw;
@@ -765,6 +777,54 @@ const JS_PRELUDE: &str = r#"(function (g) {
         if (prop === 'header') {
           return function (k) { var v = headers[S(k).toLowerCase()]; return v === undefined ? null : v; };
         }
+        // legado 的 `StrResponse.raw()` 返回 okhttp `Response`, 书源用它判断
+        // **重定向**: `result.raw().priorResponse()` 拿到重定向链的上一跳,
+        // 再 `isRedirect()` 判断是否发生过 302。缺 `raw` 时脚本在
+        // `result.raw().priorResponse()` 处抛 "not a function",
+        // 整个 loginCheckJs 失败 —— 正文随之加载不出来(该源正是这样)。
+        //
+        // 我们只保留最终地址, 因此按"原始请求地址 != 最终地址"还原重定向:
+        // `__requestUrl` 是发起请求时记录的原始 URL(见 J.ajax / __http)。
+        if (prop === 'raw') {
+          return function () {
+            var requestUrl = S(o.__requestUrl === undefined ? o.url : o.__requestUrl);
+            var finalUrl = S(o.url);
+            var redirected = !!requestUrl && !!finalUrl && requestUrl !== finalUrl;
+            function priorResponse() {
+              if (!redirected) return null;
+              // 上一跳: 同一份响应的请求地址, 但 code 视为 302 且自身没有更早的跳转。
+              return {
+                isRedirect: function () { return true; },
+                code: function () { return 302; },
+                url: function () { return requestUrl; },
+                message: function () { return 'Found'; },
+                isSuccessful: function () { return false; },
+                priorResponse: function () { return null; },
+                headers: function () { return headerMap({}); },
+                toString: function () { return requestUrl; }
+              };
+            }
+            return {
+              isRedirect: function () { return redirected; },
+              code: function () { return o.code === undefined || o.code === null ? 0 : o.code; },
+              url: function () { return finalUrl; },
+              message: function () { return ''; },
+              isSuccessful: function () {
+                return o.isSuccessful === undefined
+                  ? (o.code >= 200 && o.code < 300)
+                  : !!o.isSuccessful;
+              },
+              headers: function () { return headers; },
+              header: function (k) {
+                var v = headers[S(k).toLowerCase()];
+                return v === undefined ? null : v;
+              },
+              priorResponse: priorResponse,
+              body: function () { return null; },
+              toString: function () { return finalUrl; }
+            };
+          };
+        }
         if (prop === 'statusCode' || prop === 'code') return dual(function () { return o.code; });
         if (prop === 'body') return dual(function () { return o.body; });
         if (prop === 'url') return dual(function () { return o.url; });
@@ -777,19 +837,32 @@ const JS_PRELUDE: &str = r#"(function (g) {
   // 宿主注入绑定(如 loginCheckJs 的 `result`)时需要按 StrResponse 语义包装,
   // 在全局暴露构造器供注入脚本使用。
   g.Resp = Resp;
-  J.ajax = function (u) { return Resp(g.__connect(S(u), requestHeaders())).body(); };
-  J.connect = function (u, h) { return Resp(g.__connect(S(u), requestHeaders(h))); };
+  // 原始请求地址写进响应信封: `Resp().raw().priorResponse()` 靠它判断重定向
+  // (见 `raw` 分支)。宿主只回最终地址, 原始地址只有这里知道。
+  function httpResp(raw, requestUrl) {
+    var envelope = raw;
+    try {
+      var parsed = JSON.parse(String(raw));
+      if (parsed && typeof parsed === 'object' && parsed.__requestUrl === undefined) {
+        parsed.__requestUrl = S(requestUrl);
+        envelope = JSON.stringify(parsed);
+      }
+    } catch (_e) {}
+    return Resp(envelope);
+  }
+  J.ajax = function (u) { return httpResp(g.__connect(S(u), requestHeaders()), stripUrlOption(S(u))).body(); };
+  J.connect = function (u, h) { return httpResp(g.__connect(S(u), requestHeaders(h)), stripUrlOption(S(u))); };
   J.get = function (u, h) {
     // AnalyzeRule.get(key) reads variables; explicit HTTP URLs retain the
     // existing one-argument HTTP convenience, and headers select HTTP too.
     if (arguments.length === 1 && !/^(?:https?:)?\/\//i.test(S(u))) return ruleGet(S(u));
     return Resp(g.__http('GET', S(u), '', requestHeaders(h)));
   };
-  J.head = function (u, h) { return Resp(g.__http('HEAD', S(u), '', requestHeaders(h))); };
-  J.post = function (u, b, h) { return Resp(g.__http('POST', S(u), S(b), requestHeaders(h))); };
+  J.head = function (u, h) { return httpResp(g.__http('HEAD', S(u), '', requestHeaders(h)), stripUrlOption(S(u))); };
+  J.post = function (u, b, h) { return httpResp(g.__http('POST', S(u), S(b), requestHeaders(h)), stripUrlOption(S(u))); };
   J.put = function (u, b, h) {
     if (arguments.length < 3) return rulePut(S(u), S(b));
-    return Resp(g.__http('PUT', S(u), S(b), requestHeaders(h)));
+    return httpResp(g.__http('PUT', S(u), S(b), requestHeaders(h)), stripUrlOption(S(u)));
   };
   J.getCookie = function (tag, key) {
     var raw = S(g.cookie.getCookie(S(tag)));
@@ -873,7 +946,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.ajaxAll = function (urls) {
     if (typeof urls === 'string') urls = urls.split(',');
     var out = [];
-    for (var i = 0; i < urls.length; i++) out.push(Resp(g.__connect(S(urls[i]), requestHeaders())));
+    for (var i = 0; i < urls.length; i++) out.push(httpResp(g.__connect(S(urls[i]), requestHeaders()), stripUrlOption(S(urls[i]))));
     return out;
   };
 
@@ -952,7 +1025,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
       // (JSoup 的 element.select() 不含元素自身; 用 outerHtml 会把自己也选进来)
       //
       // JSoup 的 `Element.select()` 返回 `Elements`, 必须带 size()/get()/first()
-      // 等方法: 书源普遍写 `result.select('p.gray').first()`、
+      // 等方法: 书源普遍写 `result.select('p.meta').first()`、
       // `.size()`、`.eachText()`。只返回普通数组会让这些调用抛 "not a function",
       // 字段取值全部落空(搜索结果为 0 条)。
       select: function (rule) {
@@ -1065,7 +1138,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
   // `getAnalyzeByJSoup(result).getElements(rule)`(见 AnalyzeRule.kt)。
   //
   // 书源普遍依赖这一点, 把 getElement 的返回值直接当作章节/搜索结果列表交回
-  // 宿主: 例如 `result = java.getElement('#jieqi_page_contents>div')`。这里若
+  // 宿主: 例如 `result = java.getElement('#book-list>div')`。这里若
   // 只返回第一个元素, 序列化出来是单个 `{__snapshot:{…}}` 对象, 宿主会当成
   // "一本书"来套字段规则, 于是每项都取不到值, 结果是 0 条。
   //
@@ -1112,6 +1185,21 @@ const JS_PRELUDE: &str = r#"(function (g) {
     toJSON: function () { return this.__a; }
   };
   J.util = { HashMap: HashMap, LinkedHashMap: HashMap, Map: HashMap, ArrayList: ArrayList };
+  // `new java.util.Date()` / `Date(millis)`: 书源用它做时间戳运算。
+  // `getTime()` 与 JS 一致; `toString()` 按 ISO 给出可读时间。
+  J.util.Date = function (millis) {
+    var t = millis === undefined || millis === null ? Date.now() : Number(millis);
+    if (isNaN(t)) t = Date.now();
+    this.__t = t;
+  };
+  J.util.Date.prototype = {
+    getTime: function () { return this.__t; },
+    toMillis: function () { return this.__t; },
+    before: function (other) { return this.__t < Number(other && other.__t !== undefined ? other.__t : other); },
+    after: function (other) { return this.__t > Number(other && other.__t !== undefined ? other.__t : other); },
+    equals: function (other) { return this.__t === Number(other && other.__t !== undefined ? other.__t : other); },
+    toString: function () { return new Date(this.__t).toISOString(); }
+  };
   // Rhino 里 `java.lang.String` 是 Java String: 除了 JS String 原生方法, 书源
   // 还会调用 Java 侧方法 —— `isEmpty()`(判断元素文本/标题是否为空) 与
   // `replaceAll(regex, repl)`(从 class 名里抠出 `p_123456`)。缺这两个方法时
@@ -1136,7 +1224,24 @@ const JS_PRELUDE: &str = r#"(function (g) {
         }
         return String(this).replace(new RegExp(S(pattern)), S(replacement));
       },
-      matches: function (pattern) { return new RegExp('^(?:' + S(pattern) + ')$').test(String(this)); }
+      matches: function (pattern) { return new RegExp('^(?:' + S(pattern) + ')$').test(String(this)); },
+      // Java `String.contains` / `equalsIgnoreCase` / `hashCode`。
+      //
+      // legado 里字符串是 **Java String**, 书源会直接调这几个方法:
+      // `title.contains('第')`、`name.equalsIgnoreCase('最新章节')`。
+      // JS 原生没有它们, 缺了就是 "not a function" —— 整条字段规则失败。
+      contains: function (needle) { return String(this).indexOf(S(needle)) >= 0; },
+      equalsIgnoreCase: function (other) {
+        return String(this).toLowerCase() === S(other).toLowerCase();
+      },
+      // Java String.hashCode: `h = 31 * h + ch`, 结果按有符号 32 位整数。
+      hashCode: function () {
+        var s = String(this), h = 0;
+        for (var i = 0; i < s.length; i++) {
+          h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+        }
+        return h;
+      }
     };
     Object.keys(proto).forEach(function (name) {
       try {
@@ -1156,7 +1261,27 @@ const JS_PRELUDE: &str = r#"(function (g) {
     Integer: {
       parseInt: function (s, radix) { return parseInt(s, radix === undefined ? 10 : Number(radix)); },
       valueOf: function (s, radix) { return parseInt(s, radix === undefined ? 10 : Number(radix)); }
+    },
+    // `new java.lang.Long(x)` / `Long.parseLong`: 书源用它把大整数(时间戳、
+    // 书籍 id)显式转数值。JS number 精度足够覆盖这些场景。
+    Long: {
+      parseLong: function (s) { return parseInt(S(s), 10); },
+      valueOf: function (s) { return parseInt(S(s), 10); },
+      MAX_VALUE: 9223372036854775807,
+      MIN_VALUE: -9223372036854775808
+    },
+    // `new java.lang.StringBuilder()`: 书源用它拼长文本。
+    StringBuilder: function (initial) {
+      this.__parts = initial === undefined || initial === null ? [] : [S(initial)];
     }
+  };
+  J.lang.StringBuilder.prototype = {
+    append: function (v) { this.__parts.push(S(v)); return this; },
+    insert: function (at, v) { this.__parts.splice(Number(at) || 0, 0, S(v)); return this; },
+    reverse: function () { this.__parts.reverse(); return this; },
+    length: function () { return this.__parts.join('').length; },
+    toString: function () { return this.__parts.join(''); },
+    clear: function () { this.__parts = []; return this; }
   };
   g.Packages = { java: J };
 
@@ -1214,6 +1339,48 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.openBook = function (url) {
     g.__explore_intent('openBook', S(url));
     return true;
+  };
+  // `java.openUrl(url[, mimeType])`: legado 用系统浏览器/外部应用打开链接。
+  // 桌面端没有对应容器, 这里只登记"要外部打开"的意图(与 `openBook` 同构),
+  // 保证脚本不会因为方法不存在而中断。
+  J.openUrl = function (url, mimeType) {
+    g.__explore_intent(
+      'openUrl',
+      JSON.stringify({ url: S(url), mimeType: mimeType == null ? null : S(mimeType) })
+    );
+    return true;
+  };
+  // `java.randomUUID()`: UUID v4。书源用它生成请求去重键/临时 id。
+  J.randomUUID = function () {
+    var hex = '0123456789abcdef', out = '';
+    for (var i = 0; i < 36; i++) {
+      if (i === 8 || i === 13 || i === 18 || i === 23) { out += '-'; continue; }
+      if (i === 14) { out += '4'; continue; }
+      if (i === 19) { out += hex.charAt(8 + Math.floor(Math.random() * 4)); continue; }
+      out += hex.charAt(Math.floor(Math.random() * 16));
+    }
+    return out;
+  };
+  // `java.strToBytes(str[, charset])` / `java.bytesToStr(bytes[, charset])`:
+  // 字符串与字节序列互转。legado 返回 Rhino 的 ByteArray, 脚本按数组用
+  // (`.length` / 索引 / `.slice`), 因此这里同样交出普通数组。
+  J.strToBytes = function (v, charset) {
+    var enc = charset === undefined || charset === null ? 'UTF-8' : S(charset);
+    try {
+      var parsed = JSON.parse(S(g.__str_to_bytes(S(v), enc)));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) { return []; }
+  };
+  J.bytesToStr = function (v, charset) {
+    var enc = charset === undefined || charset === null ? 'UTF-8' : S(charset);
+    var bytes = [];
+    if (Array.isArray(v) || (v && typeof v.length === 'number')) {
+      for (var i = 0; i < v.length; i++) bytes.push(Number(v[i]) & 0xff);
+    } else {
+      var text = S(v);
+      for (var j = 0; j < text.length; j++) bytes.push(text.charCodeAt(j) & 0xff);
+    }
+    try { return S(g.__bytes_to_str(JSON.stringify(bytes), enc)); } catch (e) { return ''; }
   };
 
   // ── Rhino 的 `org.jsoup.*` 桥 ──
@@ -1450,12 +1617,62 @@ const JS_PRELUDE: &str = r#"(function (g) {
     return Resp(JSON.stringify(envelope));
   }
   tagJavaClassName(StrResponseClass, 'StrResponse');
+  // `Packages.io.legado.app.model.analyzeRule.AnalyzeRule` —— 规则分析器。
+  //
+  // 书源的 jsLib 常这样在**另给的 HTML** 上求值规则, 而不是当前页面:
+  // ```js
+  // function evalOn(x, r) {
+  //   return r == undefined ? this.java.getElement(x)
+  //     : Packages.io.legado.app.model.analyzeRule.AnalyzeRule().setContent(r).getElement(x);
+  // }
+  // ```
+  // 缺这个类时目录脚本在 `evalOn(".book-title a", page)` 处抛
+  // "cannot read property 'analyzeRule' of undefined", 目录一章都解析不出来。
+  //
+  // 语义对齐 `AnalyzeRule`: `setContent(content[, baseUrl])` 返回自身(可链式),
+  // 之后的 `getElement`/`getElements`/`getString`/`getStringList` 都作用于那份内容。
+  function AnalyzeRule() {
+    if (!(this instanceof AnalyzeRule)) return new AnalyzeRule();
+    var content = '';
+    var self = this;
+    self.setContent = function (value, base) {
+      content = value === undefined || value === null ? '' : S(value);
+      if (base !== undefined && base !== null && S(base)) {
+        try { g.baseUrl = S(base); } catch (_e) {}
+      }
+      return self;
+    };
+    self.setBaseUrl = function (base) {
+      try { g.baseUrl = S(base); } catch (_e) {}
+      return self;
+    };
+    self.getElement = function (rule) {
+      return elementsApi(wrapElements(g.__rule_get(S(rule), content, 'elements')));
+    };
+    self.getElements = self.getElement;
+    self.getString = function (rule) {
+      return g.__rule_get(S(rule), content, 'text');
+    };
+    self.getStringList = function (rule) {
+      var list;
+      try { list = JSON.parse(S(g.__rule_get(S(rule), content, 'list'))); } catch (_e) { return []; }
+      return list || [];
+    };
+    self.setRedirectUrl = function (url) { try { g.baseUrl = S(url); } catch (_e) {} return null; };
+  }
+  tagJavaClassName(AnalyzeRule, 'AnalyzeRule');
+
   g.Packages.io = {
     legado: {
       app: {
         help: {
           http: {
             StrResponse: StrResponseClass
+          }
+        },
+        model: {
+          analyzeRule: {
+            AnalyzeRule: AnalyzeRule
           }
         }
       }
@@ -1468,6 +1685,35 @@ const JS_PRELUDE: &str = r#"(function (g) {
     'delete': function (k) { g.__store_del(S(k)); },
     getFile: function (k) { return g.__store_get('file:' + S(k)); },
     putFile: function (k, v) { g.__store_put('file:' + S(k), S(v)); return v; },
+    // legado `CacheManager` 的类型化读取: 书源把计数/时间戳存进缓存后再取回。
+    // 取不到时返回 null(而不是 0), 与 Kotlin 侧可空返回(`Int?`)一致。
+    getInt: function (k) {
+      var v = g.__store_get(S(k));
+      if (v === null || v === undefined || v === '') return null;
+      var n = parseInt(String(v), 10);
+      return isNaN(n) ? null : n;
+    },
+    getLong: function (k) {
+      var v = g.__store_get(S(k));
+      if (v === null || v === undefined || v === '') return null;
+      var n = parseInt(String(v), 10);
+      return isNaN(n) ? null : n;
+    },
+    getDouble: function (k) {
+      var v = g.__store_get(S(k));
+      if (v === null || v === undefined || v === '') return null;
+      var n = parseFloat(String(v));
+      return isNaN(n) ? null : n;
+    },
+    getFloat: function (k) { return g.cache.getDouble(k); },
+    // 字节数组: 按 latin1 逐字节存, 读回为数字数组(与 `strToBytes` 同形)。
+    getByteArray: function (k) {
+      var v = g.__store_get(S(k));
+      if (v === null || v === undefined || v === '') return null;
+      var out = [];
+      for (var i = 0; i < String(v).length; i++) out.push(String(v).charCodeAt(i) & 0xff);
+      return out;
+    },
     getFromMemory: function (k) {
       var r = g.__mem_get(S(k));
       if (r === null || r === undefined) return null;
@@ -1595,6 +1841,15 @@ const JS_PRELUDE: &str = r#"(function (g) {
     // 因此按"主键即 bookUrl / 章节 url"补上 —— 与 `source.getKey()`（书源地址）
     // 不是同一个东西，前者是数据主键，后者是书源主键。
     o.getKey = function () { return S(o[keyField]); };
+    // legado `BaseBook.getCustomVariable()` / `putCustomVariable(value)`:
+    // 书籍的"自定义变量"字段。书源用它做标记(加锁状态、上次进度等),
+    // 例如 `book.getVariable("custom")` 与 `book.putCustomVariable('')` 会同时出现。
+    // 两者底层是同一份变量存储, 因此按 `custom` 键读写, 保持互相可见。
+    o.getCustomVariable = function () { return o.getVariable('custom'); };
+    o.putCustomVariable = function (value) {
+      o.putVariable('custom', S(value));
+      return true;
+    };
     return o;
   }
   function rulePut(key, value) {
@@ -1629,8 +1884,32 @@ const JS_PRELUDE: &str = r#"(function (g) {
     return book;
   }
   var bc = JSON.parse(g.__book_ctx());
-  g.book = withReadConfig(withVariables(bc.book || {}, 'bv:', 'bookUrl'));
-  g.chapter = withVariables(bc.chapter || {}, 'cv:', 'url');
+  // legado 的这些字段是**非空 Int**(`Book.durChapterIndex: Int = 0`,
+  // `BookChapter.index: Int = 0`)。我们这边是 `Option<i32>`, 序列化后为 null,
+  // 脚本读到的是 undefined/null —— 算术会变成 NaN。
+  //
+  // 例如某源按 `let inn = chapter.index - book.durChapterIndex` 判断"是不是
+  // 相邻章节"来决定是否抓正文: NaN 落到 default 分支后直接把 result 清空,
+  // 表现为"正文解析为空"。这里按 legado 的默认值补 0。
+  var bookData = bc.book || {};
+  if (bookData.durChapterIndex === undefined || bookData.durChapterIndex === null) {
+    bookData.durChapterIndex = 0;
+  }
+  if (bookData.durChapterPos === undefined || bookData.durChapterPos === null) {
+    bookData.durChapterPos = 0;
+  }
+  if (bookData.durChapterTitle === undefined || bookData.durChapterTitle === null) {
+    bookData.durChapterTitle = '';
+  }
+  var chapterData = bc.chapter || {};
+  if (chapterData.index === undefined || chapterData.index === null) {
+    chapterData.index = 0;
+  }
+  if (chapterData.title === undefined || chapterData.title === null) {
+    chapterData.title = '';
+  }
+  g.book = withReadConfig(withVariables(bookData, 'bv:', 'bookUrl'));
+  g.chapter = withVariables(chapterData, 'cv:', 'url');
   g.title = S(g.chapter.title);
 })(globalThis);
 "#;
@@ -2041,6 +2320,23 @@ fn eval_js_inner_with_source(
         globals.set(
             "__store_get",
             Func::new(|key: String| -> Option<String> { store_get(&key) }),
+        )?;
+        // `java.strToBytes` / `java.bytesToStr` 的字符集转换: 输入输出都是字节
+        // 序列, 只有宿主能按指定 charset 正确编解码(GBK 等无法用 JS 内置 API 处理)。
+        globals.set(
+            "__str_to_bytes",
+            Func::new(|text: String, charset: String| -> String {
+                let (bytes, _, _) = encoding_for_label(&charset).encode(&text);
+                serde_json::to_string(&bytes).unwrap_or_else(|_| "[]".to_string())
+            }),
+        )?;
+        globals.set(
+            "__bytes_to_str",
+            Func::new(|json: String, charset: String| -> String {
+                let bytes: Vec<u8> = serde_json::from_str(&json).unwrap_or_default();
+                let (text, _, _) = encoding_for_label(&charset).decode(&bytes);
+                text.into_owned()
+            }),
         )?;
         globals.set(
             "__store_put",
@@ -3408,6 +3704,18 @@ fn latin1_bytes_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| *b as char).collect()
 }
 
+/// 按 charset 标签取编码器。
+///
+/// 未知标签或空标签一律按 UTF-8 —— 与 Java 侧 `charsetName.toCharset()`
+/// 拿不到编码器时的回落一致, 避免书源传了怪标签就整条规则抛错。
+fn encoding_for_label(label: &str) -> &'static encoding_rs::Encoding {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return encoding_rs::UTF_8;
+    }
+    encoding_rs::Encoding::for_label(trimmed.as_bytes()).unwrap_or(encoding_rs::UTF_8)
+}
+
 /// `java.net.URL(...).openConnection()` 形态的字节级请求: 请求体按 latin1
 /// 还原成原始字节发送, 响应体按 latin1 原样回传(不解码字符集、不自动解压),
 /// 由脚本自己决定如何解释。
@@ -3431,7 +3739,7 @@ fn js_http_bytes(
 /// - 字节路径走的是 `Packages.java.net.URL(...).openConnection()` —— 真实 Java
 ///   的 HttpURLConnection **不会自动重试**, 书源脚本自己负责重试。早先这里同样
 ///   默认 2 次, 而脚本设的 connectTimeout/readTimeout 在本层是空实现, 于是单个
-///   不可达地址要串行挂满 3 个宿主超时。番茄段评源首次打开要注册两台设备,
+///   不可达地址要串行挂满 3 个宿主超时。某类带段评的书源首次打开要注册两台设备,
 ///   最坏 ≈90s, 用户看到的就是「点了很久、像是打不开」。按 Java 语义退回单次。
 fn js_request_retry(options: &JsonValue, raw_response: bool) -> usize {
     let default_retry = if raw_response { 0 } else { 2 };
@@ -3448,7 +3756,7 @@ const PANEL_REQUEST_TIMEOUT_SECS: u64 = 9;
 /// 面板请求要不要沿用书源的 `concurrentRate`。
 ///
 /// 面板里每个头像/封面都会单独发一次请求, 把它们塞进书源限速队列后, 用户在
-/// 面板里做的下一次真实请求(如翻页拉段评)要排在几十张图片后面。实测番茄源
+/// 面板里做的下一次真实请求(如翻页拉段评)要排在几十张图片后面。实测该类书源
 /// (`concurrentRate=1/1000`) + 24 个并发头像会把一次段评请求从 ~0.9s 拖到 24.8s。
 fn js_concurrent_rate(panel_request: bool, source_rate: Option<String>) -> Option<String> {
     if panel_request { None } else { source_rate }
@@ -3514,7 +3822,7 @@ fn js_request_with_bytes(
     // `panel` 由面板桥(见 `run_panel_request_inner`)注入。
     let panel_request = options.get("panel").and_then(|v| v.as_bool()).unwrap_or(false);
     // 面板请求(见 `js_panel_*`)不参与书源的并发限速: 面板首屏会给每条段评拉头像,
-    // 番茄源 concurrentRate=1/1000 时这些静态资源会排满限速队列, 用户再点下一段
+    // 该类书源 concurrentRate=1/1000 时这些静态资源会排满限速队列, 用户再点下一段
     // 段评就得排在几十个头像请求后面(实测 24 个并发头像把一次段评请求拖到 24.8s)。
     let concurrent_rate = js_concurrent_rate(panel_request, source.concurrent_rate.clone());
     let http = source.http.map(Ok).unwrap_or_else(|| source_http_context(&source.url));
@@ -4802,7 +5110,7 @@ mod tests {
     /// JS 字符串可以有孤立代理项(lone surrogate), Rust 的 String 不行。
     /// 书源侧 `String(x).substring(0, 20)` 会把 emoji 的代理对切成两半, 这类字符
     /// 过桥时 rquickjs 报 "Conversion from string failed: invalid utf-8 sequence",
-    /// 表现为书源面板随机打不开(番茄段评面板 HTML 走的就是这条路)。
+    /// 表现为书源面板随机打不开(段评面板 HTML 走的就是这条路)。
     /// 桥接层必须兜底清洗, 且不能破坏成对的代理项(emoji 要原样保留)。
     #[test]
     fn show_browser_sanitizes_lone_surrogates() {
@@ -4912,8 +5220,8 @@ mod tests {
 
     /// `Packages.java.net.URL(...).openConnection()` 走字节路径。真实 Java 的
     /// HttpURLConnection 不会自动重试, 脚本自己重试; 宿主再叠默认 2 次重试会把
-    /// 单次超时放大到 3 倍。番茄段评源首次打开要注册两台设备(FQ_registerOne),
-    /// 放大后最坏 ≈90s —— 用户看到的就是「段评点了很久、像是打不开」。
+    /// 单次超时放大到 3 倍。需要在首次打开时连续注册设备的书源, 放大后最坏
+    /// ≈90s —— 用户看到的就是「点了很久、像是打不开」。
     #[test]
     fn byte_path_requests_do_not_inherit_host_retries() {
         let no_options = serde_json::json!({});
@@ -4928,7 +5236,7 @@ mod tests {
     }
 
     /// 面板桥请求的限速决策: 面板里每个头像/封面都是独立请求, 若跟着书源的
-    /// `concurrentRate` 排队, 番茄源(1/1000)面板的首屏头像就会把用户随后的段评
+    /// `concurrentRate` 排队, 该类书源(1/1000)面板的首屏头像就会把用户随后的段评
     /// 请求顶到队尾(实测 24 个并发头像把一次段评请求从 ~0.9s 拖到 24.8s)。
     #[test]
     fn panel_requests_skip_source_rate_limit() {
@@ -5053,3 +5361,7 @@ mod tests {
     }
 
 }
+
+
+
+

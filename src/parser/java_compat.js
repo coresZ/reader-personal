@@ -488,13 +488,59 @@
     // Rhino 风格的类型表要跨次复用: jsLib 可能持有 `Packages.java.math.BigInteger`
     // 这类别名, 重建构造器会让 `instanceof` 失效。因此只补新字段, 不整体替换。
     types = g.__readerJavaTypes || {};
+    // `java.net.URLEncoder` / `URLDecoder`: 书源用它拼/解查询串。
+    // `encode` 走 UTF-8 且把空格记为 `+`(与 Java 一致); `decode` 接受 `+` 当空格。
+    var URLEncoderImpl = {
+      encode: function (v, charset) {
+        var enc = charset === undefined || charset === null ? 'UTF-8' : String(charset);
+        if (/^utf-?8$/i.test(enc)) {
+          return encodeURIComponent(String(v)).replace(/%20/g, '+');
+        }
+        try {
+          var bytes = JSON.parse(String(g.__str_to_bytes(String(v), enc)));
+          var hex = '0123456789ABCDEF', parts = [];
+          for (var i = 0; i < bytes.length; i++) {
+            var b = bytes[i] & 0xff;
+            var plain = (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5a) ||
+              (b >= 0x61 && b <= 0x7a) || b === 0x2d || b === 0x2e || b === 0x5f || b === 0x2a;
+            if (plain) parts.push(String.fromCharCode(b));
+            else if (b === 0x20) parts.push('+');
+            else parts.push('%' + hex.charAt(b >> 4) + hex.charAt(b & 15));
+          }
+          return parts.join('');
+        } catch (e) {
+          return encodeURIComponent(String(v)).replace(/%20/g, '+');
+        }
+      }
+    };
+    var URLDecoderImpl = {
+      decode: function (v, charset) {
+        var enc = charset === undefined || charset === null ? 'UTF-8' : String(charset);
+        var text = String(v).replace(/\+/g, ' ');
+        try {
+          if (/^utf-?8$/i.test(enc)) {
+            return decodeURIComponent(text);
+          }
+          var bytes = [];
+          for (var i = 0; i < text.length; i++) {
+            var ch = text.charAt(i);
+            if (ch === '%' && i + 2 < text.length) {
+              var code = parseInt(text.substr(i + 1, 2), 16);
+              if (!isNaN(code)) { bytes.push(code & 0xff); i += 2; continue; }
+            }
+            bytes.push(ch.charCodeAt(0) & 0xff);
+          }
+          return String(g.__bytes_to_str(JSON.stringify(bytes), enc));
+        } catch (e) { return text; }
+      }
+    };
     var nextTypes = {
       math:{BigInteger:BigInteger},
       lang:{String:JavaString, System:{currentTimeMillis:function () { return Date.now(); }, arraycopy:arraycopy}, Thread:{sleep:function (ms) { g.__sleep(Number(ms)); }}},
       util:{Arrays:Arrays, Base64:Base64, Collections:Collections, UUID:UUID, zip:{GZIPInputStream:GZIPInputStream, GZIPOutputStream:GZIPOutputStream}},
       security:{MessageDigest:MessageDigest, SecureRandom:SecureRandom},
       io:{ByteArrayInputStream:ByteArrayInputStream, ByteArrayOutputStream:ByteArrayOutputStream, InputStreamReader:InputStreamReader, BufferedReader:BufferedReader},
-      net:{URL:URLImpl, HttpURLConnection:UrlConnection},
+      net:{URL:URLImpl, HttpURLConnection:UrlConnection, URLEncoder:URLEncoderImpl, URLDecoder:URLDecoderImpl},
       nio:{charset:{Charset:Charset}},
       crypto:{Cipher:Cipher, spec:{SecretKeySpec:SecretKeySpec, IvParameterSpec:IvParameterSpec}}
     };

@@ -4,9 +4,9 @@
 //! ```text
 //! ruleSearch.bookList  = <js>result = java.getElement('#list>div'); result</js>
 //! ruleSearch.name      = .title@text||h4@text <js>…book.bookUrl=…
-//! ruleSearch.author    = <js>result.select('p.gray').first().html()…</js>
+//! ruleSearch.author    = <js>result.select('p.meta').first().html()…</js>
 //! ruleSearch.bookUrl   = @js:book.bookUrl
-//! ruleSearch.coverUrl  = img.0@src <js>result=gethdi(result)…</js>
+//! ruleSearch.coverUrl  = img.0@src <js>result=withImageHeaders(result)…</js>
 //! ```
 //!
 //! 四个环节此前各有一处偏差, 合起来导致搜索结果 0 条:
@@ -20,13 +20,13 @@ use serde_json::json;
 
 const SEARCH_HTML: &str = r#"<html><body>
 <div id="content">
-  <div class="blockcontent" id="jieqi_page_contents">
+  <div class="list-body" id="book-list">
     <div class="c_row cf">
       <a class="db cf" href="https://example.test/book/1001.html">
         <div class="row_cover"><img class="cover_m" src="https://img.test/1001s.jpg"></div>
         <div class="row_text">
           <h4>第一本书</h4>
-          <p class="gray">作者甲 | #标签一
+          <p class="meta">作者甲 | #标签一
           <br>这是第一本的简介。</p>
         </div>
       </a>
@@ -36,7 +36,7 @@ const SEARCH_HTML: &str = r#"<html><body>
         <div class="row_cover"><img class="cover_m" src="https://img.test/1002s.jpg"></div>
         <div class="row_text">
           <h4>第二本书</h4>
-          <p class="gray">作者乙 | #标签二
+          <p class="meta">作者乙 | #标签二
           <br>这是第二本的简介。</p>
         </div>
       </a>
@@ -51,21 +51,21 @@ fn element_list_source() -> reader_rust::model::book_source::BookSource {
         "bookSourceUrl": "https://example.test",
         "bookSourceName": "元素列表样例源",
         "jsLib": r#"
-function gethdi(url) {
+function withImageHeaders(url) {
   var u = String(url == null ? '' : url);
   if (!u || u == 'undefined' || u == 'null') return '';
   if (u.indexOf(',{') >= 0) return u;
-  return u + ',' + JSON.stringify({ headers: { Cookie: 'age18_ok=1', Referer: 'https://example.test' } });
+  return u + ',' + JSON.stringify({ headers: { Cookie: 'verify_ok=1', Referer: 'https://example.test' } });
 }
 "#,
         "searchUrl": "https://example.test/search?key={{key}}&page={{page}}",
         "ruleSearch": {
-            "bookList": "<js>\nlet r1 = java.getString('#content .blockcontent@text');\nif (r1.includes(\"错误原因\")) {result=[];}\nelse {\n\tresult = java.getElement('#jieqi_page_contents>div');\n}\nresult\n</js>",
-            "name": ".c_subject@text||h4@text\n<js>\nlet rs=java.getString('a.0@href');\nlet id=(rs.match(/book\\/(\\d+)/)||['',''])[1];\nbook.bookUrl=`data:;base64,${java.base64Encode(rs)},{\"type\":\"\"}`;\nresult\n</js>",
-            "author": "<js>\nlet r='';\ntry {\n  let p = result.select('p.gray').first();\n  if (p != null) {\n    let h = String(p.html());\n    let seg = h.split(/<br[ ]*[/]?>/i);\n    r = String(seg[0]||'').replace(/<[^>]+>/g,'').trim().split('|')[0].trim();\n  }\n} catch(e) {}\nr\n</js>",
-            "intro": "<js>\nlet r='';\ntry {\n  let p = result.select('p.gray').first();\n  if (p != null) {\n    let h = String(p.html());\n    let seg = h.split(/<br[ ]*[/]?>/i);\n    if (seg.length > 1) r = String(seg.slice(1).join(' ')).replace(/<[^>]+>/g,'').replace(/\\s+/g,' ').trim();\n  }\n} catch(e) {}\nr\n</js>",
+            "bookList": "<js>\nlet r1 = java.getString('#content .list-body@text');\nif (r1.includes(\"错误原因\")) {result=[];}\nelse {\n\tresult = java.getElement('#book-list>div');\n}\nresult\n</js>",
+            "name": ".book-name@text||h4@text\n<js>\nlet rs=java.getString('a.0@href');\nlet id=(rs.match(/book\\/(\\d+)/)||['',''])[1];\nbook.bookUrl=`data:;base64,${java.base64Encode(rs)},{\"type\":\"\"}`;\nresult\n</js>",
+            "author": "<js>\nlet r='';\ntry {\n  let p = result.select('p.meta').first();\n  if (p != null) {\n    let h = String(p.html());\n    let seg = h.split(/<br[ ]*[/]?>/i);\n    r = String(seg[0]||'').replace(/<[^>]+>/g,'').trim().split('|')[0].trim();\n  }\n} catch(e) {}\nr\n</js>",
+            "intro": "<js>\nlet r='';\ntry {\n  let p = result.select('p.meta').first();\n  if (p != null) {\n    let h = String(p.html());\n    let seg = h.split(/<br[ ]*[/]?>/i);\n    if (seg.length > 1) r = String(seg.slice(1).join(' ')).replace(/<[^>]+>/g,'').replace(/\\s+/g,' ').trim();\n  }\n} catch(e) {}\nr\n</js>",
             "bookUrl": "@js:book.bookUrl",
-            "coverUrl": "img.0@src\n<js>\nresult=gethdi(result);\nresult\n</js>"
+            "coverUrl": "img.0@src\n<js>\nresult=withImageHeaders(result);\nresult\n</js>"
         }
     }))
     .expect("book source")
@@ -84,7 +84,7 @@ fn element_list_search_parses_every_row() {
     assert_eq!(books[1].author, "作者乙");
     assert!(
         books[0].intro.as_deref().unwrap_or_default().contains("第一本的简介"),
-        "简介应取自 p.gray 的 br 之后: {:?}",
+        "简介应取自 p.meta 的 br 之后: {:?}",
         books[0].intro
     );
 }
@@ -143,3 +143,5 @@ fn element_list_search_strips_cover_url_options() {
     );
     assert_eq!(books[1].cover_url.as_deref(), Some("https://img.test/1002s.jpg"));
 }
+
+

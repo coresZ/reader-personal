@@ -226,17 +226,358 @@ fn collect_matches_from_element<'a>(
 }
 
 fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
+    match split_jsoup_pseudos(css_selector) {
+        Some((base, filters)) => {
+            let mut matches = select_css_plain(doc, &base);
+            apply_jsoup_filters(&mut matches, &filters);
+            matches
+        }
+        None => select_css_plain(doc, css_selector),
+    }
+}
+
+fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<ElementRef<'a>> {
+    match split_jsoup_pseudos(css_selector) {
+        Some((base, filters)) => {
+            let mut matches = match parse_css_selector(&base) {
+                Some(sel) => el.select(&sel).collect(),
+                None => Vec::new(),
+            };
+            apply_jsoup_filters(&mut matches, &filters);
+            matches
+        }
+        None => match parse_css_selector(css_selector) {
+            Some(sel) => el.select(&sel).collect(),
+            None => Vec::new(),
+        },
+    }
+}
+
+fn select_css_plain<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
     let Some(sel) = parse_css_selector(css_selector) else { return vec![] };
     doc.select(&sel).collect()
 }
 
-fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<ElementRef<'a>> {
-    let Some(sel) = parse_css_selector(css_selector) else { return vec![] };
-    el.select(&sel).collect()
+/// JSoup 专有伪类：`scraper` 不支持，但书源大量使用。
+///
+/// 参考 JSoup `Selector` 文档。这里只列**需要后置过滤**的那些 —— 标准 CSS
+/// 伪类（`:nth-child` / `:first-child` / `:not` / `:has` / `:is`）交给 `scraper`
+/// 原生处理，语义已经一致。
+#[derive(Clone, Debug, PartialEq)]
+enum JsoupFilter {
+    /// `:eq(n)` —— 在**同级元素**中的序号等于 n（0 基，JSoup 语义）。
+    Eq(i32),
+    /// `:gt(n)` —— 同级序号大于 n。
+    Gt(i32),
+    /// `:lt(n)` —— 同级序号小于 n。
+    Lt(i32),
+    /// `:first` / `:last` —— 结果集首/尾（JSoup 把这两个当作 `:eq(0)` / `:eq(-1)`
+    /// 的同义写法，但作用在**结果集**上）。
+    First,
+    Last,
+    /// `:contains(text)` —— 元素自身或后代的**规范化**文本包含 text（忽略大小写）。
+    Contains(String),
+    /// `:containsOwn(text)` —— 只看元素自身的直接文本。
+    ContainsOwn(String),
+    /// `:containsData(text)` —— script/style 等数据节点内容。
+    ContainsData(String),
+    /// `:containsWholeText(text)` —— 未规范化的整段文本，大小写敏感。
+    ContainsWholeText(String),
+    /// `:containsWholeOwnText(text)` —— 未规范化的自身文本，大小写敏感。
+    ContainsWholeOwnText(String),
+    /// `:matches(regex)` —— 规范化文本匹配正则。
+    Matches(String),
+    /// `:matchesOwn(regex)` —— 自身文本匹配正则。
+    MatchesOwn(String),
+    /// `:matchesWholeText(regex)` —— 未规范化整段文本匹配正则。
+    MatchesWholeText(String),
+    /// `:matchesWholeOwnText(regex)` —— 未规范化自身文本匹配正则。
+    MatchesWholeOwnText(String),
+    /// `:empty` —— 没有元素子节点且无有效文本。
+    Empty,
 }
 
-fn parse_css_selector(selector: &str) -> Option<Selector> {
-    if let Ok(parsed) = Selector::parse(selector) { return Some(parsed); }
+/// 把选择器拆成「`scraper` 可解析的基础部分」+「需要自己过滤的伪类列表」。
+///
+/// 返回 `None` 表示没有 JSoup 专有伪类，调用方走原生路径（零开销）。
+fn split_jsoup_pseudos(selector: &str) -> Option<(String, Vec<JsoupFilter>)> {
+    let bytes = selector.as_bytes();
+    let mut base = String::with_capacity(selector.len());
+    let mut filters = Vec::new();
+    let mut i = 0;
+    let mut changed = false;
+
+    while i < selector.len() {
+        // 跳过属性选择器 `[...]`：里面的冒号不是伪类（如 [property=og:novel:x]）。
+        if bytes[i] == b'[' {
+            let mut depth = 0i32;
+            while i < selector.len() {
+                match bytes[i] {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            base.push(']');
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                // 必须按**字符**推进:选择器里可能含多字节字符(如中文属性值),
+                // 用字节 `i += 1` 会切在字符中间并 panic。
+                let ch = selector[i..].chars().next().unwrap();
+                base.push(ch);
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+        if bytes[i] != b':' {
+            let ch = selector[i..].chars().next().unwrap();
+            base.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        let rest = &selector[i..];
+        let Some((name, arg, consumed, has_arg)) = parse_pseudo(rest) else {
+            base.push(':');
+            i += 1;
+            continue;
+        };
+        let filter = match name.as_str() {
+            "eq" => Some(JsoupFilter::Eq(parse_int_arg(&arg)?)),
+            "gt" => Some(JsoupFilter::Gt(parse_int_arg(&arg)?)),
+            "lt" => Some(JsoupFilter::Lt(parse_int_arg(&arg)?)),
+            "first" => Some(JsoupFilter::First),
+            "last" => Some(JsoupFilter::Last),
+            "contains" => Some(JsoupFilter::Contains(unescape_pseudo_text(&arg))),
+            "containsOwn" => Some(JsoupFilter::ContainsOwn(unescape_pseudo_text(&arg))),
+            "containsData" => Some(JsoupFilter::ContainsData(unescape_pseudo_text(&arg))),
+            "containsWholeText" => Some(JsoupFilter::ContainsWholeText(unescape_pseudo_text(&arg))),
+            "containsWholeOwnText" => {
+                Some(JsoupFilter::ContainsWholeOwnText(unescape_pseudo_text(&arg)))
+            }
+            "matches" => Some(JsoupFilter::Matches(arg)),
+            "matchesOwn" => Some(JsoupFilter::MatchesOwn(arg)),
+            "matchesWholeText" => Some(JsoupFilter::MatchesWholeText(arg)),
+            "matchesWholeOwnText" => Some(JsoupFilter::MatchesWholeOwnText(arg)),
+            "empty" => Some(JsoupFilter::Empty),
+            _ => None,
+        };
+        match filter {
+            Some(f) => {
+                filters.push(f);
+                changed = true;
+                i += consumed;
+            }
+            None => {
+                // 标准伪类（:nth-child / :not / :has / :is 等）原样保留给 scraper。
+                base.push_str(&rest[..consumed]);
+                i += consumed;
+                let _ = has_arg;
+            }
+        }
+    }
+
+    if !changed || filters.is_empty() {
+        return None;
+    }
+    Some((base, filters))
+}
+
+/// 解析 `:name(arg)` / `:name`，返回 (名字, 参数, 消耗字节数, 是否有参数)。
+fn parse_pseudo(rest: &str) -> Option<(String, String, usize, bool)> {
+    let mut chars = rest.char_indices();
+    chars.next()?; // ':'
+    let mut name = String::new();
+    let mut end = 0;
+    for (idx, ch) in chars {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            name.push(ch);
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if name.is_empty() {
+        return None;
+    }
+    let after = &rest[end..];
+    if !after.starts_with('(') {
+        return Some((name, String::new(), end, false));
+    }
+    // 找配对的右括号（支持嵌套与转义）。
+    let mut depth = 0i32;
+    let mut escaped = false;
+    let mut arg = String::new();
+    let mut close = None;
+    for (idx, ch) in after.char_indices() {
+        if escaped {
+            arg.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => {
+                arg.push(ch);
+                escaped = true;
+            }
+            '(' => {
+                depth += 1;
+                if depth > 1 {
+                    arg.push(ch);
+                }
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(idx);
+                    break;
+                }
+                arg.push(ch);
+            }
+            _ => arg.push(ch),
+        }
+    }
+    let close = close?;
+    Some((name, arg, end + close + 1, true))
+}
+
+fn parse_int_arg(arg: &str) -> Option<i32> {
+    arg.trim().parse::<i32>().ok()
+}
+
+/// JSoup 允许在文本参数里用 `\(` `\)` 转义括号。
+fn unescape_pseudo_text(arg: &str) -> String {
+    arg.replace("\\(", "(").replace("\\)", ")")
+}
+
+/// 依次应用 JSoup 伪类过滤。
+fn apply_jsoup_filters<'a>(matches: &mut Vec<ElementRef<'a>>, filters: &[JsoupFilter]) {
+    for filter in filters {
+        match filter {
+            // `:eq/:gt/:lt` 在 JSoup 里看的是**同级序号**（sibling index），
+            // 不是结果集下标。这一点很容易搞错：`td:eq(0)` 是"每行的第一个 td"。
+            JsoupFilter::Eq(n) => {
+                matches.retain(|el| eq_matches(el, *n));
+            }
+            JsoupFilter::Gt(n) => matches.retain(|el| (sibling_index(el) as i32) > *n),
+            JsoupFilter::Lt(n) => matches.retain(|el| (sibling_index(el) as i32) < *n),
+            JsoupFilter::First => matches.truncate(1),
+            JsoupFilter::Last => {
+                if matches.len() > 1 {
+                    let last = matches.len() - 1;
+                    matches.drain(..last);
+                }
+            }
+            JsoupFilter::Contains(text) => {
+                let needle = text.to_lowercase();
+                matches.retain(|el| normalize_ws(&full_text(el)).to_lowercase().contains(&needle));
+            }
+            JsoupFilter::ContainsOwn(text) => {
+                let needle = text.to_lowercase();
+                matches.retain(|el| normalize_ws(&own_text(el)).to_lowercase().contains(&needle));
+            }
+            JsoupFilter::ContainsData(text) => {
+                let needle = text.to_lowercase();
+                matches.retain(|el| {
+                    el.children().any(|node| {
+                        node.value()
+                            .as_text()
+                            .map(|t| t.text.to_lowercase().contains(&needle))
+                            .unwrap_or(false)
+                    })
+                });
+            }
+            JsoupFilter::ContainsWholeText(text) => {
+                matches.retain(|el| full_text(el).contains(text.as_str()));
+            }
+            JsoupFilter::ContainsWholeOwnText(text) => {
+                matches.retain(|el| own_text(el).contains(text.as_str()));
+            }
+            JsoupFilter::Matches(pattern) => {
+                let Ok(re) = regex::Regex::new(pattern) else { continue };
+                matches.retain(|el| re.is_match(&normalize_ws(&full_text(el))));
+            }
+            JsoupFilter::MatchesOwn(pattern) => {
+                let Ok(re) = regex::Regex::new(pattern) else { continue };
+                matches.retain(|el| re.is_match(&normalize_ws(&own_text(el))));
+            }
+            JsoupFilter::MatchesWholeText(pattern) => {
+                let Ok(re) = regex::Regex::new(pattern) else { continue };
+                matches.retain(|el| re.is_match(&full_text(el)));
+            }
+            JsoupFilter::MatchesWholeOwnText(pattern) => {
+                let Ok(re) = regex::Regex::new(pattern) else { continue };
+                matches.retain(|el| re.is_match(&own_text(el)));
+            }
+            JsoupFilter::Empty => {
+                matches.retain(|el| {
+                    el.children().all(|node| {
+                        node.value()
+                            .as_text()
+                            .map(|t| t.text.trim().is_empty())
+                            .unwrap_or(false)
+                    })
+                });
+            }
+        }
+    }
+}
+
+/// `:eq(n)` 判定。JSoup 的 `:eq(-1)` 表示倒数第一个同级元素。
+fn eq_matches(el: &ElementRef, n: i32) -> bool {
+    let index = sibling_index(el) as i32;
+    if n >= 0 {
+        return index == n;
+    }
+    let Some(parent) = el.parent().and_then(ElementRef::wrap) else {
+        return false;
+    };
+    let total = parent
+        .children()
+        .filter(|node| node.value().is_element())
+        .count() as i32;
+    index == total + n
+}
+
+/// 元素在父节点中的元素序号(0 基)。无父节点时为 0。
+fn sibling_index(el: &ElementRef) -> usize {
+    let Some(parent) = el.parent().and_then(ElementRef::wrap) else {
+        return 0;
+    };
+    parent
+        .children()
+        .filter(|node| node.value().is_element())
+        .position(|node| node.id() == el.id())
+        .unwrap_or(0)
+}
+
+/// 元素及其后代的全部文本（JSoup `Element.text()` 语义：空白规范化）。
+fn full_text(el: &ElementRef) -> String {
+    normalize_ws(&el.text().collect::<String>())
+}
+
+/// 把连续空白折叠成单个空格并去掉首尾空白。
+fn normalize_ws(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn parse_css_selector(selector: &str) -> Option<Selector> {    if let Ok(parsed) = Selector::parse(selector) { return Some(parsed); }
     // Jsoup accepts values such as [property=og:novel:book_name] without
     // quotes. Quote these values before handing the selector to scraper.
     static ATTR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
