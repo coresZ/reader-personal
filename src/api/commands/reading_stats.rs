@@ -49,13 +49,20 @@ pub async fn get_reading_stats_daily(
 }
 
 /// Lifetime totals.
-#[tauri::command]
-pub async fn get_reading_stats_summary(
-    state: tauri::State<'_, AppState>,
+pub async fn get_reading_stats_summary_core(
+    state: &AppState,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
     let summary = state.reading_stats_service.get_summary(user_ns).await?;
     Ok(ApiResponse::ok(summary))
+}
+
+/// `get_reading_stats_summary` 的 Tauri 入口: 只是 core 的薄壳。
+#[tauri::command]
+pub async fn get_reading_stats_summary(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    get_reading_stats_summary_core(&state).await
 }
 
 #[tauri::command]

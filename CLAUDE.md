@@ -32,14 +32,18 @@ npm run build          # 便携包 zip 在 desktop/dist/
 npm run icon           # 仅重新生成图标；图标已提交
 ```
 
-## 架构（纯单机桌面，无 HTTP 服务端）
+## 架构（Tauri 桌面为主 + 可选的进程内 Web 服务）
 
-reader-rust 是「阅读3.0」的 Rust 实现，当前形态为 **Tauri v2 桌面应用**：无 axum、无 Docker、无多用户。前端与后端同进程，通过 IPC 通信。
+reader-rust 是「阅读3.0」的 Rust 实现，主形态是 **Tauri v2 桌面应用**：前端与后端同进程，通过 IPC 通信，无 Docker、无多用户。
+
+另有**可选的 Web 阅读模式**（`src/server/`）：在桌面进程内起一个 axum 服务，让手机浏览器读同一个书架。默认只监听 `127.0.0.1:1122`，可在设置里放开到局域网。**没有鉴权**（与 Legado 手机端一致）——放开到局域网即等于同网段可读，UI 与 `docs/web-reader.md` 都写明了这一点。详细说明见那份文档。
 
 ### 模块结构
 
-- **`src/api/commands/`** — 全部 `#[tauri::command]`（原 axum handler 原地转型）。返回 `Result<ApiResponse<T>, AppError>` 信封。
-- **`src/api/protocol.rs`** — 自定义 URI 协议 `reader`（origin `http://reader.localhost`）：`/cover`、`/epub`、`/pdf`、`/files`、`/bookSourceProxy`（登录代理 HTML 重写）、`/bookSourceClientLog`。
+- **`src/api/commands/`** — 全部 `#[tauri::command]`（原 axum handler 原地转型）。返回 `Result<ApiResponse<T>, AppError>` 信封。**每个命令都配一个 `xxx_core(&AppState, req)`**，Web 端 HTTP handler 只调 core，不复制业务分支 —— 新增接口时先抽 core 再挂路由。
+- **`src/api/protocol.rs`** — 自定义 URI 协议 `reader`（origin `http://reader.localhost`）：`/cover`、`/epub`、`/pdf`、`/files`、`/bookSourceProxy`（登录代理 HTML 重写）、`/bookSourceClientLog`。浏览器里同一批路径由 `src/server/router.rs` 以同源路由提供。
+- **`src/server/`** — Web 阅读模式：`router.rs`（路由表，handler 全为 core 的薄适配）、`assets.rs`（静态资源 + SPA 回退）、`settings.rs`（`web-settings.json`，原子写）、`control.rs`（启停/状态/配置应用，IPC 命令）。
+- **`src/util/path_safe.rs`** — 路径校验的唯一实现，`/files` 与静态资源都用它（Windows 上 `..\..\` 必须按反斜杠分段拦）。
 - **`src/api/mod.rs`** — `AppState`（10 个 Arc service）+ `invoke_handler()` 聚合注册所有 command。
 - **`src/service/`** — 业务逻辑（book / book_source / book_group / local_txt / local_epub / json_document / ai_book / ai_model / update / user）。
 - **`src/parser/`** — 内容提取引擎（CSS/XPath/JSONPath/Regex/JS 模式自动识别）。
@@ -63,6 +67,7 @@ reader-rust 是「阅读3.0」的 Rust 实现，当前形态为 **Tauri v2 桌�
 ## 已知注意事项
 
 - **杀软并发编译竞态**：Windows 杀软实时扫描与 cargo 并行写 `.rlib` 冲突（随机 `invalid metadata files` / `link.exe 0xC000012D`）。**构建和测试务必用 `-j 4` 或更低并发**。建议给 `target/` 加 Defender 排除。
+- **不要在测试里构造 `server::assets::StaticSource`**：它带 `tauri::AppHandle`，链接器会把 tauri 的 `TaskDialogIndirect`（comctl32 v6）拉进测试 exe 的导入表；而 cargo 生成的测试 exe 没有应用 manifest，只加载得到 comctl32 v5，进程会在进 `main` 之前以 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 退出 —— 输出里没有任何 Rust panic，看起来像"链接器坏了"。`assets.rs` 因此把路径判定抽成不碰 tauri 的 `resolve_lookup()` 纯函数来测。
 - **`toml` 版本钉在 0.8.2**：共享 lockfile 因 `tauri -> gtk -> proc-macro-crate` 约束无法升级。无害（`config` 只用 Environment source，运行时从不解析 TOML）。不要尝试修复。
 - **`pdf-extract` 是 vendor 副本**（`vendor/pdf-extract`，经 `[patch.crates-io]` 接线），三处改动，都别退回上游行为：
   - **中文 CMap**：上游遇到无 ToUnicode 的 `GBK-EUC-H` 等 Type0 编码会 panic、嵌入式 GB CMap 的分段 `begincidrange` 解析失败。副本加了「恒等字节映射 + `encoding_rs` 逐码位解码伪 ToUnicode 表」的降级路径。

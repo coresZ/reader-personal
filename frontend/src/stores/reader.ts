@@ -1,8 +1,8 @@
 import { defineStore } from 'pinia'
 import { ref, computed, reactive, watch } from 'vue'
-import { isTauri } from '@tauri-apps/api/core'
 import { useAppStore } from './app'
 import { useBookshelfStore } from './bookshelf'
+import { isTauriRuntime } from '../api/transport'
 import {
   getChapterList,
   getBookInfo,
@@ -1346,7 +1346,7 @@ export const useReaderStore = defineStore('reader', () => {
       speed: speechConfig.speechRate,
       signal,
     }
-    if (!isTauri()) {
+    if (!isTauriRuntime()) {
       return requestOpenAISpeechAudio(request)
     }
 

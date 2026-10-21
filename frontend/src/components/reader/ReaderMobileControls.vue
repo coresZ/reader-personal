@@ -24,7 +24,17 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" /></svg>
           <span>书架</span>
         </div>
-        <div v-if="!mini" class="m-top-item" :class="{ active: store.activePanel === 'source' }" @click="store.togglePanel('source')">
+        <!--
+          Web 端不提供「书源」入口: 换源面板靠 `getAvailableBookSourceSSE`
+          (tauri::ipc::Channel 流) 探测可用源, 确认换源还要写 `setBookSource`,
+          两者浏览器里都没有对应实现。与详情页的书源列表一起藏掉。
+        -->
+        <div
+          v-if="!mini && !appStore.isWebMode"
+          class="m-top-item"
+          :class="{ active: store.activePanel === 'source' }"
+          @click="store.togglePanel('source')"
+        >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="7" height="7" x="3" y="3" rx="1" /><rect width="7" height="7" x="14" y="3" rx="1" /><rect width="7" height="7" x="3" y="14" rx="1" /><rect width="7" height="7" x="14" y="14" rx="1" /></svg>
           <span>书源</span>
         </div>
@@ -66,8 +76,17 @@
             <div class="progress-fill" :style="{ width: store.readingProgress }"></div>
             <div class="progress-thumb" :style="{ left: store.readingProgress }"></div>
           </div>
-          <!-- 真实页码/章节号, 不再是写死的"第 1/1 页"。 -->
-          <button type="button" class="page-text" @click="$emit('progress')">
+          <!-- 真实页码/章节号, 不再是写死的"第 1/1 页"。
+               Web 端不可点: 这里打开的是缓存面板, 而"缓存全本"依赖
+               `cache_book_sse`(IPC 通道), 浏览器里没有实现 —— 点开只会看到
+               一个永远停在 0% 的进度条。 -->
+          <button
+            type="button"
+            class="page-text"
+            :disabled="appStore.isWebMode"
+            :title="appStore.isWebMode ? '缓存管理请在桌面端使用' : undefined"
+            @click="$emit('progress')"
+          >
             {{ chapterPositionText }}
           </button>
         </div>
@@ -169,6 +188,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useReaderStore } from '../../stores/reader'
+import { useAppStore } from '../../stores/app'
 import {
   READER_FONT_SIZE_MAX,
   READER_FONT_SIZE_MIN,
@@ -179,6 +199,7 @@ import {
 } from '../../utils/readerFontSize'
 
 const store = useReaderStore()
+const appStore = useAppStore()
 /** 用 currentTheme 而非 chromeTheme: 后者在「有背景图」时会把 popup 调成 84%
  *  半透明(那是给浮层用的), 工具栏再用它就会与标题栏出现两套材质、叠出分层。
  *  工具栏要的是不透明的主题底色, 保证文字始终清晰。 */
@@ -446,6 +467,17 @@ watch(() => props.show, (visible) => {
 .page-text:hover {
   opacity: 1;
   color: var(--color-primary, #c97f3a);
+}
+
+/* Web 端禁用态: 保留页码可读, 但不要给"可点"的暗示 */
+.page-text:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.page-text:disabled:hover {
+  opacity: 0.6;
+  color: inherit;
 }
 
 .nav-row {

@@ -34,15 +34,23 @@ pub async fn delete_book_groups(
     Ok(ApiResponse::ok(serde_json::json!({ "removed": removed })))
 }
 
-#[tauri::command]
-pub async fn get_book_groups(
-    state: tauri::State<'_, AppState>,
+/// `get_book_groups` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn get_book_groups_core(
+    state: &AppState,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
     let groups = state.book_group_service.get_groups(&user_ns).await?;
     Ok(ApiResponse::ok(
         serde_json::to_value(groups).unwrap_or_default(),
     ))
+}
+
+/// `get_book_groups` 的 Tauri 入口: 只是 core 的薄壳。
+#[tauri::command]
+pub async fn get_book_groups(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<Value>, AppError> {
+    get_book_groups_core(&state).await
 }
 
 #[tauri::command]

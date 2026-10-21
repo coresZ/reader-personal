@@ -99,7 +99,12 @@
       </div>
 
       <!-- 阅读页背景图 -->
-      <div class="setting-block">
+      <!--
+        Web 端隐藏: 选图后要 `uploadBackgroundImage` 把文件落到应用目录,
+        那是 Tauri 的 octet-stream 上传命令, 浏览器里没有等价路由
+        (http.ts 的 upload 只认三种本地书)。留着按钮只会让人选完图报错。
+      -->
+      <div v-if="!appStore.isWebMode" class="setting-block">
         <div class="setting-block-head">
           <label>阅读页背景图</label>
           <button
@@ -221,9 +226,10 @@
             >{{ font.name }}</button>
           </div>
           <div class="font-actions">
-            <button class="opt-btn" @click="fontInputRef?.click()">导入字体</button>
+            <!-- 导入/删除字体走 Tauri 上传通道, Web 端没有 HTTP 路由 -->
+            <button v-if="!appStore.isWebMode" class="opt-btn" @click="fontInputRef?.click()">导入字体</button>
             <button
-              v-if="activeCustomFont"
+              v-if="activeCustomFont && !appStore.isWebMode"
               class="opt-btn danger"
               @click="removeActiveCustomFont"
             >删除当前字体</button>

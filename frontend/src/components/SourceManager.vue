@@ -140,6 +140,7 @@ import {
   unpinBookSource,
 } from '../api/source'
 import { useAppStore } from '../stores/app'
+import { isTauriRuntime } from '../api/transport'
 import { useSourceStore } from '../stores/source'
 import type { BookSource } from '../types'
 import {
@@ -969,7 +970,7 @@ function touchSubscription(url: string) {
 }
 
 async function exportSourcesList(list: BookSource[]) {
-  if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
+  if (isTauriRuntime()) {
     try {
       const result = await exportBookSources(list)
       if (result.cancelled) return

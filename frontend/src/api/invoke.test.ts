@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { toError } from './invoke'
 
 /**
@@ -38,5 +38,92 @@ describe('toError', () => {
 
   it('uses a generic default when no fallback is supplied', () => {
     expect(toError(null).message).toBe('请求失败')
+  })
+})
+
+/**
+ * 上传通道的契约测试。
+ *
+ * 背景: 传输层刚抽象出来时, `invokeUpload` 试图用「command → `/reader3/*`
+ * 路径」反查表来定位接口。但上传类命令里只有 `upload_txt_book` /
+ * `upload_epub_book` / `upload_pdf_book` 有 HTTP 路由, 背景图、自定义字体、
+ * WebDAV、RSS 源导入这些**根本没有**。结果是桌面端点「添加背景图」直接弹
+ * 「未知上传接口: upload_background_image」。
+ *
+ * 这里必须真的断言"传下去了什么"。早先的版本只写
+ * `expect(typeof tauriTransport.upload).toBe('function')`, 那种断言在
+ * 任何实现下都成立 —— 包括把它写成 `async () => { throw new Error(...) }`,
+ * 等于没有测试。
+ */
+describe('transport upload contract', () => {
+  it('desktop upload forwards the command name verbatim, never a path', async () => {
+    // 必须 mock 模块之后再 import, 否则拿到的是真的 invoke(会去连 Tauri)。
+    vi.resetModules()
+    const invoke = vi.fn(async () => 'reader://files?path=x.png')
+    vi.doMock('@tauri-apps/api/core', () => ({ invoke, Channel: class {} }))
+
+    const { tauriTransport } = await import('./transport/tauri')
+    const file = new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' })
+
+    const result = await tauriTransport.upload(
+      'upload_background_image',
+      file,
+      '背景图.png',
+      { 'x-reader-background-kind': 'desktop' },
+    )
+
+    expect(result).toBe('reader://files?path=x.png')
+    expect(invoke).toHaveBeenCalledTimes(1)
+
+    const [command, payload, options] = invoke.mock.calls[0] as unknown as [
+      string,
+      Uint8Array,
+      { headers: Record<string, string> },
+    ]
+    // 命令名原样透传: 没有"未知上传接口"这一层, 也不需要 HTTP 路由存在。
+    expect(command).toBe('upload_background_image')
+    // 载荷是**顶层**二进制, 不是 `{ req: ... }` 里的字节数组。
+    expect(payload).toBeInstanceOf(Uint8Array)
+    expect(Array.from(payload)).toEqual([1, 2, 3])
+    // 文件名走 header 且做 percent-encode(header 只能是 ASCII)。
+    expect(options.headers['x-reader-file-name']).toBe(encodeURIComponent('背景图.png'))
+    expect(options.headers['x-reader-background-kind']).toBe('desktop')
+
+    vi.doUnmock('@tauri-apps/api/core')
+  })
+
+  it('web upload maps the three local-book commands to their routes', async () => {
+    vi.resetModules()
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ isSuccess: true, errorMsg: '', data: { bookUrl: 'x' } }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.doMock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), Channel: class {} }))
+
+    const { httpTransport } = await import('./transport/http')
+    await httpTransport.upload(
+      'upload_txt_book',
+      new Blob([new Uint8Array([1])]),
+      '小说.txt',
+    )
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    // 路径**不能**再补一次 /reader3 前缀(历史上出现过 /reader3/reader3/... 全 405)
+    expect(url).toBe('/reader3/uploadTxtBook')
+    expect(init.method).toBe('POST')
+    const form = init.body as FormData
+    expect(form.get('file')).toBeInstanceOf(Blob)
+
+    vi.unstubAllGlobals()
+    vi.doUnmock('@tauri-apps/api/core')
+  })
+
+  it('web upload rejects commands without an HTTP route', async () => {
+    const { httpTransport } = await import('./transport/http')
+    await expect(
+      httpTransport.upload('upload_background_image', new Blob([new Uint8Array()]), 'a.png'),
+    ).rejects.toThrow(/仅桌面应用可用|不支持/)
   })
 })

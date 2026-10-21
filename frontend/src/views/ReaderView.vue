@@ -380,6 +380,7 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComp
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { useReaderStore, fontPresets, TOC_END_CHECK_INTERVAL_MS } from '../stores/reader'
 import { useAppStore } from '../stores/app'
+import { isTauriRuntime } from '../api/transport'
 import { getBookInfo, getBookshelfWithCacheInfo } from '../api/bookshelf'
 import { evalSourceClick, type ShowBrowserRequest } from '../api/sourceClick'
 import { applySystemTheme } from '../utils/systemUi'
@@ -3048,7 +3049,7 @@ async function toggleTauriFullscreen() {
 }
 
 function toggleFullscreen() {
-  if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
+  if (isTauriRuntime()) {
     // 串行化: 快速连按 F11 时不并发发 IPC, 否则两次 setFullscreen 的到达顺序
     // 无法保证, 结果可能是用户不想要的那个。
     const run = (fullscreenToggleInFlight ?? Promise.resolve()).then(toggleTauriFullscreen)

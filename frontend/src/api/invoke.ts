@@ -2,84 +2,38 @@
 // keep their exact signatures — `http.get<T>('/x').then(r => r.data)` becomes
 // `get<T>('/x').then(r => r.data)` — only the import changes.
 //
-// Each call maps a `/reader3/*` path to a Tauri command name and unwraps the
-// ApiResponse envelope, rejecting with `new Error(errorMsg)` exactly like the
-// old axios response interceptor.
+// 传输层可替换 (`api/transport/`): 桌面端走 Tauri IPC, 浏览器走 HTTP。
+// 本文件只保留**协议无关**的部分 —— 路径归一化、信封解包、错误归一化。
+// 两份实现共用这一段, 避免行为分叉。
 
 import { invoke } from '@tauri-apps/api/core'
 import type { ApiResponse } from '../types'
+import { httpTransport } from './transport/http'
+import { isEnvelope, isTauriRuntime } from './transport'
+import { COMMAND_BY_PATH, tauriTransport } from './transport/tauri'
 
-const COMMAND_BY_PATH: Record<string, string> = {
-  '/reader3/getBookSources': 'get_book_sources',
-  // Source login uses an IPC channel for interactive pages; see api/source.ts.
-  '/reader3/setBookSourceCookie': 'set_book_source_cookie',
-  '/reader3/testBookSources': 'test_book_sources',
-  '/reader3/cancelBookSourceTest': 'cancel_book_source_test',
-  '/reader3/cancelCacheBook': 'cancel_cache_book',
-  '/reader3/deleteInvalidBookSources': 'delete_invalid_book_sources',
-  '/reader3/saveBookSource': 'save_book_source',
-  '/reader3/saveBookSources': 'save_book_sources',
-  '/reader3/deleteBookSource': 'delete_book_source',
-  '/reader3/deleteBookSources': 'delete_book_sources',
-  '/reader3/deleteAllBookSources': 'delete_all_book_sources',
-  '/reader3/pinBookSource': 'pin_book_source',
-  '/reader3/unpinBookSource': 'unpin_book_source',
-  '/reader3/readRemoteSourceFile': 'read_remote_source_file',
-  '/reader3/exploreBook': 'explore_book',
-  '/reader3/getExploreKinds': 'get_explore_kinds',
-  '/reader3/runExploreAction': 'run_explore_action',
-  '/reader3/searchBookMulti': 'search_book_multi',
-  '/reader3/getBookshelf': 'get_bookshelf',
-  '/reader3/getShelfBookWithCacheInfo': 'get_shelf_book_with_cache_info',
-  '/reader3/getBookGroups': 'get_book_groups',
-  '/reader3/saveBookGroup': 'save_book_group',
-  '/reader3/saveBookGroupOrder': 'save_book_group_order',
-  '/reader3/deleteBookGroup': 'delete_book_group',
-  '/reader3/deleteBookGroups': 'delete_book_groups',
-  '/reader3/saveBookGroupId': 'save_book_group_id',
-  '/reader3/saveBook': 'save_book',
-  '/reader3/saveBooks': 'save_books',
-  '/reader3/setBookSource': 'set_book_source',
-  '/reader3/deleteBook': 'delete_book',
-  '/reader3/deleteBooks': 'delete_books',
-  '/reader3/saveBookProgress': 'save_book_progress',
-  '/reader3/getBookInfo': 'get_book_info',
-  '/reader3/getChapterList': 'get_chapter_list',
-  // 注意: getBookContent 需要额外的 Channel 参数(加载阶段), 不能走这里 ——
-  // 见 api/bookshelf.ts 的 getBookContent 直接 invoke 实现。
-  '/reader3/deleteBookCache': 'delete_book_cache',
-  '/reader3/clearSearchCoverCache': 'clear_search_cover_cache',
-  '/reader3/getCachedChapterUrls': 'get_cached_chapter_urls',
-  '/reader3/getChapterWordCounts': 'get_chapter_word_counts',
-  '/reader3/getAvailableBookSource': 'get_available_book_source',
-  '/reader3/getRssSources': 'get_rss_sources',
-  '/reader3/saveRssSource': 'save_rss_source',
-  '/reader3/saveRssSources': 'save_rss_sources',
-  '/reader3/deleteRssSource': 'delete_rss_source',
-  '/reader3/deleteRssSources': 'delete_rss_sources',
-  '/reader3/readRemoteRssSourceFile': 'read_remote_rss_source_file',
-  '/reader3/getRssArticles': 'get_rss_articles',
-  '/reader3/getRssContent': 'get_rss_content',
-  '/reader3/openRssSourcePanel': 'open_rss_source_panel',
-  '/reader3/getBookmarks': 'get_bookmarks',
-  '/reader3/saveBookmark': 'save_bookmark',
-  '/reader3/saveBookmarks': 'save_bookmarks',
-  '/reader3/deleteBookmark': 'delete_bookmark',
-  '/reader3/deleteBookmarks': 'delete_bookmarks',
-  '/reader3/getReplaceRules': 'get_replace_rules',
-  '/reader3/saveReplaceRule': 'save_replace_rule',
-  '/reader3/saveReplaceRules': 'save_replace_rules',
-  '/reader3/deleteReplaceRule': 'delete_replace_rule',
-  '/reader3/deleteReplaceRules': 'delete_replace_rules',
-  '/reader3/getWebdavFileList': 'get_webdav_file_list',
-  '/reader3/getWebdavFile': 'get_webdav_file',
-  '/reader3/getWebdavBackupArchive': 'get_webdav_backup_archive',
-  '/reader3/deleteWebdavFile': 'delete_webdav_file',
-  '/reader3/deleteWebdavFileList': 'delete_webdav_file_list',
-  '/reader3/getWebdavHome': 'get_webdav_home',
-  '/reader3/openWebdavFolder': 'open_webdav_folder',
-  '/reader3/getVersionUpdate': 'get_version_update',
-  '/reader3/dismissVersionUpdate': 'dismiss_version_update',
+/**
+ * 当前传输实现。运行时判定而非构建期替换:
+ * 同一份 `dist` 既能装进 Tauri, 也能被浏览器直接打开。
+ */
+const transport = isTauriRuntime() ? tauriTransport : httpTransport
+
+/** 把 `/getBookshelf` 归一化成 `/reader3/getBookshelf`。 */
+function normalizePath(path: string): string {
+  return path.startsWith('/reader3') ? path : `/reader3${path}`
+}
+
+/**
+ * command 名 → `/reader3/*` 路径(仅 Web 端需要)。
+ *
+ * 复用 `COMMAND_BY_PATH` 这一份表, 避免再维护一张会漂移的反向映射。
+ */
+const PATH_BY_COMMAND: Record<string, string> = Object.fromEntries(
+  Object.entries(COMMAND_BY_PATH).map(([path, command]) => [command, path]),
+)
+
+function pathForCommand(command: string): string | undefined {
+  return PATH_BY_COMMAND[command]
 }
 
 /**
@@ -107,30 +61,33 @@ function dispatchNeedLogin() {
   if (now - lastNeedLoginDispatchAt < 1500) return
   lastNeedLoginDispatchAt = now
   window.dispatchEvent(new CustomEvent('need-login'))
+
+  // 只有桌面端有监听者(App.vue 弹 WebDAV 登录框)。
+  //
+  // 这里**曾经**在 Web 端跳 `/__login` —— 那是服务端 HTTP Basic / cookie 会话
+  // 时代的登录页, 鉴权移除后那条路由也不存在了, 跳过去只会 404。Web 端现在
+  // 能产生 `NEED_LOGIN` 的只剩 WebDAV(且该功能在 Web 端已隐藏), 因此不再分支。
 }
 
-async function call<T>(path: string, payload: unknown): Promise<T> {
-  // The api/*.ts modules pass relative paths (e.g. `/getBookSources`) because
-  // the old axios client had `baseURL: '/reader3'`. Normalize to the full path
-  // the command map is keyed on.
-  const fullPath = path.startsWith('/reader3') ? path : `/reader3${path}`
-  const command = COMMAND_BY_PATH[fullPath]
-  if (!command) throw new Error(`未知接口: ${path}`)
-  try {
-    const res = (await invoke(command, payload === undefined ? {} : { req: payload })) as
-      | ApiResponse<T>
-      | T
-    if (typeof res === 'object' && res !== null && 'isSuccess' in res) {
-      const box = res as ApiResponse<T>
-      if (!box.isSuccess) {
-        if (box.errorMsg === 'NEED_LOGIN' || box.data === 'NEED_LOGIN') {
-          dispatchNeedLogin()
-        }
-        throw new Error(box.errorMsg || '请求失败')
+/** 统一解信封。Tauri 与 HTTP 两条路径共用, 保证错误处理只有一份。 */
+function unwrap<T>(res: ApiResponse<T> | T): T {
+  if (isEnvelope(res)) {
+    const box = res as ApiResponse<T>
+    if (!box.isSuccess) {
+      if (box.errorMsg === 'NEED_LOGIN' || box.data === 'NEED_LOGIN') {
+        dispatchNeedLogin()
       }
-      return box.data as T
+      throw new Error(box.errorMsg || '请求失败')
     }
-    return res as T // raw payload (binary endpoints that bypass the envelope)
+    return box.data as T
+  }
+  return res as T // raw payload (binary endpoints that bypass the envelope)
+}
+
+async function call<T>(path: string, payload: unknown, method: 'GET' | 'POST' = 'POST'): Promise<T> {
+  const fullPath = normalizePath(path)
+  try {
+    return unwrap<T>((await transport.call(fullPath, payload, method)) as ApiResponse<T> | T)
   } catch (err) {
     throw toError(err)
   }
@@ -138,7 +95,7 @@ async function call<T>(path: string, payload: unknown): Promise<T> {
 
 /** GET with query params → command args. */
 export function get<T>(path: string, opts?: { params?: Record<string, unknown> }): Promise<{ data: T }> {
-  return call<T>(path, opts?.params).then((data) => ({ data }))
+  return call<T>(path, opts?.params, 'GET').then((data) => ({ data }))
 }
 
 /** POST with a JSON body → command `req` arg. */
@@ -146,9 +103,19 @@ export function post<T>(path: string, body?: unknown, _config?: unknown): Promis
   return call<T>(path, body).then((data) => ({ data }))
 }
 
-/** Direct invoke without the axios-shaped wrapper (for binary/SSE helpers). */
-export function invokeRaw<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  return invoke<T>(command, args)
+/**
+ * 直接调用底层传输(给需要自定义参数的调用点用, 如带 Channel 的命令)。
+ *
+ * Web 端不存在 Channel, 传进来的 `args` 里的函数会被忽略 —— 因此调用方必须
+ * 保证"没有 Channel 也能工作"。
+ */
+export async function invokeRaw<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (isTauriRuntime()) {
+    return invoke<T>(command, args)
+  }
+  const path = pathForCommand(command)
+  if (!path) throw new Error(`Web 端不支持直接调用 ${command}`)
+  return call<T>(path, args?.req ?? args)
 }
 
 /**
@@ -160,7 +127,7 @@ export async function invokeEnvelope<T>(
   command: string,
   args: Record<string, unknown>,
 ): Promise<T> {
-  const res = await invoke<ApiResponse<T>>(command, args).catch((err) => {
+  const res = await invokeRaw<ApiResponse<T>>(command, args).catch((err) => {
     throw toError(err)
   })
   if (!res.isSuccess) throw new Error(res.errorMsg || '请求失败')
@@ -168,34 +135,33 @@ export async function invokeEnvelope<T>(
 }
 
 /**
- * 上传二进制文件专用：把字节作为**顶层** payload 交给 Tauri。
+ * 上传二进制文件专用。
  *
- * 为什么不能复用 `invokeEnvelope` —— Tauri 只在载荷本身是二进制时才走
- * octet-stream 通道（tauri 的 process-ipc-message-fn.js: 顶层 ArrayBuffer /
- * ArrayBufferView / Array 才命中）。一旦把 `Uint8Array` 塞进对象（如
- * `{ fileName, file }`），就落进 `JSON.stringify` 分支，那里对 Uint8Array 做
- * `Array.from(val)` —— 每个字节变成一个十进制数字、平均 3.57 个字符。
- * 一本 50MB 的 TXT 会因此涨到约 178MB 字符串再被 Rust 解析回字节，
- * 纯编码就要 1.8s 以上，这正是"导入本地书比初版慢几倍"的主因。
+ * 桌面端: 把字节作为**顶层** payload 交给 Tauri —— 它只在载荷本身是二进制时
+ * 才走 octet-stream 通道。一旦把 `Uint8Array` 塞进对象(如 `{ fileName, file }`),
+ * 就落进 `JSON.stringify` 分支, 那里对 Uint8Array 做 `Array.from(val)` ——
+ * 每个字节变成十进制数字、平均 3.57 个字符。一本 50MB 的 TXT 会因此涨到约
+ * 178MB 字符串再被 Rust 解析回字节, 纯编码就要 1.8s 以上。
  *
- * 顶层传字节后，附带信息（文件名等）改走 IPC 的 header。注意 header 值只能是
- * ASCII，中文文件名必须在调用方先 encodeURIComponent，Rust 侧再解码。
- *
- * 参数收 `Blob` 而非 `File`：WebDAV 上传传的是 `Blob`（无 .name），
- * `File` 是其子类，因此两类调用点都能用。
+ * Web 端: 走标准 multipart, 没有这个开销。
  */
 export async function invokeUpload<T>(
   command: string,
   commandHeaders: Record<string, string>,
   file: Blob,
 ): Promise<T> {
-  const res = await invoke<ApiResponse<T>>(command, new Uint8Array(await file.arrayBuffer()), {
-    headers: commandHeaders,
-  }).catch((err) => {
+  const fileName = decodeURIComponent(commandHeaders['x-reader-file-name'] ?? '未命名')
+
+  try {
+    // 桌面端直接把 command 交给 IPC —— 上传类命令不一定有 HTTP 路由,
+    // 拿它去反查路径会漏项(早期版本因此让「背景图上传」报"未知上传接口")。
+    const res = isTauriRuntime()
+      ? await tauriTransport.upload<T>(command, file, fileName, commandHeaders)
+      : await httpTransport.upload<T>(command, file, fileName, commandHeaders)
+    return unwrap<T>(res as ApiResponse<T> | T)
+  } catch (err) {
     throw toError(err)
-  })
-  if (!res.isSuccess) throw new Error(res.errorMsg || '请求失败')
-  return res.data as T
+  }
 }
 
 export default { get, post, invokeRaw, invokeEnvelope, invokeUpload, toError }

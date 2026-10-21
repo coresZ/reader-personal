@@ -188,3 +188,15 @@
   --shadow-2xl: 0 28px 72px rgba(0, 0, 0, 0.55);
   --focus-ring: 0 0 0 3px rgba(223, 154, 105, 0.16);
 }
+
+/*
+ * Web 阅读模式没有自绘标题栏(浏览器自带标签栏), 所有依赖 --titlebar-height
+ * 的浮层(设置抽屉、模态框、阅读页控件)都必须从视口顶部开始, 否则会空出一条
+ * 30px 的缝 —— 表现为面板和顶部"分层"。
+ *
+ * 这个类由 main.ts 在检测到非 Tauri 环境时挂到 <html> 上。
+ * 单独写在 :root 之外, 不影响桌面端。
+ */
+html.web-mode {
+  --titlebar-height: 0px;
+}

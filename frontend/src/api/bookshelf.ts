@@ -1,5 +1,6 @@
 import { invoke, Channel } from '@tauri-apps/api/core'
 import { get, post, invokeUpload } from './invoke'
+import { isTauriRuntime } from './transport'
 import { readerOrigin } from './scheme'
 import { FILE_NAME_HEADER, encodeFileName } from './uploadHeader'
 import type { ApiResponse, Book, BookChapter, BookGroup } from '../types'
@@ -73,6 +74,13 @@ export function getBookContent(params: {
   onStage?: (stage: ContentLoadStage) => void
 }) {
   const { onStage, ...req } = params
+
+  // Web 端没有 Channel, 走通用 HTTP 传输; 桌面端保留 Channel 以显示加载阶段。
+  // 这是唯一需要"双实现"的接口 —— 其余接口的签名在两侧完全一致。
+  if (!isTauriRuntime()) {
+    return post<string>('/getBookContent', req).then((r) => r.data)
+  }
+
   // 后端命令的 Channel 参数是必需的（Tauri 不支持 Option<Channel>），
   // 所以不关心进度时也要传一个通道，忽略其消息即可。
   const channel = new Channel<{ stage?: ContentLoadStage }>()

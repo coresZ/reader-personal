@@ -196,6 +196,36 @@ fn start(app: &mut App, paths: &portable::Paths) -> anyhow::Result<()> {
     let state = tauri::async_runtime::block_on(bootstrap::build_state(&cfg))?;
     app.manage(state);
 
+    // Web 访问: 状态容器 + 按上次保存的配置自动启动。
+    // 必须在 `app.manage(state)` 之后 —— autostart 需要 `AppState`。
+    app.manage(reader_rust::server::control::WebServerState::new(
+        paths.data_dir.clone(),
+    ));
+    {
+        let handle = app.handle().clone();
+        // 放到后台线程: 端口被占用时 `TcpListener::bind` 会阻塞在系统调用上,
+        // 不能让 Web 的失败拖慢桌面窗口首帧。
+        //
+        // `autostart` 是 async 的, 所以这里要显式 block_on —— 但**在这个专用
+        // 线程上**做, 不能像早先那样在 Tauri 命令线程里 block_on 整个启动流程。
+        std::thread::spawn(move || {
+            let Some(web_state) = handle
+                .try_state::<reader_rust::server::control::WebServerState>()
+            else {
+                return;
+            };
+            let Some(app_state) = handle.try_state::<reader_rust::api::AppState>() else {
+                return;
+            };
+            let static_source = reader_rust::server::control::resolve_static_source(&handle);
+            tauri::async_runtime::block_on(reader_rust::server::control::autostart(
+                &web_state,
+                &app_state,
+                static_source,
+            ));
+        });
+    }
+
     // Load the embedded frontend assets in both debug and release. The old
     // debug path pointed at a Vite dev server (localhost:5173) that isn't
     // running in a plain `cargo build`, which showed ERR_CONNECTION_REFUSED.
@@ -213,7 +243,6 @@ fn start(app: &mut App, paths: &portable::Paths) -> anyhow::Result<()> {
         .title("阅读")
         .inner_size(InitialGeometry::DEFAULT_WIDTH, InitialGeometry::DEFAULT_HEIGHT)
         .min_inner_size(min_width, min_height)
-        // Custom title bar drawn by the frontend; this hides the native frame.
         // 自定义标题栏: 隐藏原生边框。
         .decorations(false);
     // WebView2 默认把 profile 放在 `%LOCALAPPDATA%\<identifier>`, 与程序目录

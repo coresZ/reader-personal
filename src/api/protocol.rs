@@ -933,7 +933,7 @@ pub(crate) fn remove_cover_cache_urls(urls: &[String]) {
     }
 }
 
-async fn cover_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
+pub async fn cover_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
     let params: HashMap<String, String> =
         serde_urlencoded::from_str(query).unwrap_or_default();
     let url = params.get("path").map(String::as_str).unwrap_or_default();
@@ -1013,7 +1013,7 @@ async fn local_pdf_cover_route(
 ///
 /// 前端 pdf.js 整本取走自己渲染 (与 Legado 的 PdfRenderer 同一分工: 后端只
 /// 管文件, 页面光栅化在前端)。bookUrl 在 service 侧校验 32 位 hex, 无路径穿越面。
-async fn pdf_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
+pub async fn pdf_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
     let params: HashMap<String, String> =
         serde_urlencoded::from_str(query).unwrap_or_default();
     let book_url = params.get("bookUrl").map(String::as_str).unwrap_or_default();
@@ -1036,7 +1036,7 @@ async fn pdf_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u
     }
 }
 
-async fn epub_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
+pub async fn epub_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
     let params: HashMap<String, String> =
         serde_urlencoded::from_str(query).unwrap_or_default();
     let book_url = params.get("bookUrl").map(String::as_str).unwrap_or_default();
@@ -1063,7 +1063,13 @@ async fn epub_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<
 /// Serves user-uploaded files from `storage/assets/<ns>/<type>/<name>`.
 /// The path query is the asset URL minus the leading slash, e.g.
 /// `files?path=default/ai-maps/map.png`.
-async fn files_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
+///
+/// 校验走 `util::path_safe` 的**唯一实现**, 与 Web 端静态资源共用。
+/// 早先这里自己写了一版"按 `/` 分段、拒绝 `..` 段"的判断, 在 Windows 上
+/// 被 `..\..\Windows\win.ini` 绕过(反斜杠不参与 `split('/')`, 整串作为一个
+/// 普通段通过), 而 `/files` 现在同时挂在未鉴权的 Web 服务上 —— 等于把
+/// 本机任意文件读权限交给了同网段。不要再在本文件里另写一套判定。
+pub async fn files_route(state: &AppState, query: &str) -> tauri::http::Response<Vec<u8>> {
     let params: HashMap<String, String> =
         serde_urlencoded::from_str(query).unwrap_or_default();
     let Some(rel) = params.get("path") else {
@@ -1072,8 +1078,15 @@ async fn files_route(state: &AppState, query: &str) -> tauri::http::Response<Vec
             .body(Vec::new())
             .unwrap_or_default();
     };
-    let rel = rel.trim_start_matches('/');
-    if rel.is_empty() || rel.split('/').any(|seg| seg == ".." || seg.is_empty()) {
+    // `serde_urlencoded` 已经解过百分号转义, 这里不要再解一次(会变成二次解码,
+    // `%252e%252e` 被解成 `..` 之后反而绕过校验)。
+    let Some(relative) = crate::util::path_safe::safe_relative_path(rel) else {
+        return http::Response::builder()
+            .status(400)
+            .body(Vec::new())
+            .unwrap_or_default();
+    };
+    if relative.as_os_str().is_empty() {
         return http::Response::builder()
             .status(400)
             .body(Vec::new())
@@ -1081,7 +1094,7 @@ async fn files_route(state: &AppState, query: &str) -> tauri::http::Response<Vec
     }
     let full = std::path::PathBuf::from(&state.config.storage_dir)
         .join("assets")
-        .join(rel);
+        .join(relative);
     match tokio::fs::read(&full).await {
         Ok(bytes) => {
             let content_type = mime_from_ext(&full).to_string();

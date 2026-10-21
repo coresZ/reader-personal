@@ -43,7 +43,15 @@
             </svg>
             <span class="shelf-btn-label">{{ localBookUploading ? '导入中' : '导入本地书' }}</span>
           </button>
-          <button class="shelf-btn" type="button" title="导出书籍" aria-label="导出书籍" @click="showExportModal = true">
+          <!-- 导出走桌面文件对话框(save dialog + 本地路径), 浏览器里没有等价能力。 -->
+          <button
+            v-if="!appStore.isWebMode"
+            class="shelf-btn"
+            type="button"
+            title="导出书籍"
+            aria-label="导出书籍"
+            @click="showExportModal = true"
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
               <path d="M7 10l5 5 5-5" />
@@ -51,14 +59,35 @@
             </svg>
             <span class="shelf-btn-label">导出书籍</span>
           </button>
-          <button class="shelf-btn" type="button" title="分组管理" aria-label="分组管理" @click="showGroupManager = true">
+          <!--
+            分组管理 / 缓存管理 / 编辑(批量删除、移组)都是**写操作**, 而 Web 端
+            只注册了只读接口(见 src/server/router.rs): `saveBookGroup`、
+            `deleteBookGroups`、`saveBookGroupId`、`deleteBook(s)` 都没有 HTTP 路由。
+            这些按钮留着不会有任何效果 —— 用户点"批量删除"只会收到一个
+            `请求失败(404)` 的 toast, 比没有按钮更糟。与"导出书籍"同样处理。
+          -->
+          <button
+            v-if="!appStore.isWebMode"
+            class="shelf-btn"
+            type="button"
+            title="分组管理"
+            aria-label="分组管理"
+            @click="showGroupManager = true"
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M4 7h6l2 2h8v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z" />
               <path d="M8 13h8" />
             </svg>
             <span class="shelf-btn-label">分组管理</span>
           </button>
-          <button class="shelf-btn" type="button" title="缓存管理" aria-label="缓存管理" @click="showCacheManager = true">
+          <button
+            v-if="!appStore.isWebMode"
+            class="shelf-btn"
+            type="button"
+            title="缓存管理"
+            aria-label="缓存管理"
+            @click="showCacheManager = true"
+          >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <ellipse cx="12" cy="5" rx="8" ry="3" />
               <path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5" />
@@ -67,6 +96,7 @@
             <span class="shelf-btn-label">缓存管理</span>
           </button>
           <button
+            v-if="!appStore.isWebMode"
             class="shelf-btn"
             type="button"
             :class="{ active: shelfStore.editMode }"
@@ -251,7 +281,7 @@ import GroupManagerModal from '../components/bookshelf/GroupManagerModal.vue'
 import SearchResults from '../components/SearchResults.vue'
 import CacheLibraryModal from '../components/CacheLibraryModal.vue'
 import ExportBookModal from '../components/ExportBookModal.vue'
-import { showContextMenu } from '../composables/useContextMenu'
+import { showContextMenu, type MenuItem } from '../composables/useContextMenu'
 import { BOOK_SORT_KEYS, BOOK_SORT_OPTIONS, bookSortLabel } from '../utils/bookshelfSort'
 import { filterShelfBooks } from '../utils/bookshelfFilter'
 import type { Book, SearchBook } from '../types'
@@ -402,18 +432,26 @@ async function handleDeleteBook(book: Book | SearchBook) {
 function handleBookContextMenu({ book, event }: { book: Book | SearchBook; event: MouseEvent }) {
   // 批量编辑模式不弹单本菜单
   if (shelfStore.editMode) return
-  const menuItems = [
+  const readItems: MenuItem[] = [
     { label: '开始阅读', action: () => handleBookClick(book) },
     { label: '查看详情', action: () => handleBookInfo(book) },
-    { label: '编辑信息', action: () => openDetail(book, true) },
-    { divider: true },
-    // 单本分组调整: 记下这本书, 选中集此时必然是空的(编辑模式不弹本菜单)。
-    { label: '调整分组', action: () => openGroupSelect(book.bookUrl) },
-    { label: '缓存管理', action: () => { showCacheManager.value = true } },
-    { divider: true },
-    { label: '删除', danger: true, action: () => handleDeleteBook(book) },
   ]
-  showContextMenu(event, menuItems, book)
+  // Web 端只保留上面这条纯读路径。其余项都依赖桌面专属能力:
+  // 「编辑信息」要写回 saveBook + 封面上传, 「调整分组」是 saveBookGroupId,
+  // 「缓存管理」靠 cache_book_sse(IPC 通道), 「删除」是 delete_book。
+  // 这些都没有 HTTP 路由, 留着就是点一下 404 的按钮。
+  const writeItems: MenuItem[] = appStore.isWebMode
+    ? []
+    : [
+      { label: '编辑信息', action: () => openDetail(book, true) },
+      { divider: true },
+      // 单本分组调整: 记下这本书, 选中集此时必然是空的(编辑模式不弹本菜单)。
+      { label: '调整分组', action: () => openGroupSelect(book.bookUrl) },
+      { label: '缓存管理', action: () => { showCacheManager.value = true } },
+      { divider: true },
+      { label: '删除', danger: true, action: () => handleDeleteBook(book) },
+    ]
+  showContextMenu(event, [...readItems, ...writeItems], book)
 }
 
 function toggleEditMode() {

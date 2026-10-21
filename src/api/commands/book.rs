@@ -602,9 +602,13 @@ pub async fn explore_book(
     ))
 }
 
-#[tauri::command]
-pub async fn get_book_info(
-    state: tauri::State<'_, AppState>,
+/// 书籍详情的共享实现。
+///
+/// 抽成 `&AppState` 入参是为了让 Tauri command 与 Web 端 HTTP handler
+/// (`crate::server`) 走**同一份**逻辑 —— 两边只是传输方式不同, 分叉实现
+/// 迟早会在本地书 / 书源回退这类分支上行为不一致。
+pub async fn get_book_info_core(
+    state: &AppState,
     req: BookInfoRequest,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
@@ -672,9 +676,18 @@ pub async fn get_book_info(
     ))
 }
 
+/// `get_book_info` 的 Tauri 入口: 只是 core 的薄壳。
 #[tauri::command]
-pub async fn get_chapter_list(
+pub async fn get_book_info(
     state: tauri::State<'_, AppState>,
+    req: BookInfoRequest,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    get_book_info_core(&state, req).await
+}
+
+/// `get_chapter_list` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn get_chapter_list_core(
+    state: &AppState,
     req: ChapterListRequest,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
@@ -744,18 +757,27 @@ pub async fn get_chapter_list(
         ));
     }
 
+    // 空串必须按"没有"处理。
+    //
+    // Legado 的 `Book.tocUrl` 是非空类型 `String`，从未打开过详情的书在备份里
+    // 就是 `"tocUrl": ""`。前端原样透传后，`Some("")` 会命中 `if let Some(u)` 分支，
+    // 把目录地址解析成空串 —— 于是既不回落到用 bookUrl 取详情（那是 else 分支），
+    // 又拿空 URL 去抓目录，必然失败。表现就是「从手机端备份导入后打开书一直转，
+    // 切换一次书源就好了」（换源会把 tocUrl 置空并重新取详情）。
+    let req_toc_url = normalized_url_arg(req.toc_url.as_deref());
+    let req_book_url = normalized_url_arg(req.book_url.as_deref());
+
     let source = resolve_book_source(
         &state,
         &user_ns,
         req.book_source_url.clone(),
         req.book_source.clone(),
-        req.book_url.as_deref().or(req.toc_url.as_deref()),
+        req_book_url.as_deref().or(req_toc_url.as_deref()),
     )
     .await?;
-    let toc_url = if let Some(u) = req.toc_url {
-        repair_encoded_url(&u)
-    } else if let Some(book_url) = req.book_url {
-        let book_url = repair_encoded_url(&book_url);
+    let toc_url = if let Some(u) = req_toc_url {
+        u
+    } else if let Some(book_url) = req_book_url {
         let book = state
             .book_service
             .get_book_info(&user_ns, &source, &book_url)
@@ -804,7 +826,7 @@ pub async fn get_chapter_list(
 
     // If there are more pages to fetch, do it in background
     if !pagination.pending_urls.is_empty() {
-        let state_clone = state.inner().clone();
+        let state_clone = state.clone();
         let user_ns_clone = user_ns;
         let toc_url_clone = toc_url.clone();
 
@@ -850,13 +872,24 @@ pub async fn get_chapter_list(
     ))
 }
 
+/// `get_chapter_list` 的 Tauri 入口: 只是 core 的薄壳。
 #[tauri::command]
-pub async fn get_book_content(
+pub async fn get_chapter_list(
     state: tauri::State<'_, AppState>,
+    req: ChapterListRequest,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    get_chapter_list_core(&state, req).await
+}
+
+/// `get_book_content` 的共享实现。
+///
+/// `on_stage` 是加载阶段回调。Tauri 侧传 `ipc::Channel`, Web 侧传 `None`
+/// (一次性 HTTP 响应没有可推送的中间状态); 传 `None` 时逻辑完全一致, 只是
+/// 不产生进度事件。
+pub async fn get_book_content_core(
+    state: &AppState,
     req: BookContentRequest,
-    // 加载阶段通道: 前端总是传(Tauri 的 Channel 不支持 Option),
-    // 不关心进度时忽略消息即可。
-    on_stage: tauri::ipc::Channel<serde_json::Value>,
+    on_stage: Option<&(dyn Fn(crate::service::book_service::ContentLoadStage) + Send + Sync)>,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
 
@@ -964,19 +997,27 @@ pub async fn get_book_content(
                 .book_service
                 .get_book_info(&user_ns, &source, url)
                 .await?;
-            let toc_url = book_info.toc_url.as_deref().unwrap_or(url);
+            // 详情规则没取到目录地址时必须回落到书籍地址本身（Legado
+            // `BookInfo.kt:158` 同款兜底）。空串会让下面的抓取请求直接失败。
+            let toc_url = book_info
+                .toc_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(repair_encoded_url)
+                .unwrap_or_else(|| url.clone());
 
             // If refresh is requested, delete chapter list cache first
             if do_refresh {
                 let _ = state
                     .book_service
-                    .delete_chapter_list_cache(&user_ns, toc_url)
+                    .delete_chapter_list_cache(&user_ns, &toc_url)
                     .await;
             }
 
             let mut chapters = state
                 .book_service
-                .get_chapter_list_with_cache(&user_ns, &source, toc_url, do_refresh)
+                .get_chapter_list_with_cache(&user_ns, &source, &toc_url, do_refresh)
                 .await?;
             let idx = req.index.unwrap() as usize;
 
@@ -991,7 +1032,7 @@ pub async fn get_book_content(
                 );
                 chapters = state
                     .book_service
-                    .get_chapter_list_with_cache(&user_ns, &source, toc_url, true)
+                    .get_chapter_list_with_cache(&user_ns, &source, &toc_url, true)
                     .await?;
 
                 if idx >= chapters.len() {
@@ -1043,7 +1084,9 @@ pub async fn get_book_content(
 
     // 阶段回调: 本地已缓存时后端直接返回, 不会有任何阶段事件
     let notify_stage = |stage: crate::service::book_service::ContentLoadStage| {
-        let _ = on_stage.send(serde_json::json!({ "stage": stage }));
+        if let Some(cb) = on_stage {
+            cb(stage);
+        }
     };
     let content = state
         .book_service
@@ -1058,9 +1101,24 @@ pub async fn get_book_content(
     Ok(ApiResponse::ok(serde_json::Value::String(content)))
 }
 
+/// `get_book_content` 的 Tauri 入口: 把 IPC 通道适配成 core 的回调。
 #[tauri::command]
-pub async fn delete_book_cache(
+pub async fn get_book_content(
     state: tauri::State<'_, AppState>,
+    req: BookContentRequest,
+    // 加载阶段通道: 前端总是传(Tauri 的 Channel 不支持 Option),
+    // 不关心进度时忽略消息即可。
+    on_stage: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    let sink = |stage: crate::service::book_service::ContentLoadStage| {
+        let _ = on_stage.send(serde_json::json!({ "stage": stage }));
+    };
+    get_book_content_core(&state, req, Some(&sink)).await
+}
+
+/// `delete_book_cache` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn delete_book_cache_core(
+    state: &AppState,
     req: DeleteCacheRequest,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
@@ -1111,6 +1169,15 @@ pub async fn delete_book_cache(
     })))
 }
 
+/// `delete_book_cache` 的 Tauri 入口: 只是 core 的薄壳。
+#[tauri::command]
+pub async fn delete_book_cache(
+    state: tauri::State<'_, AppState>,
+    req: DeleteCacheRequest,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    delete_book_cache_core(&state, req).await
+}
+
 /// Search covers use the unauthenticated `public` namespace. `delete_book`
 /// handles shelf books, but search results that were never saved have no book
 /// lifecycle event, so the search UI explicitly releases its cover URLs when a
@@ -1137,9 +1204,9 @@ pub async fn clear_search_cover_cache(
     Ok(ApiResponse::ok(serde_json::json!({ "deleted": deleted })))
 }
 
-#[tauri::command]
-pub async fn get_cached_chapter_urls(
-    state: tauri::State<'_, AppState>,
+/// `get_cached_chapter_urls` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn get_cached_chapter_urls_core(
+    state: &AppState,
     req: CachedChapterUrlsRequest,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
@@ -1154,8 +1221,16 @@ pub async fn get_cached_chapter_urls(
 }
 
 #[tauri::command]
-pub async fn get_chapter_word_counts(
+pub async fn get_cached_chapter_urls(
     state: tauri::State<'_, AppState>,
+    req: CachedChapterUrlsRequest,
+) -> Result<ApiResponse<Value>, AppError> {
+    get_cached_chapter_urls_core(&state, req).await
+}
+
+/// `get_chapter_word_counts` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn get_chapter_word_counts_core(
+    state: &AppState,
     req: CachedChapterUrlsRequest,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
@@ -1170,14 +1245,27 @@ pub async fn get_chapter_word_counts(
 }
 
 #[tauri::command]
-pub async fn get_bookshelf(
+pub async fn get_chapter_word_counts(
     state: tauri::State<'_, AppState>,
-) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    req: CachedChapterUrlsRequest,
+) -> Result<ApiResponse<Value>, AppError> {
+    get_chapter_word_counts_core(&state, req).await
+}
+
+/// `get_bookshelf` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn get_bookshelf_core(state: &AppState) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
     let list = state.book_service.get_bookshelf(&user_ns).await?;
     Ok(ApiResponse::ok(
         serde_json::to_value(list).unwrap_or_default(),
     ))
+}
+
+#[tauri::command]
+pub async fn get_bookshelf(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    get_bookshelf_core(&state).await
 }
 
 #[tauri::command]
@@ -1246,9 +1334,14 @@ pub async fn upload_pdf_book(
     ))
 }
 
-#[tauri::command]
-pub async fn save_book(
-    state: tauri::State<'_, AppState>,
+/// `save_book` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+///
+/// 这里的每一段都不是"顺手加的校验": 书源候选按启用列表过滤、缺 `tocUrl`
+/// 时回取详情、本地书改名后迁移阅读统计 —— 任何一条漏在 Web 侧, 同一本书在
+/// 浏览器里就会和桌面端表现出不同状态。所以 Web handler 必须调它, 不能
+/// 直接 `book_service.save_book()`。
+pub async fn save_book_core(
+    state: &AppState,
     mut req: Book,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
@@ -1347,9 +1440,18 @@ pub async fn save_book(
     ))
 }
 
+/// `save_book` 的 Tauri 入口: 只是 core 的薄壳。
 #[tauri::command]
-pub async fn save_books(
+pub async fn save_book(
     state: tauri::State<'_, AppState>,
+    req: Book,
+) -> Result<ApiResponse<Value>, AppError> {
+    save_book_core(&state, req).await
+}
+
+/// `save_books` 的共享实现 (批量导入/同步走这里)。
+pub async fn save_books_core(
+    state: &AppState,
     mut req: Vec<Book>,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
@@ -1373,6 +1475,15 @@ pub async fn save_books(
     Ok(ApiResponse::ok(
         serde_json::to_value(saved).unwrap_or_default(),
     ))
+}
+
+/// `save_books` 的 Tauri 入口: 只是 core 的薄壳。
+#[tauri::command]
+pub async fn save_books(
+    state: tauri::State<'_, AppState>,
+    req: Vec<Book>,
+) -> Result<ApiResponse<Value>, AppError> {
+    save_books_core(&state, req).await
 }
 
 #[tauri::command]
@@ -1537,9 +1648,9 @@ pub async fn delete_books(
     Ok(ApiResponse::ok(serde_json::json!({"deleted": count})))
 }
 
-#[tauri::command]
-pub async fn save_book_progress(
-    state: tauri::State<'_, AppState>,
+/// `save_book_progress` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn save_book_progress_core(
+    state: &AppState,
     req: SaveBookProgressRequest,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
@@ -1642,6 +1753,15 @@ pub async fn save_book_progress(
     Ok(ApiResponse::ok(serde_json::json!("")))
 }
 
+/// `save_book_progress` 的 Tauri 入口: 只是 core 的薄壳。
+#[tauri::command]
+pub async fn save_book_progress(
+    state: tauri::State<'_, AppState>,
+    req: SaveBookProgressRequest,
+) -> Result<ApiResponse<Value>, AppError> {
+    save_book_progress_core(&state, req).await
+}
+
 #[tauri::command]
 pub async fn get_shelf_book(
     state: tauri::State<'_, AppState>,
@@ -1661,9 +1781,9 @@ pub async fn get_shelf_book(
     ))
 }
 
-#[tauri::command]
-pub async fn get_shelf_book_with_cache_info(
-    state: tauri::State<'_, AppState>,
+/// `get_shelf_book_with_cache_info` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn get_shelf_book_with_cache_info_core(
+    state: &AppState,
 ) -> Result<ApiResponse<Value>, AppError> {
     let user_ns = "default";
     let books = state.book_service.get_bookshelf(&user_ns).await?;
@@ -1724,7 +1844,7 @@ pub async fn get_shelf_book_with_cache_info(
     }
 
     if !prefetch_books.is_empty() {
-        let state_clone = state.inner().clone();
+        let state_clone = state.clone();
         let user_ns_clone = user_ns;
         tokio::spawn(async move {
             for book in prefetch_books {
@@ -1757,6 +1877,14 @@ pub async fn get_shelf_book_with_cache_info(
     Ok(ApiResponse::ok(
         serde_json::to_value(result).unwrap_or_default(),
     ))
+}
+
+/// `get_shelf_book_with_cache_info` 的 Tauri 入口: 只是 core 的薄壳。
+#[tauri::command]
+pub async fn get_shelf_book_with_cache_info(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<Value>, AppError> {
+    get_shelf_book_with_cache_info_core(&state).await
 }
 
 #[tauri::command]
@@ -2864,10 +2992,15 @@ async fn resolve_book_source(
             if let Some(src) = state.book_source_service.get(&user_ns, &normalized).await? {
                 return Ok(src);
             }
+            // 书源地址在书源表里是**主键字符串**，而书架的 `origin` 来自备份/详情页，
+            // 两边经常只差一个尾斜杠（Legado 导出 `https://site.com/`，详情页规则
+            // 拼出来的可能是 `https://site.com`）。精确查失败后必须按同一口径比较，
+            // 否则会误报「书源不存在」——用户看到的是打开书一直转圈或换源列表空白。
+            let identity = source_identity_url(&normalized);
             let sources = state.book_source_service.list(&user_ns).await?;
             if let Some(src) = sources
                 .into_iter()
-                .find(|s| normalize_source_url(&s.book_source_url) == normalized)
+                .find(|s| source_identity_url(&s.book_source_url) == identity)
             {
                 return Ok(src);
             }
@@ -2887,10 +3020,11 @@ async fn resolve_book_source(
                 {
                     return Ok(src);
                 }
+                let identity = source_identity_url(&shelf_origin);
                 let sources = state.book_source_service.list(&user_ns).await?;
                 if let Some(src) = sources
                     .into_iter()
-                    .find(|s| normalize_source_url(&s.book_source_url) == shelf_origin)
+                    .find(|s| source_identity_url(&s.book_source_url) == identity)
                 {
                     return Ok(src);
                 }
@@ -2901,7 +3035,7 @@ async fn resolve_book_source(
     // Auto-discovery from book_url
     if let Some(b_url) = book_url {
         let b_host = match url::Url::parse(b_url) {
-            Ok(u) => u.host_str().unwrap_or_default().to_string(),
+            Ok(u) => u.host_str().unwrap_or_default().to_lowercase(),
             Err(_) => "".to_string(),
         };
         if !b_host.is_empty() {
@@ -2911,11 +3045,12 @@ async fn resolve_book_source(
             for s in sources {
                 let normalized_source_url = normalize_source_url(&s.book_source_url);
                 if let Ok(s_url) = url::Url::parse(&normalized_source_url) {
-                    if let Some(s_host) = s_url.host_str() {
+                    if let Some(s_host) = s_url.host_str().map(str::to_lowercase) {
                         // Match by exact host or by root domain
-                        let s_root = extract_root_domain(s_host);
-                        if b_host.ends_with(s_host)
-                            || s_host.ends_with(&b_host)
+                        let s_root = extract_root_domain(&s_host);
+                        if b_host == s_host
+                            || b_host.ends_with(&format!(".{s_host}"))
+                            || s_host.ends_with(&format!(".{b_host}"))
                             || (b_root == s_root && !b_root.is_empty())
                         {
                             return Ok(s);
@@ -2951,8 +3086,17 @@ fn merge_book(target: &mut Book, info: Book) {
     if target.cover_url.is_none() {
         target.cover_url = info.cover_url;
     }
-    if target.toc_url.is_none() {
-        target.toc_url = info.toc_url;
+    // 空串/空白目录地址必须当成"没有"：换源时上面刚把 toc_url 置为 None，
+    // 若详情规则也没给出目录地址，`info.toc_url` 可能仍是 `Some("")`
+    // （Legado 的 Kotlin 非空 String 在这里被序列化成空串）。写回去就变成
+    // 「有 tocUrl 但是空」的状态 —— 打开书时既不补详情、又拿空 URL 抓目录，
+    // 于是一直转圈。
+    let info_toc_url = info
+        .toc_url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if target.toc_url.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        target.toc_url = info_toc_url;
     }
     if target.intro.is_none() {
         target.intro = info.intro;
@@ -3184,6 +3328,18 @@ fn source_identity_url(value: &str) -> String {
     }
 }
 
+/// 请求里的可选 URL 参数：空白串一律视为"未提供"。
+///
+/// 前端会把书架记录原样回传，而 Legado 的书架/备份里 `tocUrl` 常是 `""`
+/// （Kotlin 侧 `var tocUrl: String = ""`，非空类型）。若把 `Some("")` 当成
+/// 有效值，调用链就会拿空 URL 去抓目录，既不回落也不报可读错误。
+fn normalized_url_arg(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(repair_encoded_url)
+}
+
 fn retain_enabled_source_books(
     books: Vec<SearchBook>,
     enabled_urls: &std::collections::HashSet<String>,
@@ -3257,10 +3413,12 @@ mod tests {
     use super::{
         book_matches_delete_target, build_available_book_source_response,
         cache_count_for_shelf_display, dedup_chapters, fallback_available_book,
+        merge_book, normalized_url_arg,
         resolve_cache_start_index, retain_enabled_source_books, run_cache_tasks,
         should_use_available_source_cache, is_current_source_candidate,
         effective_available_result_limit,
         local_book_rename_needs_stats_migration,
+        source_identity_url,
         take_available_source_cached_matches,
         take_available_source_sse_matches, GetAvailableBookSourceRequest,
         SearchCancellationGuard, SEARCH_CANCELLATIONS, SEARCH_CANCEL_REQUESTS,
@@ -3949,5 +4107,80 @@ mod tests {
         assert_eq!(matches[2].origin, "source-3");
         assert_eq!(matches[4].origin, "source-5");
         assert_eq!(seen.len(), 5);
+    }
+
+    /// 空串/纯空白的 `tocUrl` 必须按"没有提供"处理。
+    ///
+    /// Legado 的 `Book.tocUrl` 是 Kotlin 非空 `String`，从手机端备份导入的书架里
+    /// 就是 `"tocUrl": ""`。若把它当成有效 URL，目录请求既不会回落到 bookUrl 取详情，
+    /// 又会拿空地址去抓页面 —— 用户看到的是打开书一直转圈。
+    #[test]
+    fn normalized_url_arg_treats_blank_url_as_missing() {
+        assert_eq!(normalized_url_arg(None), None);
+        assert_eq!(normalized_url_arg(Some("")), None);
+        assert_eq!(normalized_url_arg(Some("   \t\n")), None);
+        assert_eq!(
+            normalized_url_arg(Some("  https://example.test/toc  ")),
+            Some("https://example.test/toc".to_string())
+        );
+    }
+
+    /// 书源身份比较必须忽略尾斜杠，否则备份里常见的一处差异会让整本书打不开。
+    #[test]
+    fn source_identity_url_ignores_trailing_slash() {
+        assert_eq!(
+            source_identity_url("https://example.test/"),
+            source_identity_url("https://example.test")
+        );
+        assert_ne!(
+            source_identity_url("https://example.test/a"),
+            source_identity_url("https://example.test/b")
+        );
+        // 非 http(s) 地址保持原样，不做斜杠裁剪（本地书标识等依赖原值）。
+        assert_eq!(source_identity_url("local-txt:abc"), "local-txt:abc");
+    }
+
+    /// 换源时详情规则没给出目录地址，不能把空串写进书架。
+    #[test]
+    fn merge_book_never_writes_blank_toc_url() {
+        let mut target = Book {
+            name: "测试书".into(),
+            author: "作者".into(),
+            book_url: "https://example.test/book".into(),
+            origin: "https://example.test".into(),
+            toc_url: None,
+            ..Book::default()
+        };
+        let info = Book {
+            toc_url: Some("   ".into()),
+            ..Book::default()
+        };
+
+        merge_book(&mut target, info);
+
+        assert_eq!(target.toc_url, None, "空白目录地址必须归一成 None");
+    }
+
+    /// 详情给出真实目录地址时要补进书架（换源后再次打开才不用重复取详情）。
+    #[test]
+    fn merge_book_fills_missing_toc_url() {
+        let mut target = Book {
+            name: "测试书".into(),
+            book_url: "https://example.test/book".into(),
+            origin: "https://example.test".into(),
+            toc_url: None,
+            ..Book::default()
+        };
+        let info = Book {
+            toc_url: Some("https://example.test/book/catalog".into()),
+            ..Book::default()
+        };
+
+        merge_book(&mut target, info);
+
+        assert_eq!(
+            target.toc_url.as_deref(),
+            Some("https://example.test/book/catalog")
+        );
     }
 }

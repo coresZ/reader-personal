@@ -124,7 +124,13 @@
           </div>
 
           <!-- Available Sources -->
-          <div v-if="!isLocal" class="source-section">
+          <!--
+            Web 端不显示: 这个列表靠 `getAvailableBookSourceSSE` 拉, 而它是
+            `tauri::ipc::Channel` 流(sse.ts 的 openSse 直接调 invoke), 浏览器里
+            连不上; 就算列表出来了, 换源要写 `setBookSource`, 也没有 HTTP 路由。
+            两头都缺, 整块藏掉 —— 与顶栏多源搜索的处理一致。
+          -->
+          <div v-if="!isLocal && !appStore.isWebMode" class="source-section">
             <h3>{{ singleSourceOnly ? '书源' : '可读书源' }}</h3>
             <div v-if="sourcesLoading && !sourceCandidates.length" class="source-loading">
               <div class="loading-spinner"></div>
@@ -259,15 +265,24 @@
                 加入书架
               </button>
               <template v-else>
-                <!-- 只有书架里的书才谈得上编辑信息 -->
-                <button class="action-btn" @click="startEdit">
+                <!--
+                  编辑信息 / 取消加入都是写操作, Web 端没有对应路由
+                  (`deleteBook`、`uploadBookCover` 等只存在于 Tauri)。
+                  按钮留着只会让人点出一个 404, 所以按桌面专属处理。
+                -->
+                <button v-if="!appStore.isWebMode" class="action-btn" @click="startEdit">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
                     <path d="M12 20h9" />
                     <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
                   </svg>
                   编辑信息
                 </button>
-                <button class="action-btn" :disabled="removingFromShelf" @click="removeFromShelf">
+                <button
+                  v-if="!appStore.isWebMode"
+                  class="action-btn"
+                  :disabled="removingFromShelf"
+                  @click="removeFromShelf"
+                >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
                     <path d="M5 12h14" />
                   </svg>
@@ -555,6 +570,13 @@ function loadSourceCandidates(loadId: number, bookKey: string, refresh = false) 
   if (!b || !b.name) {
     return
   }
+  // Web 端整块书源列表都不渲染(见模板里的 `.source-section`), 但 watch 仍然
+  // 会走到这里。不能只靠"看不见"—— `getAvailableBookSourceSSE` 底层是
+  // `tauri::ipc::Channel`, 浏览器里根本没有, 发出去只会抛错或挂住。
+  if (appStore.isWebMode) {
+    sourcesLoading.value = false
+    return
+  }
   closeSourceSSE()
   sourcesLoading.value = true
   sourcesIncomplete.value = false
@@ -711,9 +733,11 @@ async function loadChaptersFor(
     const nextChapters = await getChapterList({
       bookUrl,
       bookSourceUrl: origin,
-      tocUrl: origin === sourceKey(props.book?.origin || '')
-        ? (props.book as Book | null)?.tocUrl
-        : undefined,
+      // 空串目录地址不能传：后端会当成"没有"并回落到 bookUrl 去取详情。
+      // （从手机端导入的书 tocUrl 常常是空串。）
+      tocUrl: (origin === sourceKey(props.book?.origin || '')
+        ? (props.book as Book | null)?.tocUrl?.trim()
+        : undefined) || undefined,
     })
     if (!isCurrentDetail(loadId, bookKey) || requestId !== chapterLoadId) return
     chapters.value = nextChapters

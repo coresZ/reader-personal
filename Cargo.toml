@@ -64,15 +64,18 @@ tauri-plugin-dialog = "2"
 # PDF 解析/提取。lopdf 不单独依赖: 用 pdf-extract 重导出的那份, 避免
 # 两个 lopdf 版本各自算一套页序。
 pdf-extract = "0.12.0"
+# Web 阅读模式 (`src/server/`)。axum 曾是 dev-only 依赖(仅测试里的 mock 上游),
+# 现在也承载进程内的 HTTP 服务, 因此提升为正式依赖。
+axum = { version = "0.7", features = ["json", "multipart"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55"
 
 [dev-dependencies]
-# Only used by tests/*.rs to spin up local mock upstream sites. The app itself
-# is pure IPC — no HTTP server.
-axum = { version = "0.7", features = ["json", "multipart"] }
+# Only used by tests/*.rs to spin up local mock upstream sites.
 tokio = { version = "1", features = ["full"] }
+# `server::router` 的 body-limit 回归要直接 poll 一个 Router。
+tower = { version = "0.5", features = ["util"] }
 
 # pdf-extract 上游 0.12.0 遇到无 ToUnicode 的 GBK-EUC-H 等 Type0 编码会直接
 # panic (LaTeX CJK 产物常见)。vendor 副本加了 GBK/Big5 系 CMap 的近似解码:

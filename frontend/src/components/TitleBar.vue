@@ -50,6 +50,7 @@ import { useRoute } from 'vue-router'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useReaderStore } from '../stores/reader'
 import { useAppStore } from '../stores/app'
+import { isTauriRuntime } from '../api/transport'
 
 const { surface = null } = defineProps<{
   surface?: 'settings' | 'reader-panel' | null
@@ -58,7 +59,7 @@ const { surface = null } = defineProps<{
 const readerStore = useReaderStore()
 const appStore = useAppStore()
 const route = useRoute()
-const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+const isTauri = isTauriRuntime()
 const appWindow = isTauri ? getCurrentWindow() : null
 const isMaximized = ref(false)
 const isReader = computed(() => route.name === 'reader')

@@ -89,6 +89,15 @@ Reader 是「阅读3.0」（[Legado](https://github.com/Rimchars/legado)）的�
 - 可配置全局老板键，在其他窗口中快速隐藏或恢复应用
 - 自动记住窗口尺寸与位置；拔掉外接显示器后会自动校正，不会出现窗口跑到屏幕外
 
+### Web 访问（手机阅读）
+
+- 在桌面端「设置 → 应用 → Web 访问」开启后，手机/平板浏览器打开显示的地址即可读书架与正文
+- 默认只监听 `127.0.0.1:1122`；打开「允许局域网访问」后绑定全部网卡，供同一 WiFi 下的设备访问
+- **没有账号密码**（与 Legado 手机端一致）：放开局域网等于同网段的任何人都能读你的书架，请只在可信网络里开启
+- 提供书架、目录、正文、进度、书签、替换规则与 WiFi 传书；搜索、换源、备份、缓存整本等只在桌面端提供
+
+详见 [`docs/web-reader.md`](docs/web-reader.md)。
+
 ## 快速开始
 
 1. 前往 [Releases](https://github.com/hadc188/reader/releases) 下载适合当前系统的版本。
@@ -197,6 +206,7 @@ cargo test -j 4
 - **前端**：Vue 3、Vite、TypeScript、Pinia、Vue Router、ECharts。
 - **本地核心**：Rust、Tokio、Reqwest、SQLx、SQLite、rquickjs。
 - **通信方式**：前端通过 Tauri IPC 调用本地命令，封面与 EPUB 资源通过应用自定义协议加载。
+- **Web 访问**：可选的进程内 axum 服务，与桌面端共用同一套 `*_core` 业务实现，只做协议适配。
 - **数据存储**：SQLite 保存业务数据，文件目录保存封面、章节缓存、本地书籍和备份。
 
 主要目录：
@@ -205,6 +215,7 @@ cargo test -j 4
 | --- | --- |
 | `frontend/` | Vue 3 桌面界面、状态管理与前端测试 |
 | `src/api/` | Tauri 命令、自定义协议与桌面接口 |
+| `src/server/` | Web 访问：axum 路由、静态资源、配置与启停 |
 | `src/app/` | 应用配置、启动流程与窗口状态持久化 |
 | `src/service/` | 书籍、书源、用户数据等业务逻辑 |
 | `src/parser/` | CSS、XPath、JSONPath、正则和 JavaScript 解析引擎 |

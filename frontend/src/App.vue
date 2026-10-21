@@ -13,7 +13,10 @@
       aria-hidden="true"
       :style="customBackgroundStyle"
     ></div>
-    <TitleBar :surface="titlebarSurface" />
+    <!-- 标题栏只在桌面端渲染: 它整套是为无边框窗口服务的(拖动区、最小化/
+         最大化/关闭、迷你模式)。浏览器里没有窗口可控制, 留着只会显示三个
+         点了没反应的按钮, 还白占 30px 顶部空间。 -->
+    <TitleBar v-if="!appStore.isWebMode" :surface="titlebarSurface" />
     <div class="app-body">
       <AppTopBar v-if="showHeader" />
       <main class="app-main" :class="{ 'with-bottom-nav': showBottomNav, 'without-header': !showHeader }">
@@ -70,7 +73,11 @@ const appStore = useAppStore()
 const readerStore = useReaderStore()
 
 const showHeader = computed(() => route.name !== 'reader' && !appStore.miniMode)
-const showBottomNav = computed(() => route.name !== 'reader' && !appStore.miniMode)
+/* Web 端不渲染底部导航: 只剩书架和最近阅读两项, 用顶部的书架/最近入口
+   就够切换, 底部常驻一条导航反而占掉手机的阅读高度。 */
+const showBottomNav = computed(
+  () => route.name !== 'reader' && !appStore.miniMode && !appStore.isWebMode,
+)
 const titlebarSurface = computed<'settings' | 'reader-panel' | null>(() => {
   if (appStore.showSettingsDrawer) return 'settings'
   if (appStore.showSourceManager || appStore.showWebdavManager) return 'settings'

@@ -119,11 +119,8 @@
                 <path d="M20 16.5a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 16.5" />
               </svg>
               &#24212;&#29992;
+              <span class="section-badge">{{ appVersion }}</span>
             </h3>
-            <div class="status-card">
-              <span>{{ appVersion }}</span>
-              <small>当前应用版本</small>
-            </div>
             <div v-if="isDesktopApp" class="setting-switch-row">
               <div class="setting-switch-copy">
                 <span>关闭时隐藏到系统托盘</span>
@@ -165,9 +162,15 @@
                 @keydown="recordBossKey"
                 @blur="recordingBossKey = false"
               >
-                {{ recordingBossKey ? '请按下新的快捷键' : formatBossKey(appStore.bossKeyShortcut) }}
+                <span class="boss-key-value">
+                  {{ recordingBossKey ? '请按下新的快捷键' : formatBossKey(appStore.bossKeyShortcut) }}
+                </span>
+                <span class="boss-key-hint">{{ recordingBossKey ? 'Esc 取消' : '点击修改' }}</span>
               </button>
             </div>
+            <!-- 与上面的「老板键」同一层级: 都是自带边框的卡片, 不再额外加小标题,
+                 否则两个相邻分组的标题层级不一致(一个有标题、一个没有)。 -->
+            <WebAccessSetting v-if="isDesktopApp" />
             <template v-if="appStore.canCheckVersionUpdate">
               <div class="setting-switch-row">
                 <div class="setting-switch-copy">
@@ -199,7 +202,7 @@
                   <small>{{ desktopUpdateProgressMessage }}</small>
                 </div>
               </div>
-              <div class="btn-group version-actions">
+              <div class="version-actions">
                 <button class="action-btn" :disabled="!appStore.versionUpdate?.releaseUrl" @click="handleOpenRelease">
                   查看发行页
                 </button>
@@ -211,7 +214,7 @@
                   本版本不再提醒
                 </button>
                 <button class="action-btn" :disabled="appStore.versionUpdateLoading" @click="handleCheckVersionUpdate">
-                  {{ appStore.versionUpdateLoading ? '检查中...' : '重新检查' }}
+                  {{ appStore.versionUpdateLoading ? '检查中…' : '重新检查' }}
                 </button>
                 <button
                   v-if="isDesktopApp"
@@ -279,7 +282,12 @@
                 &#26263;&#33394;
               </button>
             </div>
-            <div class="background-setting">
+            <!--
+              背景图相关整块在 Web 端隐藏: 选图后要 `upload_background_image`
+              把文件落到应用目录, 那是 Tauri 的 octet-stream 上传命令, 浏览器里
+              没有等价路由。留下的只有"点了报错"和"永远禁用的开关"。
+            -->
+            <div v-if="!appStore.isWebMode" class="background-setting">
               <div class="setting-switch-copy">
                 <span>桌面背景图</span>
               </div>
@@ -340,7 +348,7 @@
                 </label>
               </div>
             </div>
-            <div class="setting-switch-row">
+            <div v-if="!appStore.isWebMode" class="setting-switch-row">
               <div class="setting-switch-copy">
                 <span>应用到阅读页</span>
                 <small>{{ readerBackgroundDescription }}</small>
@@ -360,7 +368,13 @@
             </div>
           </section>
 
-          <section v-show="activeSettingsTab === 'appearance'" class="drawer-section">
+          <!-- 隐藏功能: 只对桌面端有意义。Web 端本来就没有统计与 RSS,
+               这两个开关没有可隐藏的对象。 -->
+          <section
+            v-if="!appStore.isWebMode"
+            v-show="activeSettingsTab === 'appearance'"
+            class="drawer-section"
+          >
             <h3 class="section-title">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
                 <path d="M17.94 17.94 12 12m0 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3zM12 12l5.5-5.5" />
@@ -405,6 +419,7 @@ import { useRoute } from 'vue-router'
 import { useAppStore } from '../stores/app'
 import { useBookshelfStore } from '../stores/bookshelf'
 import { useReaderStore } from '../stores/reader'
+import { isTauriRuntime } from '../api/transport'
 import {
   READER_BACKGROUND_OPACITY_STEP,
   normalizeReaderBackgroundOpacity,
@@ -414,6 +429,7 @@ import {
 } from '../utils/readerBackground'
 import { captureBossKey, formatBossKey } from '../utils/bossKey'
 import { uploadBackgroundImage } from '../api/background'
+import WebAccessSetting from './WebAccessSetting.vue'
 
 const props = defineProps<{
   modelValue: boolean
@@ -428,16 +444,35 @@ const shelfStore = useBookshelfStore()
 const readerStore = useReaderStore()
 const route = useRoute()
 const appVersion = __APP_VERSION__
-const isDesktopApp = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+const isDesktopApp = isTauriRuntime()
 const backgroundInputRef = ref<HTMLInputElement | null>(null)
 const processingBackground = ref(false)
 const recordingBossKey = ref(false)
-const settingsTabs = [
+
+/**
+ * 设置分类。Web 端只留「外观」——
+ *
+ * 「常用」里是书源/备份/代理这些桌面能力, 「应用」里是托盘、老板键、版本更新、
+ * Web 访问开关(自己给自己开后门没有意义)。浏览器里点开只会看到一堆点了报错的
+ * 按钮, 不如直接不给。
+ *
+ * 注意保留「外观」: 阅读页的字号、行距、主题在手机上同样要调。
+ */
+const allSettingsTabs = [
   { value: 'common', label: '常用' },
   { value: 'appearance', label: '外观' },
   { value: 'app', label: '应用' },
 ] as const
-const activeSettingsTab = ref<(typeof settingsTabs)[number]['value']>('common')
+const settingsTabs = computed(() =>
+  appStore.isWebMode
+    ? allSettingsTabs.filter((tab) => tab.value === 'appearance')
+    : [...allSettingsTabs],
+)
+const activeSettingsTab = ref<(typeof allSettingsTabs)[number]['value']>(
+  // Web 端只有「外观」一个标签, 直接把默认值设成它 ——
+  // 否则会停在一个根本不渲染的「常用」上, 面板看起来是空的。
+  appStore.isWebMode ? 'appearance' : 'common',
+)
 const proxyModeDraft = ref<'system' | 'manual'>(appStore.networkProxyMode)
 const proxyUrlDraft = ref(appStore.networkProxyUrl)
 const savingProxy = ref(false)
@@ -495,7 +530,8 @@ const versionUpdateMessage = computed(() => {
     return `当前 ${info.currentVersion}，最新 ${info.latestVersion}，本版本已设置不再提醒。`
   }
   if (info.error) return `当前 ${info.currentVersion}，上次检查失败：${info.error}`
-  return `当前 ${info.currentVersion}。`
+  // 没有更新时不重复版本号: 标题旁已有版本徽标, 这里再写一遍纯属冗余。
+  return `已确认 ${info.currentVersion} 为最新，无需更新。`
 })
 const updateProgressStyle = computed(() => ({
   width: appStore.desktopUpdateProgress?.stage === 'failed'
@@ -697,6 +733,8 @@ async function handleCheckVersionUpdate() {
 
 .settings-drawer {
   position: fixed;
+  /* `--titlebar-height` 是桌面端自绘标题栏的高度。Web 端由 global.css 把它
+     归零(见 `html.web-mode`), 这里不需要特殊处理。 */
   top: var(--titlebar-height, 30px);
   right: 0;
   bottom: 0;
@@ -720,7 +758,15 @@ async function handleCheckVersionUpdate() {
 .settings-drawer.with-custom-background .setting-switch-row,
 .settings-drawer.with-custom-background .background-setting,
 .settings-drawer.with-custom-background .proxy-setting,
-.settings-drawer.with-custom-background .theme-option {
+.settings-drawer.with-custom-background .theme-option,
+/* 老板键与 Web 访问也是同一层级的卡片, 背景图模式下必须一起半透明 ——
+ * 漏掉它们会让这几块变成不透明实心色, 在背景图上显得像贴了块补丁。
+ *
+ * 类名必须是 `.web-access`: 那是 `WebAccessSetting.vue` 根元素上的名字。
+ * 这里曾写成 `.web-access-setting`(照组件文件名臆造的), 选择器永远不匹配,
+ * 症状正是注释里说的"贴了块补丁" —— 而它恰好是最难联想到"写错类名"的那种。 */
+.settings-drawer.with-custom-background .boss-key-setting,
+.settings-drawer.with-custom-background .web-access {
   background: color-mix(in srgb, var(--color-bg-elevated) 66%, transparent);
   border-color: color-mix(in srgb, var(--color-border) 72%, transparent);
 }
@@ -913,42 +959,9 @@ async function handleCheckVersionUpdate() {
   color: inherit;
 }
 
-.boss-key-setting {
-  display: grid;
-  gap: var(--space-2);
-  margin-bottom: var(--space-3);
-  padding: var(--space-3);
-  border: 1px solid var(--color-border-light);
-  border-radius: var(--radius-lg);
-  background: var(--color-bg);
-}
-
-.boss-key-setting .compact-row {
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-
-.boss-key-recorder {
-  min-height: 40px;
-  padding: 0 var(--space-3);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  background: var(--color-bg-elevated);
-  color: var(--color-text);
-  text-align: left;
-  cursor: pointer;
-}
-
-.boss-key-recorder.recording {
-  border-color: var(--color-primary);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary) 15%, transparent);
-}
-
-.boss-key-recorder:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
+/* `.boss-key-*` 的样式已提到 `styles/global.css`。原因同 Web 访问:
+ * 它们是独立的一块控件, 放在 scoped 里无法被其它组件/演示页复用, 而且
+ * 同一个类在文件里出现过两份(后者覆盖前者的 display:flex), 已一并清理。 */
 
 .proxy-setting {
   display: grid;
@@ -1022,40 +1035,41 @@ async function handleCheckVersionUpdate() {
   justify-content: flex-start;
 }
 
-.btn-group {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-
+/* 版本区四个按钮等宽排列, 2×2 网格。
+ *
+ * 不能用 `.btn-group` 的 `flex-wrap`: 四个按钮文案长度差得多("查看发行页" 5 字,
+ * "本版本不再提醒" 7 字), 换行后每行起点和宽度都不一致, 看起来像没对齐。
+ * 两列等宽网格在任何字数下都对齐, "下载并更新"也自然落在"重新检查"旁边,
+ * 不会单独占一整行。`minmax(0, 1fr)` 防止长文案把列宽撑破。 */
 .version-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
   margin-bottom: var(--space-3);
 }
 
-.action-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
-  min-height: 38px;
-  padding: 0 var(--space-4);
-  border-radius: var(--radius-md);
-  font-size: var(--text-sm);
-  font-weight: 600;
-  background: var(--color-bg);
-  color: var(--color-text);
-  border: 1px solid var(--color-border-light);
-  transition: all var(--duration-fast) var(--ease-out);
+.version-actions .action-btn {
+  width: 100%;
 }
 
-.action-btn:hover {
-  background: var(--color-bg-hover);
-  border-color: var(--color-border);
+/* 标题旁的版本号徽标。
+ * 原来是单独一张 status-card, 但下面「版本检查」卡片里已经写着"当前 v1.5.8",
+ * 同一个信息出现两次、还各占一块底色, 显得零碎。 */
+.section-badge {
+  margin-left: auto;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  background: var(--color-bg-sunken);
+  color: var(--color-text-tertiary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
 }
 
-.action-btn:active {
-  transform: scale(0.97);
-}
+/* `.action-btn` / `.btn-group` 的公共样式已提到 `styles/global.css` ——
+ * 它们同时被 WebAccessSetting、WebdavManager 等独立组件复用，留在 scoped
+ * 样式里子组件拿不到。此处只保留设置面板自己的修饰类。 */
 
 /* 主操作走"淡底 + 主色文字/描边", 而不是一整块高饱和橙压白字。
  * 两个理由: 一是整块纯主色在浅色面板里分量过重, 把周围浅色控件的层次全压平;
@@ -1311,34 +1325,7 @@ async function handleCheckVersionUpdate() {
   display: none;
 }
 
-.status-card {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: var(--space-3);
-  background: var(--color-bg);
-  border: 1px solid var(--color-border-light);
-  border-radius: var(--radius-lg);
-  margin-bottom: var(--space-3);
-}
-
-.status-card span {
-  font-size: var(--text-sm);
-  font-weight: 600;
-}
-
-.status-card small {
-  color: var(--color-text-tertiary);
-}
-
-.status-card.accent {
-  background: rgba(var(--color-primary-rgb), 0.1);
-  border-color: rgba(var(--color-primary-rgb), 0.2);
-}
-
-.status-card.muted {
-  opacity: 0.72;
-}
+/* `.status-card` 公共样式在 `styles/global.css`。 */
 
 .update-progress {
   display: grid;
@@ -1378,82 +1365,9 @@ async function handleCheckVersionUpdate() {
   to { transform: translateX(205%); }
 }
 
-.setting-switch-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-  padding: var(--space-3);
-  margin-bottom: var(--space-3);
-  border: 1px solid var(--color-border-light);
-  border-radius: var(--radius-lg);
-  background: var(--color-bg);
-}
-
-.setting-switch-copy {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.setting-switch-copy span {
-  color: var(--color-text);
-  font-size: var(--text-sm);
-  font-weight: 600;
-}
-
-.setting-switch-copy small {
-  color: var(--color-text-tertiary);
-  font-size: var(--text-xs);
-}
-
-.switch-control {
-  position: relative;
-  width: 44px;
-  height: 24px;
-  flex: 0 0 44px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-full);
-  background: var(--color-bg-sunken);
-  transition: background var(--duration-fast), border-color var(--duration-fast);
-}
-
-.switch-control span {
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 16px;
-  height: 16px;
-  border-radius: var(--radius-full);
-  background: var(--color-bg-elevated);
-  box-shadow: var(--shadow-xs);
-  transition: transform var(--duration-fast);
-}
-
-/* 开启态: 淡主色轨道 + 主色圆点, 与全应用的主按钮/选中态同一套语言。
- * 圆点必须同时着色 —— 原来是"橙底 + 白圆点", 底改淡后白圆点会彻底看不见
- * (白 on #e9d3c5 仅 1.2:1); 改为主色圆点后 5.7:1, 开/关靠圆点位置区分。
- * 圆点用 primary 与正文色混合(而非纯 primary), 才能保证浅色主题下压得住底。 */
-.switch-control.on {
-  border-color: var(--color-primary-soft-border);
-  background: var(--color-primary-soft-bg);
-}
-
-.switch-control.on span {
-  transform: translateX(20px);
-  background: var(--color-primary-soft-text);
-}
-
-.switch-control:disabled {
-  cursor: not-allowed;
-  opacity: 0.45;
-}
-
-.action-btn:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
+/* `.setting-switch-row` / `.setting-switch-copy` / `.switch-control` 的公共
+ * 样式已提到 `styles/global.css`, 供 WebAccessSetting 等独立组件复用 ——
+ * 留在 scoped 样式里, 子组件内部元素拿不到(它们没有本组件的 data-v 属性)。 */
 
 .feature-toggle-list {
   display: flex;

@@ -70,15 +70,10 @@ const allItems: Array<{ key: NavKey; label: string; path: string; paths: string[
   },
 ]
 
-// Filter out hidden features; hide-key maps to a feature key ('stats', 'rss').
-const items = computed(() => {
-  const hidden = (key: NavKey) => {
-    if (key === 'recent') return appStore.isFeatureHidden('stats')
-    if (key === 'rss') return appStore.isFeatureHidden('rss')
-    return false
-  }
-  return allItems.filter((item) => !hidden(item.key))
-})
+// 过滤不可见的入口。判断集中在 `appStore.isNavVisible`:
+// - 桌面端按用户偏好隐藏统计/RSS;
+// - Web 端只保留书架与最近阅读(其余能力没有对应的后端实现, 留着会让人以为坏了)。
+const items = computed(() => allItems.filter((item) => appStore.isNavVisible(item.key)))
 
 const navRef = ref<HTMLElement | null>(null)
 const itemRefs = ref<Record<NavKey, HTMLElement | null>>({

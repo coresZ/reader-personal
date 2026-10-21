@@ -45,9 +45,9 @@ pub struct DesktopUpdateProgress {
     message: String,
 }
 
-#[tauri::command]
-pub async fn get_version_update(
-    state: tauri::State<'_, AppState>,
+/// `get_version_update` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn get_version_update_core(
+    state: &AppState,
     req: VersionUpdateQuery,
 ) -> Result<ApiResponse<Value>, AppError> {
     let info = state
@@ -57,6 +57,14 @@ pub async fn get_version_update(
     Ok(ApiResponse::ok(
         serde_json::to_value(info).map_err(|err| AppError::BadRequest(err.to_string()))?,
     ))
+}
+
+#[tauri::command]
+pub async fn get_version_update(
+    state: tauri::State<'_, AppState>,
+    req: VersionUpdateQuery,
+) -> Result<ApiResponse<Value>, AppError> {
+    get_version_update_core(&state, req).await
 }
 
 #[tauri::command]

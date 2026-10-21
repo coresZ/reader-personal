@@ -248,3 +248,284 @@ ul, ol {
     opacity: 1;
   }
 }
+
+/* ─── 设置面板的共享控件 ─── */
+/*
+ * 这些类被多个组件复用（SettingsDrawer、WebAccessSetting、WebdavManager…）。
+ * 放在这里而不是某个组件的 `<style scoped>` 里：scoped 样式只会给**本组件模板**
+ * 里的元素加 `data-v-*` 属性，子组件根节点之外的内部元素拿不到父组件的样式。
+ *
+ * 症状就是 WebAccessSetting 曾经整块显示成裸文本 —— 开关变成看不见的普通
+ * button，卡片没有边框和内边距。这类"看起来像没写样式"的问题，根因几乎都是
+ * 样式被 scoped 隔离了。
+ */
+
+.setting-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3);
+  margin-bottom: var(--space-3);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg);
+}
+
+/* 紧凑变体：嵌在另一张卡片里时不要再套一层边框与底色。 */
+.setting-switch-row.compact-row {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.setting-switch-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.setting-switch-copy span {
+  color: var(--color-text);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.setting-switch-copy small {
+  color: var(--color-text-tertiary);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.switch-control {
+  position: relative;
+  width: 44px;
+  height: 24px;
+  flex: 0 0 44px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  background: var(--color-bg-sunken);
+  transition: background var(--duration-fast), border-color var(--duration-fast);
+}
+
+.switch-control span {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--radius-full);
+  background: var(--color-bg-elevated);
+  box-shadow: var(--shadow-xs);
+  transition: transform var(--duration-fast);
+}
+
+/* 开启态: 淡主色轨道 + 主色圆点, 与全应用的主按钮/选中态同一套语言。
+ * 圆点必须同时着色 —— 原来是"橙底 + 白圆点", 底改淡后白圆点会彻底看不见
+ * (白 on #e9d3c5 仅 1.2:1); 改为主色圆点后 5.7:1, 开/关靠圆点位置区分。
+ * 圆点用 primary 与正文色混合(而非纯 primary), 才能保证浅色主题下压得住底。 */
+.switch-control.on {
+  border-color: var(--color-primary-soft-border);
+  background: var(--color-primary-soft-bg);
+}
+
+.switch-control.on span {
+  transform: translateX(20px);
+  background: var(--color-primary-soft-text);
+}
+
+.switch-control:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.status-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  /* 与相邻卡片(`.setting-switch-row` / `.boss-key-setting`)同一层次。
+   *
+   * 原来用 `--color-bg-sunken`: 浅色主题下是 #eceff1, 而相邻卡片是 --color-bg
+   * (#f5f6f7) + 白底面板, 于是状态卡看起来"凹下去一块", 和周围的卡片不是
+   * 一个平面。状态卡是**信息块**而不是输入框, 不该用下沉色。 */
+  background: var(--color-bg-elevated);
+}
+
+.status-card span {
+  color: var(--color-text);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.status-card small {
+  color: var(--color-text-tertiary);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+}
+
+.status-card.accent {
+  border-color: var(--color-primary-soft-border);
+  background: var(--color-primary-soft-bg);
+}
+
+/* 主色只用在边框与底色上, 标题保持正文色 ——
+ * 状态卡的标题要能一眼读出来, 用 primary-soft-text 在深色主题下偏暗,
+ * 和旁边的卡片标题不是一个灰度。 */
+.status-card.accent span {
+  color: var(--color-text);
+}
+
+.status-card.muted span {
+  color: var(--color-text-secondary);
+  font-weight: 500;
+}
+
+.btn-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: 38px;
+  padding: 0 var(--space-4);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--duration-fast) var(--ease-out);
+}
+
+.action-btn:hover {
+  background: var(--color-bg-hover);
+  border-color: var(--color-border);
+}
+
+.action-btn:active {
+  transform: scale(0.97);
+}
+
+/* 主操作走"淡底 + 主色文字/描边", 而不是一整块高饱和橙压白字。
+ * 两个理由: 一是整块纯主色在浅色面板里分量过重, 把周围浅色控件的层次全压平;
+ * 二是白字压在 #c56f35 上对比度只有约 4:1, 观感发闷、显脏。
+ * 权重靠"有彩度 vs 无彩度"区分(对比旁边的 .action-btn 白底灰边), 主次依旧清楚。
+ * 文字色用 primary 与 text 的混合色: 浅色主题下比纯 primary 更暗、深色主题下
+ * 自动偏向浅橙, 两个主题都能保证可读性, 不必分别写死。 */
+.action-btn.primary {
+  background: var(--color-selected-bg);
+  /* 60% 主色 + 40% 正文色: 浅色主题 #835131 在淡橙底上 5.3:1, 深色主题 #e3bb9f
+   * 在暗底上 8.5:1, 两边都过 AA。调高比例会让浅色主题跌破 4.5:1
+   * (80% 只有 3.8:1), 所以这个值不要再往上抬。 */
+  color: color-mix(in srgb, var(--color-primary) 60%, var(--color-text));
+  border-color: var(--color-selected-border);
+}
+
+.action-btn.primary:hover {
+  background: var(--color-selected-bg-hover);
+  border-color: var(--color-primary);
+}
+
+.action-btn.danger {
+  color: var(--color-danger);
+  border-color: transparent;
+  background: transparent;
+  padding: var(--space-1) var(--space-2);
+}
+
+.action-btn.danger:hover {
+  background: rgba(245, 34, 45, 0.08);
+}
+
+.action-btn.full {
+  width: 100%;
+  justify-content: center;
+}
+
+.action-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ─── 老板键 ─── */
+
+.boss-key-setting {
+  display: grid;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg);
+}
+
+/* 标题行嵌在卡片里: 不再自带外框与底色, 否则会看到"卡片套卡片"的双层边框。 */
+.boss-key-setting .compact-row {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.boss-key-recorder {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-height: 40px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--duration-fast), box-shadow var(--duration-fast);
+}
+
+.boss-key-recorder.recording {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary) 15%, transparent);
+}
+
+/* 与开关同一套语义: 未启用时整块压暗, 而不是只把文字变灰 ——
+ * 否则边框和底色仍然亮着, 看起来像"可以点却没反应"。 */
+.boss-key-recorder:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  background: var(--color-bg-sunken);
+}
+
+.boss-key-value {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 右侧的操作提示: 让"这块可以点"这件事在静止状态就可读,
+ * 而不是要用户把鼠标移上去才知道。 */
+.boss-key-hint {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+}
+
+.boss-key-recorder.recording .boss-key-hint {
+  color: var(--color-primary);
+}
+
+.boss-key-recorder:disabled .boss-key-hint {
+  /* 禁用时提示文案不该仍显得可点。 */
+  opacity: 0;
+}

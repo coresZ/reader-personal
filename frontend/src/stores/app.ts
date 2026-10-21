@@ -7,6 +7,7 @@ import {
   getVersionUpdate,
 } from '../api/update'
 import { addReadingStats } from '../api/readingStats'
+import { isTauriRuntime, isWebUiMode } from '../api/transport'
 import type { DesktopUpdateProgress, VersionUpdateInfo } from '../types'
 import { applySystemTheme } from '../utils/systemUi'
 import type { LegadoWebdavConfig } from '../api/webdav'
@@ -97,7 +98,7 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function applyBossKey() {
-    if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return
+    if (!isTauriRuntime()) return
     await invokeRaw('configure_boss_key', {
       shortcut: bossKeyEnabled.value ? bossKeyShortcut.value : null,
     })
@@ -145,7 +146,7 @@ export const useAppStore = defineStore('app', () => {
     mode: NetworkProxyMode = networkProxyMode.value,
     proxyUrl: string = networkProxyUrl.value,
   ) {
-    if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return null
+    if (!isTauriRuntime()) return null
     const status = await invokeRaw<NetworkProxyStatus>('configure_network_proxy', {
       mode,
       proxyUrl: mode === 'manual' ? proxyUrl.trim() : null,
@@ -570,7 +571,7 @@ export const useAppStore = defineStore('app', () => {
   const miniMode = ref(false)
 
   async function syncWindowMode() {
-    if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return
+    if (!isTauriRuntime()) return
     try {
       const mode = await invokeRaw<{ miniMode: boolean; alwaysOnTop: boolean }>('get_window_mode')
       miniMode.value = Boolean(mode?.miniMode)
@@ -580,13 +581,38 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function toggleMiniMode() {
-    if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
+    if (!isTauriRuntime()) {
       throw new Error('迷你模式仅在桌面应用可用')
     }
     const mode = await invokeRaw<{ miniMode: boolean; alwaysOnTop: boolean }>('toggle_mini_mode')
     miniMode.value = Boolean(mode?.miniMode)
     showToast(miniMode.value ? '已进入迷你模式' : '已退出迷你模式', 'success')
     return mode
+  }
+
+  // ─── Web 精简模式 ───
+  /**
+   * 是否运行在浏览器里(由 `src/server` 托管, 不是 Tauri WebView)。
+   *
+   * Web 端的目标只是"用手机躺着看书", 因此**砍掉一切与阅读无关的入口**:
+   * 书海(需多源搜索, 走 ipc::Channel 未实现)、统计、RSS、书源管理、WebDAV、
+   * 版本更新、迷你模式、老板键……留着它们只会让人以为功能坏了。
+   *
+   * 判据统一走 `api/transport` 的 `isWebUiMode()` —— 项目里曾经散着五份
+   * `'__TAURI_INTERNALS__' in window` 字面量, 改一处漏一处就会出现"界面按
+   * 桌面端渲染、接口却按浏览器发"这种自相矛盾的状态。
+   */
+  const isWebMode = computed(() => isWebUiMode())
+
+  /** 集成的导航项在 Web 端是否该显示。 */
+  function isNavVisible(key: 'home' | 'explore' | 'recent' | 'rss'): boolean {
+    if (isWebMode.value) {
+      // Web 端只保留书架与最近阅读 —— 其余都没有可用的后端能力。
+      return key === 'home' || key === 'recent'
+    }
+    if (key === 'recent') return !isFeatureHidden('stats')
+    if (key === 'rss') return !isFeatureHidden('rss')
+    return true
   }
 
   return {
@@ -606,5 +632,6 @@ export const useAppStore = defineStore('app', () => {
     toasts, showToast, dismissToast,
     confirmState, confirmDialog, resolveConfirm,
     hiddenFeatures, isFeatureHidden, toggleHiddenFeature,
+    isWebMode, isNavVisible,
   }
 })

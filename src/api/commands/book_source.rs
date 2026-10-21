@@ -117,9 +117,9 @@ pub struct UsernameParam {
     pub username: Option<String>,
 }
 
-#[tauri::command]
-pub async fn save_book_source(
-    state: tauri::State<'_, AppState>,
+/// `save_book_source` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn save_book_source_core(
+    state: &AppState,
     req: serde_json::Value,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
@@ -132,14 +132,23 @@ pub async fn save_book_source(
     let source_became_available = source_became_available(existing_source.as_ref(), &source);
     state.book_source_service.save(&user_ns, source).await?;
     if source_became_available {
-        invalidate_shelf_book_source_caches(&state, &user_ns).await?;
+        invalidate_shelf_book_source_caches(state, &user_ns).await?;
     }
     Ok(ApiResponse::ok(serde_json::json!({"saved": true})))
 }
 
+/// `save_book_source` 的 Tauri 入口: 只是 core 的薄壳。
 #[tauri::command]
-pub async fn save_book_sources(
+pub async fn save_book_source(
     state: tauri::State<'_, AppState>,
+    req: serde_json::Value,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    save_book_source_core(&state, req).await
+}
+
+/// `save_book_sources` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn save_book_sources_core(
+    state: &AppState,
     req: serde_json::Value,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
@@ -166,7 +175,7 @@ pub async fn save_book_sources(
         // save_many 是"尽力写入"(并发提交, 任一失败仍继续其余写入), 因此返回 Err 时
         // **可能已有部分源入库**。缓存失效必须照常执行, 否则换源结果与刚写入的源
         // 不一致。用 `?` 直接返回会跳过这一步, 留下已入库但缓存陈旧的源。
-        let invalidate_result = invalidate_shelf_book_source_caches(&state, &user_ns).await;
+        let invalidate_result = invalidate_shelf_book_source_caches(state, &user_ns).await;
         // 保存错误优先上报(它更关键), 但不能因此丢掉缓存失效的错误。
         save_result?;
         invalidate_result?;
@@ -178,9 +187,18 @@ pub async fn save_book_sources(
     ))
 }
 
+/// `save_book_sources` 的 Tauri 入口: 只是 core 的薄壳。
 #[tauri::command]
-pub async fn get_book_source(
+pub async fn save_book_sources(
     state: tauri::State<'_, AppState>,
+    req: serde_json::Value,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    save_book_sources_core(&state, req).await
+}
+
+/// `get_book_source` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn get_book_source_core(
+    state: &AppState,
     req: BookSourceUrlParam,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
@@ -197,15 +215,32 @@ pub async fn get_book_source(
     ))
 }
 
+/// `get_book_source` 的 Tauri 入口: 只是 core 的薄壳。
 #[tauri::command]
-pub async fn get_book_sources(
+pub async fn get_book_source(
     state: tauri::State<'_, AppState>,
+    req: BookSourceUrlParam,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    get_book_source_core(&state, req).await
+}
+
+/// `get_book_sources` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn get_book_sources_core(
+    state: &AppState,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
     let list = state.book_source_service.list(&user_ns).await?;
     Ok(ApiResponse::ok(
         serde_json::to_value(list).unwrap_or_default(),
     ))
+}
+
+/// `get_book_sources` 的 Tauri 入口: 只是 core 的薄壳。
+#[tauri::command]
+pub async fn get_book_sources(
+    state: tauri::State<'_, AppState>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    get_book_sources_core(&state).await
 }
 
 #[tauri::command]
@@ -771,9 +806,9 @@ pub async fn delete_invalid_book_sources(
     })))
 }
 
-#[tauri::command]
-pub async fn delete_book_source(
-    state: tauri::State<'_, AppState>,
+/// `delete_book_source` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn delete_book_source_core(
+    state: &AppState,
     req: BookSourceUrlParam,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
@@ -789,9 +824,18 @@ pub async fn delete_book_source(
     Ok(ApiResponse::ok(serde_json::json!({"deleted": true})))
 }
 
+/// `delete_book_source` 的 Tauri 入口: 只是 core 的薄壳。
 #[tauri::command]
-pub async fn delete_book_sources(
+pub async fn delete_book_source(
     state: tauri::State<'_, AppState>,
+    req: BookSourceUrlParam,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    delete_book_source_core(&state, req).await
+}
+
+/// `delete_book_sources` 的共享实现 (Tauri command 与 Web HTTP handler 共用)。
+pub async fn delete_book_sources_core(
+    state: &AppState,
     req: Vec<BookSourceUrlParam>,
 ) -> Result<ApiResponse<serde_json::Value>, AppError> {
     let user_ns = "default";
@@ -816,6 +860,15 @@ pub async fn delete_book_sources(
         .clear_source_cookies(&user_ns, &deleted_list)
         .await;
     Ok(ApiResponse::ok(serde_json::json!({"deleted": true})))
+}
+
+/// `delete_book_sources` 的 Tauri 入口: 只是 core 的薄壳。
+#[tauri::command]
+pub async fn delete_book_sources(
+    state: tauri::State<'_, AppState>,
+    req: Vec<BookSourceUrlParam>,
+) -> Result<ApiResponse<serde_json::Value>, AppError> {
+    delete_book_sources_core(&state, req).await
 }
 
 #[tauri::command]
