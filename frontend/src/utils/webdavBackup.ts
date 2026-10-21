@@ -36,10 +36,10 @@ const BACKUP_VERSION = 2
 /**
  * 不进入备份的 localStorage key。
  *
- * `reader-background-image` / `reader-page-background-image` 存的是整张背景图的
- * base64(实测一张 webp 就有 361 KB), 体积远大于其它所有备份内容之和, 而且每次
- * 备份都会重复带上同一张图。备份应当保存"难以重建的元数据", 背景图是用户手边
- * 就有的文件, 重新选一次的成本远低于它带来的体积与超限风险。
+ * `reader-background-image` / `reader-page-background-image` 存的是图片文件地址
+ * (`http://reader.localhost/files?path=default/backgrounds/...`), 图片本体在
+ * 本机存储目录里 —— 备份到另一台机器后该地址必然失效, 写进备份只会在恢复时留下
+ * 一张打不开的背景。备份保存"难以重建的元数据", 背景图重新选一次即可。
  */
 const LOCAL_STORAGE_KEYS_EXCLUDED = new Set([
   'reader-background-image',

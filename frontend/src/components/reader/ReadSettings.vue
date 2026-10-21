@@ -115,7 +115,7 @@
             type="button"
             :disabled="processingReaderImage"
             :style="config.readerBackgroundImage
-              ? { backgroundImage: `url(${config.readerBackgroundImage})` }
+              ? { backgroundImage: `url('${config.readerBackgroundImage}')` }
               : undefined"
             @click="readerImageInputRef?.click()"
           >
@@ -703,6 +703,7 @@ import {
   prepareReaderBackgroundImage,
   readerOpacityToPercent,
 } from '../../utils/readerBackground'
+import { uploadBackgroundImage } from '../../api/background'
 import {
   HOTKEY_ACTIONS,
   HOTKEY_ACTION_MAP,
@@ -771,7 +772,10 @@ async function handleReaderImageChange(event: Event) {
   if (!file) return
   processingReaderImage.value = true
   try {
-    store.setReaderBackgroundImage(await prepareReaderBackgroundImage(file))
+    // 与桌面背景图一致: 原分辨率上传落盘, 不再为 localStorage 配额压图。
+    const prepared = await prepareReaderBackgroundImage(file)
+    const url = await uploadBackgroundImage('reader', prepared.blob, prepared.fileName)
+    store.setReaderBackgroundImage(url)
     appStore.showToast('阅读页背景图已更新', 'success')
   } catch (error) {
     appStore.showToast((error as Error).message || '背景图片处理失败', 'error')

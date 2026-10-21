@@ -110,6 +110,19 @@ fn main() {
         std::process::exit(1);
     }
 
+    let mut context = tauri::generate_context!();
+    // 每个数据目录一个实例 identifier: 单实例插件按它做互斥量, WebView2 的数据
+    // 目录也按它派生。否则两个便携副本会互相顶掉、共用一份 localStorage
+    // (issue #20 第 4 条)。必须在 build 之前改 —— 插件在 setup 时读取。
+    let paths = match portable::resolve() {
+        Ok(paths) => paths,
+        Err(err) => {
+            win::fatal(&format!("启动失败：{err:#}"));
+            std::process::exit(1);
+        }
+    };
+    context.config_mut().identifier = paths.instance_identifier.clone();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
@@ -123,15 +136,15 @@ fn main() {
         }))
         .invoke_handler(reader_rust::api::invoke_handler())
         .register_asynchronous_uri_scheme_protocol("reader", handle_reader_scheme)
-        .setup(|app| {
-            if let Err(err) = start(app) {
+        .setup(move |app| {
+            if let Err(err) = start(app, &paths) {
                 let message = format!("启动失败：{err:#}");
                 win::fatal(&message);
                 return Err(message.into());
             }
             Ok(())
         })
-        .build(tauri::generate_context!());
+        .build(context);
 
     let app = match app {
         Ok(app) => app,
@@ -151,13 +164,21 @@ fn main() {
     });
 }
 
-fn start(app: &mut App) -> anyhow::Result<()> {
-    let paths = portable::resolve()?;
-
+fn start(app: &mut App, paths: &portable::Paths) -> anyhow::Result<()> {
     if paths.relocated_notice {
         win::warn(&format!(
             "程序所在目录不可写，书库数据已改存到：\n{}",
             paths.data_dir.display()
+        ));
+    }
+    // 旧版浏览器数据(主题、字号、书架筛选等界面偏好)被占用没搬过来时要说一声,
+    // 否则用户只会看到"升级后设置全没了"。说明文件里有手动迁移的步骤。
+    if let Some(notice) = &paths.webview_migration_skipped {
+        win::warn(&format!(
+            "旧版界面设置仍在被另一个旧窗口使用，本次未自动迁移。\n\n\
+             详情：\n{}\n\n\
+             （书库、书源、阅读进度不受影响。）",
+            notice.display()
         ));
     }
 
@@ -193,7 +214,16 @@ fn start(app: &mut App) -> anyhow::Result<()> {
         .inner_size(InitialGeometry::DEFAULT_WIDTH, InitialGeometry::DEFAULT_HEIGHT)
         .min_inner_size(min_width, min_height)
         // Custom title bar drawn by the frontend; this hides the native frame.
-        .decorations(false)
+        // 自定义标题栏: 隐藏原生边框。
+        .decorations(false);
+    // WebView2 默认把 profile 放在 `%LOCALAPPDATA%\<identifier>`, 与程序目录
+    // 无关 —— 两个便携副本会共用同一份 localStorage(issue #20 第 4 条)。
+    // 显式指到数据目录下, 让"拷一个文件夹"真的带走全部状态。
+    // 只有 Windows 支持自定义 profile 目录; macOS/Linux 的等价开关是另一种 API,
+    // 那边本来就按 identifier 分开, 不需要改。
+    #[cfg(target_os = "windows")]
+    let window = window.data_directory(paths.webview_data.clone());
+    let window = window
         .center()
         // 先不显示。Tauri 默认为 visible(true), 于是窗口在 WebView2 尚未渲染出
         // 首帧时就弹出来, 用户先看到一块白板 —— 这正是启动白闪的第一段。

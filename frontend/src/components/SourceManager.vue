@@ -60,7 +60,7 @@
               :selected-urls="selectedSourceUrls"
               :active-url="editingSource?.bookSourceUrl"
               :empty-title="sources.length ? '没有匹配的书源' : '暂无书源'"
-              :empty-description="sources.length ? '调整搜索关键词或分组筛选后再试' : '可以本地导入、远程同步或手动新增'"
+              :empty-description="sources.length ? '调整搜索关键词或分组筛选后再试' : '可以本地导入、网络导入或手动新增'"
               @edit="editSource"
               @toggle-enabled="toggleSource"
               @toggle-selection="toggleSourceSelection"
@@ -927,10 +927,10 @@ async function importRemoteSource() {
     }
     await saveBookSources(parsed)
     touchSubscription(targetUrl)
-    appStore.showToast(`成功同步 ${parsed.length} 个书源`, 'success')
+    appStore.showToast(`成功导入 ${parsed.length} 个书源`, 'success')
     await loadSources()
   } catch (e: unknown) {
-    appStore.showToast((e as Error).message || '远程同步失败', 'error')
+    appStore.showToast((e as Error).message || '网络导入失败', 'error')
   } finally {
     syncingSubscriptionUrl.value = ''
   }
@@ -944,7 +944,7 @@ function saveSubscription() {
   if (!subscriptions.value.find((item) => item.url === remoteUrl.value)) {
     subscriptions.value.unshift({ url: remoteUrl.value })
     persistSubscriptions()
-    appStore.showToast('订阅已保存', 'success')
+    appStore.showToast('导入链接已保存', 'success')
   }
 }
 

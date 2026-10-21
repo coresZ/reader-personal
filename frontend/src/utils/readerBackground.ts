@@ -5,8 +5,15 @@ const SUPPORTED_IMAGE_TYPES = new Set([
   'image/bmp',
 ])
 
-const MAX_SOURCE_BYTES = 20 * 1024 * 1024
-const MAX_STORED_LENGTH = 2_000_000
+/** 原图上限。落盘后不再受 localStorage 5MB 配额约束, 但仍要挡掉异常巨大的文件;
+ *  与后端 `MAX_BACKGROUND_IMAGE_BYTES` 保持一致。 */
+export const MAX_BACKGROUND_SOURCE_BYTES = 48 * 1024 * 1024
+
+/**
+ * WebView 的位图尺寸上限是 16384px，超过后整张图解码失败（背景直接不显示）。
+ * 8192 足够覆盖 4K / 5K 屏的双倍图，又留出安全余量。
+ */
+export const MAX_BACKGROUND_DIMENSION = 8192
 
 export const DEFAULT_READER_BACKGROUND_OPACITY = 0.35
 
@@ -55,12 +62,53 @@ export function percentToReaderOpacity(percent: unknown): number | null {
   return Math.round(clamped) / 100
 }
 
-export async function prepareReaderBackgroundImage(file: File) {
+/** 背景图要落盘的像素尺寸。
+ *
+ *  背景图**不做有损压缩**: 以前这里会等比缩到 1600px 再按 0.58 质量编码成
+ *  webp, 3840x2160 的图存进来只剩 1600x900, 铺到 4K 屏上自然发糊(issue #20
+ *  第 1 条)。现在只在超过 WebView 位图上限时等比缩小(无损编码), 其余情况原样
+ *  上传, 由 `background-size: cover` 在渲染期缩放。
+ */
+export function backgroundOutputSize(
+  width: number,
+  height: number,
+  maxDimension = MAX_BACKGROUND_DIMENSION,
+): { width: number; height: number } {
+  const longest = Math.max(width, height)
+  if (!Number.isFinite(longest) || longest <= 0) {
+    throw new Error('无法读取该图片')
+  }
+  if (longest <= maxDimension) {
+    return { width: Math.round(width), height: Math.round(height) }
+  }
+  const scale = maxDimension / longest
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  }
+}
+
+export interface PreparedBackgroundImage {
+  /** 要上传的字节。非 BMP、尺寸未超限时就是用户选的原文件。 */
+  blob: Blob
+  /** 上传时用于推导扩展名的文件名。 */
+  fileName: string
+}
+
+/** 校验并准备要保存到磁盘的背景图。
+ *
+ *  必须保持**原始分辨率**: 存进 localStorage 的时代受 5MB 配额限制, 只能把图
+ *  缩到 1600px 再压 webp; 现在字节直接落盘(`storage/assets/default/backgrounds`),
+ *  只在两种情况下重新编码:
+ *  - BMP: 浏览器能解码但体积巨大(BMP 无压缩), 无损转成 PNG;
+ *  - 边长超过 `MAX_BACKGROUND_DIMENSION`: 等比缩小, 否则 WebView 解码失败。
+ */
+export async function prepareReaderBackgroundImage(file: File): Promise<PreparedBackgroundImage> {
   if (!SUPPORTED_IMAGE_TYPES.has(file.type)) {
     throw new Error('请选择 JPG、PNG、WebP 或 BMP 图片')
   }
-  if (file.size > MAX_SOURCE_BYTES) {
-    throw new Error('背景图片不能超过 20 MB')
+  if (file.size > MAX_BACKGROUND_SOURCE_BYTES) {
+    throw new Error('背景图片不能超过 48 MB')
   }
 
   let bitmap: ImageBitmap
@@ -73,32 +121,54 @@ export async function prepareReaderBackgroundImage(file: File) {
     if (!bitmap.width || !bitmap.height) {
       throw new Error('无法读取该图片')
     }
-
-    const attempts = [
-      { maxDimension: 2400, quality: 0.86 },
-      { maxDimension: 1920, quality: 0.72 },
-      { maxDimension: 1600, quality: 0.58 },
-    ]
-    for (const attempt of attempts) {
-      const dataUrl = renderBackgroundImage(bitmap, attempt.maxDimension, attempt.quality)
-      if (dataUrl.length <= MAX_STORED_LENGTH) return dataUrl
+    const target = backgroundOutputSize(bitmap.width, bitmap.height)
+    const mustReencode = file.type === 'image/bmp'
+      || target.width !== bitmap.width
+      || target.height !== bitmap.height
+    if (!mustReencode) {
+      // 扩展名按 MIME 类型给, 不用原文件名: 有的 JPG 存成 `.jfif`/`.jpe`,
+      // 后端只接受白名单扩展名, 直接沿用原名字会被拒。
+      return {
+        blob: file,
+        fileName: backgroundUploadFileName(file.name, file.type),
+      }
     }
+    // PNG 是无损的: 重新编码不会引入压缩劣化, 只是把 BMP 的 24bit 原始像素
+    // 换成压缩后的容器。缩小过的图同样走 PNG。
+    const blob = await renderBackgroundImage(bitmap, target.width, target.height)
+    return { blob, fileName: replaceExtension(file.name, 'png') }
   } finally {
     bitmap.close()
   }
-
-  throw new Error('图片内容过大，请选择更简单或尺寸更小的图片')
 }
 
-function renderBackgroundImage(bitmap: ImageBitmap, maxDimension: number, quality: number) {
-  const scale = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height))
-  const width = Math.max(1, Math.round(bitmap.width * scale))
-  const height = Math.max(1, Math.round(bitmap.height * scale))
+function extensionForType(type: string) {
+  if (type === 'image/png') return 'png'
+  if (type === 'image/webp') return 'webp'
+  return 'jpg'
+}
+
+/** 上传用的文件名: 原文件名的可读部分 + 后端白名单里的扩展名。 */
+export function backgroundUploadFileName(name: string, type: string) {
+  return replaceExtension(name, extensionForType(type))
+}
+
+function replaceExtension(name: string, extension: string) {
+  const base = name.replace(/\.[^./\\]+$/, '') || 'background'
+  return `${base}.${extension}`
+}
+
+function renderBackgroundImage(bitmap: ImageBitmap, width: number, height: number) {
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
   const context = canvas.getContext('2d')
   if (!context) throw new Error('当前环境无法处理图片')
   context.drawImage(bitmap, 0, 0, width, height)
-  return canvas.toDataURL('image/webp', quality)
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob)
+      else reject(new Error('图片编码失败，请更换图片后重试'))
+    }, 'image/png')
+  })
 }

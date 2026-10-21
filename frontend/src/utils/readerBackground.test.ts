@@ -2,8 +2,11 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_READER_BACKGROUND_OPACITY,
   DEFAULT_READER_PANEL_OPACITY,
+  MAX_BACKGROUND_DIMENSION,
   READER_BACKGROUND_OPACITY_STEP,
   READER_PANEL_OPACITY_MIN,
+  backgroundOutputSize,
+  backgroundUploadFileName,
   normalizeReaderBackgroundOpacity,
   normalizeReaderPanelOpacity,
   percentToReaderOpacity,
@@ -85,5 +88,41 @@ describe('opacity percentage input', () => {
     for (const percent of [0, 1, 17, 35, 50, 99, 100]) {
       expect(readerOpacityToPercent(percentToReaderOpacity(percent))).toBe(percent)
     }
+  })
+})
+
+describe('background image output size', () => {
+  it('keeps a 4K image at its original resolution', () => {
+    // issue #20 第 1 条: 以前一律缩到 1600px 再压 0.58 质量 webp, 4K 图必然发糊。
+    expect(backgroundOutputSize(3840, 2160)).toEqual({ width: 3840, height: 2160 })
+    expect(backgroundOutputSize(1920, 1080)).toEqual({ width: 1920, height: 1080 })
+  })
+
+  it('only shrinks what the webview could not decode', () => {
+    const size = backgroundOutputSize(20000, 10000)
+    expect(size.width).toBe(MAX_BACKGROUND_DIMENSION)
+    expect(size.height).toBe(MAX_BACKGROUND_DIMENSION / 2)
+  })
+
+  it('preserves the aspect ratio when shrinking', () => {
+    const size = backgroundOutputSize(10000, 5000, 4000)
+    expect(size).toEqual({ width: 4000, height: 2000 })
+  })
+
+  it('rejects images without usable dimensions', () => {
+    expect(() => backgroundOutputSize(0, 0)).toThrow()
+  })
+})
+
+describe('background upload file name', () => {
+  it('rewrites the extension from the MIME type', () => {
+    // 后端只收 png/jpg/jpeg/webp 扩展名, `.jfif` 这类会被拒。
+    expect(backgroundUploadFileName('壁纸.jfif', 'image/jpeg')).toBe('壁纸.jpg')
+    expect(backgroundUploadFileName('a.b.png', 'image/png')).toBe('a.b.png')
+    expect(backgroundUploadFileName('shot.WEBP', 'image/webp')).toBe('shot.webp')
+  })
+
+  it('keeps a readable name when the file has none', () => {
+    expect(backgroundUploadFileName('', 'image/jpeg')).toBe('background.jpg')
   })
 })

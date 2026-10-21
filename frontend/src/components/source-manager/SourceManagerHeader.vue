@@ -19,7 +19,7 @@
         </svg>
       </button>
       <button class="action-btn" type="button" @click="$emit('import-local')">本地导入</button>
-      <button class="action-btn" type="button" @click="$emit('open-subscriptions')">远程同步</button>
+      <button class="action-btn" type="button" @click="$emit('open-subscriptions')">网络导入</button>
       <button class="action-btn" type="button" @click="$emit('export')">导出</button>
       <button
         class="action-btn"
@@ -136,6 +136,12 @@ defineEmits<{
   justify-content: center;
   padding: 8px 12px;
   font-size: 13px;
+  /* 显式回到常规字重。`styles/global.css` 里有一份**不限定作用域**的
+   * `.action-btn`(给设置抽屉、WebDAV 等处的粗体方案按钮用), 它会命中这里的
+   * 按钮 —— 本组件原本没写 font-weight, 继承 body 的 400, 于是整排工具栏按钮
+   * 被悄悄加粗了。scoped 只是把选择器变成 `.action-btn[data-v-*]`, 特异性更高,
+   * 但**不声明这个属性就压不住**全局那条。 */
+  font-weight: 400;
   white-space: nowrap;
 }
 

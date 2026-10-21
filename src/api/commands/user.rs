@@ -310,6 +310,119 @@ pub async fn delete_book_cover(
     Ok(ApiResponse::ok(Value::Null))
 }
 
+/* ─── 背景图 ───
+ *  与自定义封面同一套思路: 图片字节落到 storage/assets/default/backgrounds/,
+ *  前端只在 readConfig 里保存 reader://files?path=... 的 URL。
+ *
+ *  以前背景图以 base64 dataURL 存在 localStorage 里, 受 5MB 配额限制, 只能把
+ *  图片缩到 1600px 再按 0.58 质量压成 webp —— 3840x2160 的图存进来就糊了
+ *  (issue #20 第 1 条)。落盘后不再需要为配额让步。 */
+
+const MAX_BACKGROUND_IMAGE_BYTES: usize = 48 * 1024 * 1024;
+const BACKGROUND_CATEGORY: &str = "backgrounds";
+
+/// 与 protocol.rs 的 mime_from_ext 对齐: 这里存什么扩展名, 前端就要能按图片取回。
+const BACKGROUND_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+
+/// 两张背景图(桌面 / 阅读页)共用目录, 用文件名前缀区分, 便于清理时只删对应那张。
+const BACKGROUND_KINDS: [&str; 2] = ["desktop", "reader"];
+
+fn background_dir(state: &AppState) -> PathBuf {
+    PathBuf::from(&state.config.storage_dir)
+        .join("assets")
+        .join("default")
+        .join(BACKGROUND_CATEGORY)
+}
+
+fn background_url(file_name: &str) -> String {
+    format!(
+        "{}/files?path=default/{BACKGROUND_CATEGORY}/{file_name}",
+        crate::api::protocol::reader_scheme_origin()
+    )
+}
+
+/// 从 URL 里取出本应用 backgrounds 目录下的文件名; 其它地址返回 None。
+///
+/// 与封面同样严格: 只认 `upload_background_image` 生成的形式(前缀 + 纯 hex +
+/// 白名单扩展名), 否则任意 URL 都能让删除命令去动磁盘文件。
+fn background_file_name_from_url(url: &str) -> Option<String> {
+    let prefix = format!(
+        "{}/files?path=default/{BACKGROUND_CATEGORY}/",
+        crate::api::protocol::reader_scheme_origin()
+    );
+    let file_name = url.strip_prefix(&prefix)?;
+    let (stem, extension) = file_name.rsplit_once('.')?;
+    if !BACKGROUND_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) {
+        return None;
+    }
+    let (kind, id) = stem.split_once('-')?;
+    if !BACKGROUND_KINDS.contains(&kind) {
+        return None;
+    }
+    if id.is_empty() || !id.chars().all(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(file_name.to_string())
+}
+
+/// 背景图是桌面图还是阅读页图。与前端 `BACKGROUND_KIND_HEADER` 一致。
+///
+/// 走 IPC header 而不是普通参数: `invokeUpload` 把整个 payload 当二进制 body
+/// 交给 Tauri, 放不进对象里的普通参数(见 `decode_header_file_name` 的说明)。
+pub const BACKGROUND_KIND_HEADER: &str = "x-reader-background-kind";
+
+#[tauri::command]
+pub async fn upload_background_image(
+    state: tauri::State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<ApiResponse<String>, AppError> {
+    let kind = request
+        .headers()
+        .get(BACKGROUND_KIND_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if !BACKGROUND_KINDS.contains(&kind.as_str()) {
+        return Err(AppError::BadRequest("背景图类型无效".to_string()));
+    }
+    let file = decode_upload_body(request.body())?;
+    if file.is_empty() || file.len() > MAX_BACKGROUND_IMAGE_BYTES {
+        return Err(AppError::BadRequest("背景图片为空或超过 48 MB".to_string()));
+    }
+    let file_name = decode_header_file_name(&request)?;
+    let extension = PathBuf::from(&file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|value| BACKGROUND_EXTENSIONS.contains(&value.as_str()))
+        .ok_or_else(|| {
+            AppError::BadRequest("仅支持 PNG、JPG 和 WebP 图片".to_string())
+        })?;
+    // 文件名不含用户输入(原文件名可能带路径分隔符), 只用 kind + UUID。
+    let stored_name = format!("{kind}-{}.{extension}", uuid::Uuid::new_v4().simple());
+    let dir = background_dir(&state);
+    fs::create_dir_all(&dir)
+        .await
+        .map_err(|error| AppError::Internal(error.into()))?;
+    fs::write(dir.join(&stored_name), file)
+        .await
+        .map_err(|error| AppError::Internal(error.into()))?;
+    Ok(ApiResponse::ok(background_url(&stored_name)))
+}
+
+#[tauri::command]
+pub async fn delete_background_image(
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<ApiResponse<Value>, AppError> {
+    let Some(file_name) = background_file_name_from_url(&url) else {
+        // 旧版存的是 dataURL, 或地址不是本应用生成的 —— 没有文件要删。
+        return Ok(ApiResponse::ok(Value::Null));
+    };
+    let _ = fs::remove_file(background_dir(&state).join(file_name)).await;
+    Ok(ApiResponse::ok(Value::Null))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +536,72 @@ mod tests {
     #[test]
     fn cover_size_limit_is_eight_megabytes() {
         assert_eq!(MAX_BOOK_COVER_BYTES, 8 * 1024 * 1024);
+    }
+
+    fn valid_background_url(name: &str) -> String {
+        format!(
+            "{}/files?path=default/{BACKGROUND_CATEGORY}/{name}",
+            crate::api::protocol::reader_scheme_origin()
+        )
+    }
+
+    #[test]
+    fn background_url_round_trips_through_the_parser() {
+        for stored in ["desktop-0123456789abcdef.png", "reader-deadbeef.webp"] {
+            let url = background_url(stored);
+            assert_eq!(
+                background_file_name_from_url(&url).as_deref(),
+                Some(stored),
+                "环回失败: {url}"
+            );
+        }
+    }
+
+    /// 背景图与封面/字体分属不同目录: 前缀对不上就不能让删除命令去碰别的文件。
+    #[test]
+    fn background_parser_rejects_other_categories() {
+        let coverish = format!(
+            "{}/files?path=default/{BOOK_COVER_CATEGORY}/desktop-deadbeef.png",
+            crate::api::protocol::reader_scheme_origin()
+        );
+        assert!(background_file_name_from_url(&coverish).is_none());
+
+        let cases = [
+            // 旧版 dataURL: 没有文件要删
+            "data:image/webp;base64,dGVzdA==".to_string(),
+            // 缺少 kind 前缀
+            valid_background_url("deadbeef.png"),
+            // kind 不在白名单
+            valid_background_url("banner-deadbeef.png"),
+            // 路径穿越
+            valid_background_url("desktop-../secrets.png"),
+            valid_background_url("desktop-../../bookSource.json"),
+            valid_background_url("desktop-sub/dir.png"),
+            // 扩展名不在图片白名单
+            valid_background_url("desktop-deadbeef.exe"),
+            valid_background_url("desktop-deadbeef.svg"),
+            // 空文件名 / 非法 hex
+            valid_background_url("desktop-.png"),
+            valid_background_url("desktop-my-bg.png"),
+            String::new(),
+            "not a url".to_string(),
+        ];
+        for case in &cases {
+            assert!(background_file_name_from_url(case).is_none(), "应拒绝: {case}");
+        }
+    }
+
+    #[test]
+    fn background_upload_accepts_every_supported_extension() {
+        for extension in BACKGROUND_EXTENSIONS {
+            let name = format!("reader-deadbeef.{extension}");
+            assert!(background_file_name_from_url(&valid_background_url(&name)).is_some());
+        }
+    }
+
+    #[test]
+    fn background_upload_limit_is_above_the_old_dataurl_budget() {
+        // 落盘后不再受 localStorage 5MB 配额约束, 20MB 的 4K 原图能原样保存。
+        assert!(MAX_BACKGROUND_IMAGE_BYTES >= 20 * 1024 * 1024);
     }
 }

@@ -54,6 +54,7 @@ import {
   type LegadoBookProgress,
 } from '../api/webdav'
 import { deleteCustomFont, listCustomFonts, uploadCustomFont, type CustomFontEntry } from '../api/fonts'
+import { deleteBackgroundImage } from '../api/background'
 import { readSavedReadingPosition } from '../utils/readingPosition'
 
 const READER_SESSION_KEY = 'reader-last-session'
@@ -128,7 +129,7 @@ export interface ReadConfig {
   applyBackgroundToReader: boolean
   /** 阅读页背景色, '' 表示跟随主题。 */
   readerBackgroundColor: string
-  /** 阅读页专属背景图(dataURL), 与桌面背景图相互独立。 */
+  /** 阅读页专属背景图(reader:// 的 URL), 与桌面背景图相互独立。 */
   readerBackgroundImage: string
   /** 阅读页背景图透明度。 */
   readerImageOpacity: number
@@ -484,7 +485,7 @@ export const useReaderStore = defineStore('reader', () => {
 
   function saveConfig() {
     const persistedConfig: Partial<ReadConfig> = { ...config }
-    // 两张背景图都是 dataURL, 各自存在独立的 localStorage key 里, 不进 readConfig。
+    // 两张背景图都是落盘的图片地址, 各自存在独立的 localStorage key 里, 不进 readConfig。
     delete persistedConfig.backgroundImage
     delete persistedConfig.readerBackgroundImage
     localStorage.setItem('readConfig', JSON.stringify(persistedConfig))
@@ -566,32 +567,46 @@ export const useReaderStore = defineStore('reader', () => {
   /** 设置界面矩阵: 供 UI 直接读取动作元信息。 */
   const hotkeyActions = HOTKEY_ACTION_MAP
 
-  function setBackgroundImage(dataUrl: string) {
+  function setBackgroundImage(url: string) {
+    const previous = config.backgroundImage
     try {
-      localStorage.setItem(READER_BACKGROUND_IMAGE_KEY, dataUrl)
-      config.backgroundImage = dataUrl
+      localStorage.setItem(READER_BACKGROUND_IMAGE_KEY, url)
+      config.backgroundImage = url
     } catch {
       throw new Error('背景图片保存失败，请选择尺寸更小的图片')
+    }
+    // 换图后把上一张落盘文件删掉, 否则每换一次都会在 storage 里留一份孤儿图片。
+    // 旧版存的是 dataURL, 后端只认自己生成的 URL, 传进去是空操作。
+    if (previous && previous !== url) {
+      void deleteBackgroundImage(previous).catch(() => undefined)
     }
   }
 
   function clearBackgroundImage() {
+    const previous = config.backgroundImage
     localStorage.removeItem(READER_BACKGROUND_IMAGE_KEY)
     config.backgroundImage = ''
+    if (previous) void deleteBackgroundImage(previous).catch(() => undefined)
   }
 
-  function setReaderBackgroundImage(dataUrl: string) {
+  function setReaderBackgroundImage(url: string) {
+    const previous = config.readerBackgroundImage
     try {
-      localStorage.setItem(READER_PAGE_BACKGROUND_IMAGE_KEY, dataUrl)
-      config.readerBackgroundImage = dataUrl
+      localStorage.setItem(READER_PAGE_BACKGROUND_IMAGE_KEY, url)
+      config.readerBackgroundImage = url
     } catch {
       throw new Error('阅读页背景图片保存失败，请选择尺寸更小的图片')
+    }
+    if (previous && previous !== url) {
+      void deleteBackgroundImage(previous).catch(() => undefined)
     }
   }
 
   function clearReaderBackgroundImage() {
+    const previous = config.readerBackgroundImage
     localStorage.removeItem(READER_PAGE_BACKGROUND_IMAGE_KEY)
     config.readerBackgroundImage = ''
+    if (previous) void deleteBackgroundImage(previous).catch(() => undefined)
   }
 
   /** 两个方向的转换函数。以前只加载 traditionalized, 「简体」档因此无从转换 ——

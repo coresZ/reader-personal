@@ -294,7 +294,7 @@
                     class="background-preview"
                     :class="{ empty: !readerStore.config.backgroundImage }"
                     :style="readerStore.config.backgroundImage
-                      ? { backgroundImage: `url(${readerStore.config.backgroundImage})` }
+                      ? { backgroundImage: `url('${readerStore.config.backgroundImage}')` }
                       : undefined"
                   ></span>
                   <span>{{ processingBackground ? '正在处理' : (readerStore.config.backgroundImage ? '更换图片' : '选择图片') }}</span>
@@ -413,6 +413,7 @@ import {
   readerOpacityToPercent,
 } from '../utils/readerBackground'
 import { captureBossKey, formatBossKey } from '../utils/bossKey'
+import { uploadBackgroundImage } from '../api/background'
 
 const props = defineProps<{
   modelValue: boolean
@@ -619,8 +620,10 @@ async function handleBackgroundImageChange(event: Event) {
   if (!file) return
   processingBackground.value = true
   try {
-    const dataUrl = await prepareReaderBackgroundImage(file)
-    readerStore.setBackgroundImage(dataUrl)
+    // 原分辨率上传, 由后端落盘 —— 不再压到 1600px(issue #20 第 1 条)。
+    const prepared = await prepareReaderBackgroundImage(file)
+    const url = await uploadBackgroundImage('desktop', prepared.blob, prepared.fileName)
+    readerStore.setBackgroundImage(url)
     appStore.showToast('桌面背景已更新', 'success')
   } catch (error) {
     appStore.showToast((error as Error).message || '背景图片处理失败', 'error')

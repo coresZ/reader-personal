@@ -143,6 +143,8 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
         commands::user::delete_custom_font,
         commands::user::upload_book_cover,
         commands::user::delete_book_cover,
+        commands::user::upload_background_image,
+        commands::user::delete_background_image,
         commands::webdav::get_webdav_file_list,
         commands::webdav::get_webdav_file,
         commands::webdav::save_webdav_file_as,

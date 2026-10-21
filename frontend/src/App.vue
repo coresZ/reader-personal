@@ -103,7 +103,7 @@ const customBackgroundStyle = computed(() => {
     && Boolean(readerStore.config.readerBackgroundImage)
   return {
     // 图铺在外壳最底层(标题栏也在其中), 因此标题栏必须透明才能透出背景。
-    backgroundImage: shellBackgroundImage.value ? `url(${shellBackgroundImage.value})` : undefined,
+    backgroundImage: shellBackgroundImage.value ? `url("${shellBackgroundImage.value}")` : undefined,
     opacity: usingReaderImage
       ? readerStore.config.readerImageOpacity
       : readerStore.config.backgroundOpacity,
@@ -202,7 +202,14 @@ body {
   background-repeat: no-repeat;
   background-size: cover;
   pointer-events: none;
-  transition: opacity var(--duration-normal);
+  /* 这里**不能**加 opacity 过渡。
+   *
+   * 切换页面时「铺哪张图」和「用哪个透明度」是在同一帧一起变的: 从书架进阅读页
+   * 会同时换成阅读页专属图并使用 readerImageOpacity。若 opacity 还在 transition,
+   * 新图会先以旧图的透明度渲染整个过渡时长 —— 阅读页背景透明度设成 0 时最刺眼:
+   * 阅读图先以桌面图的 100% 不透明度整张闪一下, 再淡出成透明(issue #20 第 2 条)。
+   *
+   * 透明度滑块每次 input 都会更新, 不需要过渡来"看起来平滑"。 */
 }
 
 .app-shell > .titlebar {

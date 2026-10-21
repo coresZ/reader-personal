@@ -364,12 +364,12 @@ describe('backup payload v2', () => {
     // 自定义快捷键存在**独立的** localStorage key 里(不随 readConfig 走),
     // 漏在备份清单外时恢复后按键会静默丢失 —— 它必须进备份。
     //
-    // 背景图相反: 一张 webp base64 就有 361 KB, 比其余所有备份内容之和还大得多,
-    // 每次备份都重复带同一张图。备份只存"难以重建的元数据", 图是用户手边的文件,
+    // 背景图相反: 存的是本机文件地址(图片本体在存储目录里), 换一台机器就失效,
+    // 进备份只会在恢复时留下一张打不开的背景。备份只存"难以重建的元数据",
     // 因此显式排除(见 webdavBackup.ts 的 LOCAL_STORAGE_KEYS_EXCLUDED)。
     const store: Record<string, string> = {
-      'reader-background-image': 'data:image/webp;base64,MAINDESKTOP',
-      'reader-page-background-image': 'data:image/png;base64,AAAAREADER',
+      'reader-background-image': 'http://reader.localhost/files?path=default/backgrounds/desktop-1.png',
+      'reader-page-background-image': 'http://reader.localhost/files?path=default/backgrounds/reader-1.png',
       'reader-hotkeys': JSON.stringify({ 'Control+f': ['search'] }),
     }
     vi.stubGlobal('localStorage', {

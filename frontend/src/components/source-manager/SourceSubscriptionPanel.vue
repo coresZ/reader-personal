@@ -4,8 +4,8 @@
       <section class="subscription-panel">
         <header class="subscription-header">
           <div>
-            <h3>远程书源同步</h3>
-            <p>保存书源合集链接，后续可以一键同步更新。</p>
+            <h3>网络导入</h3>
+            <p>填一个书源合集链接即可导入；保存后可以随时一键重新导入更新。</p>
           </div>
           <button class="icon-btn" type="button" title="关闭" @click="$emit('close')">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -23,16 +23,16 @@
           />
           <button class="action-btn primary" type="button" :disabled="syncing" @click="$emit('sync')">
             <span v-if="syncing" class="spinner" aria-hidden="true"></span>
-            {{ syncing ? '同步中…' : '立即同步' }}
+            {{ syncing ? '导入中…' : '立即导入' }}
           </button>
-          <button class="action-btn" type="button" @click="$emit('save')">保存订阅</button>
+          <button class="action-btn" type="button" @click="$emit('save')">保存链接</button>
         </div>
 
         <div v-if="subscriptions.length" class="subscription-list">
           <article v-for="item in subscriptions" :key="item.url" class="subscription-item">
             <div class="subscription-main">
               <span class="subscription-url">{{ item.url }}</span>
-              <span v-if="item.lastSyncedAt" class="subscription-time">上次同步 {{ formatTime(item.lastSyncedAt) }}</span>
+              <span v-if="item.lastSyncedAt" class="subscription-time">上次导入 {{ formatTime(item.lastSyncedAt) }}</span>
             </div>
             <div class="subscription-actions">
               <button
@@ -42,13 +42,13 @@
                 @click="$emit('sync-subscription', item.url)"
               >
                 <span v-if="syncingUrl === item.url" class="spinner" aria-hidden="true"></span>
-                {{ syncingUrl === item.url ? '同步中' : '同步' }}
+                {{ syncingUrl === item.url ? '导入中' : '重新导入' }}
               </button>
               <button class="mini-btn danger" type="button" :disabled="syncing" @click="$emit('remove-subscription', item.url)">删除</button>
             </div>
           </article>
         </div>
-        <div v-else class="subscription-empty">还没有保存的远程订阅。</div>
+        <div v-else class="subscription-empty">还没有保存的网络导入记录。</div>
       </section>
     </div>
   </Transition>
@@ -202,6 +202,9 @@ function formatTime(ts: number) {
   gap: 6px;
   padding: 0 12px;
   font-size: 13px;
+  /* 与 SourceManagerHeader 同一原因: 不写就会被 global.css 里那份不限作用域的
+   * `.action-btn` 的 600 命中, 按钮凭空变粗。 */
+  font-weight: 400;
   white-space: nowrap;
 }
 
