@@ -40,6 +40,11 @@ vi.mock('../utils/recentBooks', () => ({
   saveRecentReadBook: vi.fn(),
 }))
 
+vi.mock('../api/background', () => ({
+  deleteBackgroundImage: vi.fn(() => Promise.resolve(null)),
+  uploadBackgroundImage: vi.fn(),
+}))
+
 vi.mock('../utils/openaiSpeech', () => ({
   DEFAULT_OPENAI_BASE_URL: 'https://api.openai.com/v1',
   inferSpeechApiFormat: vi.fn(() => 'openai'),
@@ -539,7 +544,7 @@ describe('reader local txt chapters', () => {
 
   it('persists and removes a custom reading background', () => {
     const readerStore = useReaderStore()
-    const image = 'data:image/webp;base64,dGVzdA=='
+    const image = 'http://reader.localhost/files?path=default/backgrounds/desktop-abc.png'
 
     readerStore.setBackgroundImage(image)
     readerStore.updateConfig('backgroundOpacity', 0.6)
@@ -1553,8 +1558,8 @@ describe('reader page background image', () => {
 
   it('stores the reader image separately from the desktop image', () => {
     const readerStore = useReaderStore()
-    const desktop = 'data:image/webp;base64,ZGVza3RvcA=='
-    const reader = 'data:image/webp;base64,cmVhZGVy'
+    const desktop = 'http://reader.localhost/files?path=default/backgrounds/desktop-aaaa.png'
+    const reader = 'http://reader.localhost/files?path=default/backgrounds/reader-bbbb.png'
 
     readerStore.setBackgroundImage(desktop)
     readerStore.setReaderBackgroundImage(reader)
@@ -1568,10 +1573,10 @@ describe('reader page background image', () => {
 
   it('clears only the reader image', () => {
     const readerStore = useReaderStore()
-    const desktop = 'data:image/webp;base64,ZGVza3RvcA=='
+    const desktop = 'http://reader.localhost/files?path=default/backgrounds/desktop-aaaa.png'
 
     readerStore.setBackgroundImage(desktop)
-    readerStore.setReaderBackgroundImage('data:image/webp;base64,cmVhZGVy')
+    readerStore.setReaderBackgroundImage('http://reader.localhost/files?path=default/backgrounds/reader-bbbb.png')
     readerStore.clearReaderBackgroundImage()
 
     expect(readerStore.config.readerBackgroundImage).toBe('')
@@ -1579,9 +1584,30 @@ describe('reader page background image', () => {
     expect(localStorage.removeItem).toHaveBeenCalledWith('reader-page-background-image')
   })
 
+  /** 换图/清空要把上一张的落盘文件删掉, 否则 storage 里会越积越多孤儿图片。 */
+  it('deletes the previous background file when replacing or clearing', async () => {
+    const readerStore = useReaderStore()
+    const { deleteBackgroundImage } = await import('../api/background')
+    // mock 是模块级的, 前面的用例也会换图 —— 先清掉它们的调用记录。
+    vi.mocked(deleteBackgroundImage).mockClear()
+    const first = 'http://reader.localhost/files?path=default/backgrounds/desktop-aaaa.png'
+    const second = 'http://reader.localhost/files?path=default/backgrounds/desktop-bbbb.png'
+
+    readerStore.setBackgroundImage(first)
+    readerStore.setBackgroundImage(second)
+    // 同一张图重复设置不该删掉正在用的文件。
+    readerStore.setBackgroundImage(second)
+    expect(deleteBackgroundImage).toHaveBeenCalledTimes(1)
+    expect(deleteBackgroundImage).toHaveBeenCalledWith(first)
+
+    readerStore.clearBackgroundImage()
+    expect(deleteBackgroundImage).toHaveBeenCalledTimes(2)
+    expect(deleteBackgroundImage).toHaveBeenLastCalledWith(second)
+  })
+
   it('keeps both images out of the persisted readConfig payload', () => {
     const readerStore = useReaderStore()
-    const image = 'data:image/webp;base64,dGVzdA=='
+    const image = 'http://reader.localhost/files?path=default/backgrounds/desktop-abc.png'
 
     readerStore.setBackgroundImage(image)
     readerStore.setReaderBackgroundImage(image)
