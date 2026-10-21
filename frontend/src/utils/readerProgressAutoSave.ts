@@ -1,17 +1,4 @@
 type TimerHandle = ReturnType<typeof setTimeout> | number
-const KEEPALIVE_SETTLE_TIMEOUT_MS = 800
-
-/**
- * 离开阅读页时等待进度写入的上限。
- *
- * 这段逻辑挂在路由守卫里, 守卫 resolve 之前页面不会真正切走 —— 任何一次后端慢请求
- * 都会变成「点了返回却还停在阅读页」。最坏的一种是目录缓存缺失时同步联网抓目录:
- * 单请求 15s 超时 × 3 次尝试, 分页目录还要逐页串行, 一分钟内都回不了书架。
- *
- * 进度写入只是尽力而为: 本地位置在 beginPersist 里已经同步落盘, 服务端那份晚到或
- * 丢失都能接受, 卡住导航不能接受。因此到点无条件放行。
- */
-const ROUTE_LEAVE_TIMEOUT_MS = 1200
 
 export interface ReaderProgressAutoSaveSchedulerOptions {
   intervalMs: number
@@ -23,7 +10,6 @@ export interface ReaderProgressAutoSaveSchedulerOptions {
 export interface ReaderProgressExitSaverOptions {
   disposeAutoSave: () => void
   savePosition: () => void
-  flushToServer: () => Promise<void> | void
   flushToServerKeepalive: () => Promise<void> | void
   flushToLegado?: () => Promise<void> | void
 }
@@ -76,19 +62,33 @@ export function createReaderProgressAutoSaveScheduler({
   }
 }
 
+/**
+ * 离开阅读页时的进度收尾。
+ *
+ * 关键约定: **导航不能被进度写入拖住**。
+ *
+ * 本地位置(`localStorage`)在 `beginPersist()` 里同步落盘, 这一步已经保证了
+ * 「下次打开这本书落在原处」; 服务端与 WebDAV 那两份是尽力而为 —— 它们经 IPC /
+ * 网络往返, 慢一次就是几百毫秒到几十秒。
+ *
+ * 旧实现让路由守卫 `await` 这条链, 并用 1200ms 上限兜底, 于是「退出到书架」
+ * 的耗时随写入速度在 0~1.2s 之间抖动: 命中缓存时秒出, 后端慢一次就明显卡顿
+ * (issue #19「有时候需要几秒钟才能退出来, 有时候也能秒出」)。守卫里还先等了
+ * 最多 800ms 让 keepalive 落地, 才轮到那一次写入 —— 慢的时候两段叠加。
+ *
+ * 现在的做法: 本地位置同步写, 服务端/WebDAV 的两次写入发起后立刻放行导航。
+ * 阅读页卸载后 store 仍常驻, IPC 与上传都会继续跑完; 真要立刻关窗时,
+ * App.vue 的 close-requested 路径还会再 flush 一次。
+ */
 export function createReaderProgressExitSaver({
   disposeAutoSave,
   savePosition,
-  flushToServer,
   flushToServerKeepalive,
   flushToLegado,
 }: ReaderProgressExitSaverOptions) {
-  let routeFlushPromise: Promise<void> | null = null
   let routeFlushed = false
-  let keepaliveSent = false
   let autoSaveDisposed = false
-  let keepaliveThenFinal: Promise<void> | null = null
-  let finalFlushCompleted = false
+  let keepaliveSent = false
 
   function beginPersist() {
     if (!autoSaveDisposed) {
@@ -96,64 +96,46 @@ export function createReaderProgressExitSaver({
       disposeAutoSave()
     }
     savePosition()
-    return true
+  }
+
+  /** 发起后台写入: 一次 keepalive 进度写入, 完成后再同步 WebDAV 进度。全程不等待。
+   *
+   *  keepalive 版本就是为"页面即将消失"准备的: 一次 IPC 往返即返回。这里仍然
+   *  不 await —— 导航不该为它排队。`keepaliveSent` 负责去重: 同一批退出钩子
+   *  (路由离开 / pagehide / 组件卸载)会连着触发, 只写一次就够。 */
+  function startBackgroundFlush() {
+    if (keepaliveSent) return
+    keepaliveSent = true
+    void Promise.resolve(flushToServerKeepalive())
+      .then(() => flushToLegado?.())
+      .catch(() => undefined)
   }
 
   return {
+    /** 路由离开钩子: 本地位置同步落盘, 服务端/网盘写入发起后立即放行。
+     *
+     *  改动前这里 await 整条写入链(含 800ms keepalive 等待与 1200ms 上限),
+     *  于是"退出到书架"的耗时随后端快慢在 0~1.2s 之间抖动 —— 见 issue #19。 */
     async flushBeforeRouteLeave() {
-      if (routeFlushPromise) return routeFlushPromise
       if (routeFlushed) {
         beginPersist()
         return
       }
       routeFlushed = true
       beginPersist()
-      const previous = keepaliveThenFinal
-      let settleTimer: TimerHandle | null = null
-      const flush = Promise.race([
-        Promise.resolve(previous),
-        new Promise<void>((resolve) => {
-          settleTimer = setTimeout(resolve, KEEPALIVE_SETTLE_TIMEOUT_MS)
-        }),
-      ])
-        .then(() => flushToServer())
-        .then(() => {
-          finalFlushCompleted = true
-        })
-        .then(() => flushToLegado?.())
-        .then(() => undefined)
-        .catch(() => undefined)
-        .finally(() => {
-          if (settleTimer != null) clearTimeout(settleTimer as ReturnType<typeof setTimeout>)
-        })
-      // 守卫等的是这个 Promise: 到点必须放行, 否则后端慢一次就把用户锁在阅读页。
-      // 未完成的 flush 仍会继续跑完, 只是不再阻塞导航。
-      let routeLeaveTimer: TimerHandle | null = null
-      routeFlushPromise = Promise.race([
-        flush,
-        new Promise<void>((resolve) => {
-          routeLeaveTimer = setTimeout(resolve, ROUTE_LEAVE_TIMEOUT_MS)
-        }),
-      ]).then(() => {
-        if (routeLeaveTimer != null) clearTimeout(routeLeaveTimer as ReturnType<typeof setTimeout>)
-      }).finally(() => {
-        routeFlushPromise = null
-      })
-      await routeFlushPromise
+      startBackgroundFlush()
     },
 
+    /** 页面隐藏/卸载: 本地落盘 + 一次 keepalive 写入(同样不阻塞)。 */
     flushKeepalive() {
       beginPersist()
-      if (keepaliveSent || finalFlushCompleted) return
-      keepaliveSent = true
-      keepaliveThenFinal = Promise.resolve(flushToServerKeepalive())
-        .then(() => flushToLegado?.())
-        .then(() => undefined)
+      startBackgroundFlush()
     },
 
+    /** 切到后台(可能马上被系统冻结): 落盘并发一次 keepalive, 不做更多。 */
     flushTemporaryKeepalive() {
       savePosition()
-      flushToServerKeepalive()
+      void Promise.resolve(flushToServerKeepalive()).catch(() => undefined)
     },
   }
 }

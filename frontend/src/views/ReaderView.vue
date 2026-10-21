@@ -390,6 +390,7 @@ import {
   isReaderHoverPointInZone,
   shouldRevealReaderControls,
 } from '../utils/readerHoverControls'
+import { resolveReaderBackTarget } from '../utils/readerBack'
 import { shouldPreferServerReadingPosition, type ReadingPositionSnapshot } from '../utils/readingPosition'
 import { isLocalBook, isLocalEpubBook } from '../utils/localBook'
 import { PDF_PAGE_ATTR, isPdfBook, releasePdfBook, renderPdfChapterPages } from '../utils/pdfPages'
@@ -743,7 +744,6 @@ const serverProgressAutoSaveScheduler = createReaderProgressAutoSaveScheduler({
 const readerProgressExitSaver = createReaderProgressExitSaver({
   disposeAutoSave: () => serverProgressAutoSaveScheduler.dispose(),
   savePosition: () => saveReadingPosition({ force: true }),
-  flushToServer: () => store.flushProgressToServerKeepalive(true),
   flushToServerKeepalive: () => store.flushProgressToServerKeepalive(true),
   flushToLegado: async () => {
     await store.syncCurrentBookProgressFromLegadoOnExit()
@@ -3071,33 +3071,38 @@ function toggleFullscreen() {
 }
 
 /** 「返回」: 按弹层 → 选区菜单 → 搜索 → 朗读面板 → 书详情的顺序逐层退出,
- *  都没有时回书架(与原 Esc 的级联一致)。 */
+ *  都没有时回书架。
+ *
+ *  **工具栏不参与这一串层级**(判定见 utils/readerBack, 已单测覆盖)。旧实现把
+ *  "收起工具栏"排在"退出"之前, 于是用户按第一次 Esc 只是把菜单栏收起来、
+ *  第二次才回书架 —— 也就是 issue #19 的「第一次会先隐藏顶层菜单栏」。工具栏
+ *  本来就会随滚动/点击正文/指针离开自己收起, 不需要靠「返回」来关。 */
 function handleReaderBack() {
-  if (store.activePanel) {
-    store.closePanel()
-    return
+  switch (resolveReaderBackTarget({
+    panelOpen: !!store.activePanel,
+    selectionMenuVisible: selectionMenu.value.visible,
+    searchOpen: showSearch.value,
+    ttsOpen: showTTSPanel.value,
+    bookInfoOpen: showBookInfo.value,
+  })) {
+    case 'panel':
+      store.closePanel()
+      return
+    case 'selectionMenu':
+      hideSelectionMenu()
+      return
+    case 'search':
+      closeSearch()
+      return
+    case 'tts':
+      closeTTSPanel()
+      return
+    case 'bookInfo':
+      showBookInfo.value = false
+      return
+    default:
+      goHome()
   }
-  if (selectionMenu.value.visible) {
-    hideSelectionMenu()
-    return
-  }
-  if (showSearch.value) {
-    closeSearch()
-    return
-  }
-  if (showTTSPanel.value) {
-    closeTTSPanel()
-    return
-  }
-  if (showBookInfo.value) {
-    showBookInfo.value = false
-    return
-  }
-  if (showControls.value) {
-    collapseControlsByClick()
-    return
-  }
-  goHome()
 }
 
 /** 执行快捷键动作。返回 true 表示已处理(调用方据此决定是否 preventDefault)。
@@ -3213,11 +3218,18 @@ function isKeyboardHotkeyBlocked(): boolean {
  *  中键/侧键用的是 isMouseButtonHotkeyBlocked —— 规则与滚轮不同, 原因见那里的说明。 */
 
 function handleKeydown(e: KeyboardEvent) {
-  if (isKeyboardHotkeyBlocked()) return
+  const keyId = hotkeyIdFromEvent(e)
+  if (!keyId) return
+  // 「返回」不受输入框限制。搜索面板一打开就把焦点放进输入框, 若连 Esc 也拦掉,
+  // 用户在搜索框里按 Esc 会毫无反应(面板关不掉, 也退不出阅读页), 只能先用鼠标
+  // 点一下正文。返回是"离开当前层"的通用语义, 与正在打字不冲突: 它不往输入框
+  // 里插入字符, 也不改变光标位置。
+  const action = resolveHotkeyAction(store.hotkeyBindings, keyId, readingModeKind.value)
+  if (action !== 'back' && isKeyboardHotkeyBlocked()) return
 
   // 矩阵里没有换绑的按键不拦截: 用户在设置里把某键设为「不操作」后,
   // 该键应彻底交还浏览器, 而不是被静默吞掉。
-  if (dispatchHotkey(hotkeyIdFromEvent(e))) e.preventDefault()
+  if (dispatchHotkey(keyId)) e.preventDefault()
 }
 
 /** 该鼠标键在当前模式下是否有**可执行**的快捷键动作(仅解析, 不执行)。
@@ -3406,9 +3418,15 @@ async function openInfo() {
   }
 }
 
-onBeforeRouteLeave(async () => {
+/** 离开阅读页: 同步写出本地位置, 后台再补服务端/WebDAV 两份。
+ *
+ *  这里**不能** await 进度写入 —— 那是 issue #19「有时候几秒才退出、有时候
+ *  秒出」的根因: 写入耗时取决于后端/网盘, 守卫一挡就成了退出耗时的一部分。
+ *  本地位置在 captureProgressForSync + savePosition 里同步落盘, 已经足够保证
+ *  「下次打开落在原处」; 远程两份由 exitSaver 在后台跑完。 */
+onBeforeRouteLeave(() => {
   captureProgressForSync()
-  await readerProgressExitSaver.flushBeforeRouteLeave()
+  void readerProgressExitSaver.flushBeforeRouteLeave()
   return true
 })
 

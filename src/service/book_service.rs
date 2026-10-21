@@ -3141,6 +3141,13 @@ impl BookService {
         Ok(list)
     }
 
+    /// 书架落盘: 先写临时文件再原子替换, 读者永远看不到写了一半的 JSON。
+    ///
+    /// 必须原子替换的原因: 书架是多个命令共读共写的同一份文件。离开阅读页时的
+    /// 进度写入(save_book_progress)与书架页的读取(get_shelf_book_with_cache_info)
+    /// 会并发发生 —— 旧的 `fs::write` 直接截断目标文件再写, 夹在中间的读取会拿到
+    /// 空串或半截 JSON, 于是要么报「解析失败」, 要么走 `recover_bookshelf_entries`
+    /// 的恢复分支(它还会顺手把恢复结果回写, 与正在写的那次互相覆盖)。
     async fn write_bookshelf(&self, user_ns: &str, list: &Vec<Book>) -> Result<(), AppError> {
         let path = self.bookshelf_path(user_ns);
         if let Some(parent) = path.parent() {
@@ -3149,10 +3156,30 @@ impl BookService {
                 .map_err(|e| AppError::Internal(e.into()))?;
         }
         let data = serde_json::to_string(list).map_err(|e| AppError::BadRequest(e.to_string()))?;
-        fs::write(&path, data)
+        // 临时名带唯一后缀: 极端并发下(进度写入与书架编辑同时落盘)两次写不会
+        // 争用同一个中间文件, 各自 rename 一次, 最终内容仍是某一次的完整快照。
+        let temp_path = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4().simple()));
+        fs::write(&temp_path, data)
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
-        Ok(())
+        // Windows 上替换失败只有一种常见原因: 目标文件正被某个读者打开。读者只
+        // 做一次短读, 短暂重试即可; 重试仍失败才把错误上报, 不静默吞掉。
+        let mut last_error = None;
+        for attempt in 0..5u32 {
+            match fs::rename(&temp_path, &path).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 4 {
+                        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(&temp_path).await;
+        Err(AppError::Internal(
+            last_error.expect("rename 至少失败过一次").into(),
+        ))
     }
 
     // Chapter list cache methods
@@ -4119,6 +4146,79 @@ mod tests {
         assert_eq!(to_json(ContentLoadStage::Fetching), "\"fetching\"");
         assert_eq!(to_json(ContentLoadStage::Parsing), "\"parsing\"");
         assert_eq!(to_json(ContentLoadStage::Caching), "\"caching\"");
+    }
+
+    /// 书架落盘必须原子替换: 并发读者永远看不到半截 JSON。
+    ///
+    /// issue #19 的退出路径改成"发起写入即放行导航"之后, `save_book_progress`
+    /// 会与书架页的读取真正并发。旧的 `fs::write` 先截断再写, 夹在中间的读取
+    /// 会拿到空串, 触发 `recover_bookshelf_entries` 恢复分支, 甚至把恢复结果
+    /// 回写覆盖掉正在写的那一次。
+    #[tokio::test]
+    async fn bookshelf_write_never_exposes_a_partial_file() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-atomic-bookshelf-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let book = Book {
+            name: "原子写入".to_string(),
+            author: "测试".to_string(),
+            origin: "https://example.com".to_string(),
+            book_url: "https://example.com/book/1".to_string(),
+            ..Default::default()
+        };
+        service
+            .save_book("default", book.clone())
+            .await
+            .unwrap();
+
+        let path = storage_dir
+            .join("data")
+            .join("default")
+            .join("bookshelf.json");
+
+        // 写入与读取交错跑: 任何一次读取都必须拿到完整 JSON。
+        let reader = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    if let Ok(data) = tokio::fs::read_to_string(&path).await {
+                        if data.is_empty() {
+                            return Err("读到了空文件");
+                        }
+                        serde_json::from_str::<Vec<Book>>(&data)
+                            .map_err(|_| "读到了半截 JSON")?;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Ok(())
+            })
+        };
+        for _ in 0..20 {
+            service.save_book("default", book.clone()).await.unwrap();
+        }
+        reader.await.unwrap().unwrap();
+
+        // 最终内容是一次完整快照: 能反序列化, 且仍是这本书(save_book 会补齐
+        // 自己的字段, 所以不逐字节比对)。
+        let persisted: Vec<Book> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].book_url, "https://example.com/book/1");
+        // 中间文件不能残留。
+        let leftovers = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(storage_dir);
     }
 
     #[test]
