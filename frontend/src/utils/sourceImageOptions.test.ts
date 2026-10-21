@@ -3,6 +3,7 @@ import {
   ensureSvgNamespace,
   parseSourceImageOptions,
   processSourceImageOptions,
+  reserveImageSpace,
 } from './sourceImageOptions'
 
 // 取自真实插件(addComment)产生的 src: 段评图标 + 配置面板 click
@@ -128,6 +129,67 @@ describe('processSourceImageOptions（用最小 DOM 桩，不依赖 jsdom）', (
     const { classes, attrs } = runOn(bad)
     expect(attrs.get('src')).toBe(bad)
     expect(classes.has('source-clickable')).toBe(false)
+  })
+})
+
+describe('reserveImageSpace（用最小 DOM 桩，不依赖 jsdom）', () => {
+  function makeImage(opts: {
+    attrs?: Record<string, string>
+    classes?: string[]
+    style?: Record<string, string>
+  }) {
+    const attrs = new Map<string, string>(Object.entries(opts.attrs ?? {}))
+    const classes = new Set(opts.classes ?? [])
+    const style: Record<string, string> = { ...(opts.style ?? {}) }
+    const image = {
+      style,
+      classList: { contains: (name: string) => classes.has(name) },
+      hasAttribute: (name: string) => attrs.has(name),
+    }
+    return image
+  }
+
+  function runOn(images: ReturnType<typeof makeImage>[]) {
+    const root = { querySelectorAll: () => images } as unknown as HTMLElement
+    reserveImageSpace(root)
+    return images
+  }
+
+  it('leaves an image that already declares width and height alone', () => {
+    // 番茄源插图都带这两个属性, 浏览器据此即可在加载前按比例占位。
+    const [image] = runOn([makeImage({ attrs: { width: '1024', height: '576' } })])
+
+    expect(image.style.aspectRatio).toBeUndefined()
+  })
+
+  it('reserves space when the image has no intrinsic size', () => {
+    const [image] = runOn([makeImage({ attrs: { src: 'a.jpg' } })])
+
+    // width 与 aspect-ratio 必须成对: 未加载的图片固有宽度是 0,
+    // 没有确定宽度就换算不出占位高度。
+    expect(image.style.width).toBe('100%')
+    expect(image.style.aspectRatio).toBe('16 / 9')
+    expect(image.style.height).toBe('auto')
+  })
+
+  it('reserves space when only one dimension is given', () => {
+    const [image] = runOn([makeImage({ attrs: { width: '1024' } })])
+
+    expect(image.style.width).toBe('100%')
+    expect(image.style.aspectRatio).toBe('16 / 9')
+  })
+
+  it('leaves commentary bubbles alone', () => {
+    // 气泡有自己固定的行内尺寸, 再套宽高比会把它撑成整段高图。
+    const [image] = runOn([makeImage({ classes: ['source-inline-bubble'] })])
+
+    expect(image.style.aspectRatio).toBeUndefined()
+  })
+
+  it('does not override a size the source already set', () => {
+    const [image] = runOn([makeImage({ style: { width: '110px' } })])
+
+    expect(image.style.aspectRatio).toBeUndefined()
   })
 })
 

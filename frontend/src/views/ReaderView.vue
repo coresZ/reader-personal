@@ -394,7 +394,7 @@ import { shouldPreferServerReadingPosition, type ReadingPositionSnapshot } from 
 import { isLocalBook, isLocalEpubBook } from '../utils/localBook'
 import { PDF_PAGE_ATTR, isPdfBook, releasePdfBook, renderPdfChapterPages } from '../utils/pdfPages'
 import { rewriteCssAssetUrls, toReaderAssetUrl } from '../utils/localEpubAsset'
-import { processSourceImageOptions } from '../utils/sourceImageOptions'
+import { processSourceImageOptions, reserveImageSpace } from '../utils/sourceImageOptions'
 import { repairSourceImageHtml } from '../utils/sourceImageHtml'
 import { handleReaderFontSizeWheel } from '../utils/readerFontSize'
 import { createReaderProgressAutoSaveScheduler, createReaderProgressExitSaver } from '../utils/readerProgressAutoSave'
@@ -1109,6 +1109,7 @@ function formatChapterHtml(rawText: string) {
 
   rewriteLocalEpubAssetSrcs(wrapper)
   processSourceImageOptions(wrapper)
+  reserveImageSpace(wrapper)
   highlightSearchText(wrapper)
   return wrapper.innerHTML
 }
@@ -4245,6 +4246,24 @@ watch(
   background: rgba(201, 127, 58, 0.12);
   border-radius: 10px;
   box-shadow: inset 0 0 0 1px rgba(201, 127, 58, 0.18);
+}
+
+/* 书源正文的图片。
+ *
+ * 两条都必须写:
+ *  1. `max-width: 100%` —— 不溢出正文列。
+ *  2. `height: auto` —— 书源图片自带 `width`/`height` 属性(番茄源每张都有),
+ *     只限宽不限高时, 浏览器会把**属性里的绝对高度**当最终高度: 一张
+ *     1024x576 的图在 380px 宽的列里会被拉成 380x576, 严重变形。
+ *
+ * 加上 `height: auto` 后宽高比才交给浏览器按属性推导, 于是:
+ *  - 图片加载**前**就能按真实比例占住位置(不再从 0 高度开始);
+ *  - 加载**后**高度不变, 下方正文不会突然上移/下移。
+ * 这正是 issue #21「带图章节排版有延迟/跳动」的成因 —— 用户的 GIF 里
+ * 图片区域从空白变成图片的同时, 其下内容整体位移三百多像素。 */
+:deep(.chapter-text img) {
+  max-width: 100%;
+  height: auto;
 }
 
 /* 本地 EPUB: 正文排版以原书 CSS 为准(原书规则随章节内联, 在 DOM 中位于本组件

@@ -151,11 +151,17 @@ function filterBlockStyle(styleText: string): string {
 }
 
 /** 清掉一个元素上会把图片拉高/移出正常流的写法, 让页面高度只由内容决定。
- *  `width`/`height` **属性**是书源随手写的绝对像素, 一律清掉; CSS 里的 `width`
- *  (书源 `,{width}` 选项的落地形态) 保留 —— 只给宽度时高度按比例走, 不会变形。 */
+ *
+ *  **`width`/`height` 属性必须保留** —— 它们是浏览器在图片**下载完成之前**
+ *  按比例预留占位的唯一依据(HTML 规范: 有这两个属性即可算出 aspect ratio)。
+ *  删掉它们, 图片在加载前只有一行 broken-image 的高度(约 16px), 加载后突然
+ *  变成几百像素, 正文在页内整块位移 —— 这正是 issue #21 的「带图章节排版延迟」。
+ *  书源写的绝对像素确实不该决定最终显示尺寸, 但这件事交给 CSS 完成:
+ *  下面的 `max-width: 100%` + `max-height` 已经接管了实际尺寸,
+ *  属性只承担「加载前占位」这一个职责。
+ *
+ *  CSS 里的高度声明仍要清掉: 书源常写 `style="height:100%"`, 那会把图纵向拉满。 */
 function stripImageLayout(element: Element) {
-  element.removeAttribute('width')
-  element.removeAttribute('height')
   if (!(element instanceof HTMLElement) && !(element instanceof SVGElement)) return
   for (const property of IMAGE_HEIGHT_STYLE_PROPERTIES) {
     element.style.removeProperty(property)
@@ -269,6 +275,10 @@ function constrainBlockMedia(blockHtml: string, pageHeightPx: number, lineHeight
     stripImageLayout(element)
     element.style.maxWidth = '100%'
     element.style.maxHeight = `${maxHeight}px`
+    // `height: auto` 让宽高比由 `<img>` 自带的 width/height 属性推导:
+    // 加载前就能占住正确高度(不塌成 broken-image 的一行), 加载后比例也对。
+    // 缺了它, `max-height` 会把图按属性绝对高度直接截断, 画面被压扁。
+    element.style.height = 'auto'
     // 兜底: 万一还有别的来源给死了宽高, contain 至少不会把画面压扁。
     // 只对可替换元素设置: `svg`/`iframe` 用不上该属性, 设了也无害。
     element.style.objectFit = 'contain'

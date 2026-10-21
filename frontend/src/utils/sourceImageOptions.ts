@@ -91,6 +91,33 @@ export function parseSourceImageOptions(rawSrc: string): SourceImageOption | nul
   return null
 }
 
+/** 给正文插图补上占位尺寸, 避免加载完成前后高度变化导致的正文跳动。
+ *
+ *  只处理「正文插图」: 段评气泡(`source-inline-bubble`)与设了 `style.width`
+ *  的图标有自己明确的尺寸, 不参与占位。
+ *
+ *  `width: 100%` 和 `aspect-ratio` **必须成对出现**才有效:
+ *  未加载的图片固有尺寸是 0, 没有确定宽度时宽高比无从换算, 高度照样是 0。
+ *  只有先靠 `width: 100%` 把宽度钉到列宽, `aspect-ratio` 才能算出占位高度。
+ *  实测(700px 列宽): 只写 aspect-ratio 时加载前高度 0; 加上 width:100% 后
+ *  加载前后都是 393.75px, 位移 0。
+ *
+ *  比例取常见横图 16:9。真实图片比例不同, 加载后由 `height: auto` 与图片
+ *  自身比例接管 —— 这一层只负责「先把位置占住」。 */
+const FALLBACK_IMAGE_ASPECT = '16 / 9'
+
+export function reserveImageSpace(root: HTMLElement) {
+  const images = Array.from(root.querySelectorAll('img')) as HTMLImageElement[]
+  images.forEach((image) => {
+    if (image.classList.contains('source-inline-bubble')) return
+    if (image.hasAttribute('width') && image.hasAttribute('height')) return
+    if (image.style.width || image.style.height || image.style.aspectRatio) return
+    image.style.width = '100%'
+    image.style.aspectRatio = FALLBACK_IMAGE_ASPECT
+    image.style.height = 'auto'
+  })
+}
+
 /**
  * 处理正文容器里的所有图片：剥离 `,{json}`、标记可点击、按 `style:text` 呈现为行内气泡。
  * 直接修改传入的 DOM（与 `formatChapterHtml` 的其余后处理一致）。
