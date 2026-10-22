@@ -214,6 +214,10 @@ impl SourceSession {
 pub struct SourceHttpContext {
     pub session: Arc<SourceSession>,
     pub client: reqwest::Client,
+    /// 与 `client` 共享同一个 cookie jar, 但**不跟随 3xx**。
+    /// legado 的 `java.get/head/post` 是 `followRedirects(false)` 语义,
+    /// 书源靠读 302 的 `Location` 做两步搜索。见 `http_client::build_source_client_no_redirect`。
+    pub client_no_redirect: reqwest::Client,
     pub proxy: Option<String>,
     pub timeout_secs: u64,
 }

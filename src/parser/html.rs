@@ -1361,10 +1361,91 @@ pub fn node_extract(node: &sxd_xpath::nodeset::Node<'_>, extractor: &str) -> Opt
     }
 }
 
+/// 把 HTML 转成 `sxd_document`(XML 解析器)能吃的良构文档, 供 XPath 求值。
+///
+/// `sxd_document` 是**严格 XML** 解析器, 而真实的书源页面几乎都不是良构 XML:
+/// 未闭合的 `<br>`/`<img>`/`<meta>`、重复属性、未加引号的属性值、裸 `&`、
+/// `<script>` 里的 `<` 与 `&&`……直接喂原始 HTML 会整份解析失败返回空,
+/// 结果就是「XPath 写法的发现页/目录规则一条都取不到」。
+///
+/// 正确做法是先按 HTML5 规则建 DOM(`scraper`/html5ever, 与 CSS 路径同一棵树),
+/// 再序列化成良构 XML。这一步与 legado 的行为对齐: 手机端用的是
+/// `org.jsoup` + `jsoupXpath`, 同样先把 HTML 解析成 DOM 再跑 XPath。
+///
+/// 两点细节:
+/// - 同名属性(如 `src` 与 `srcset` 之外还有重复的 `alt`)在 XML 里非法,
+///   `scraper` 的 `attrs()` 迭代器会重复吐同一个键, 必须按名去重;
+/// - 非法属性名(数字开头等)整条丢弃, 宁可少一个属性也不要让整份文档解析失败。
+pub fn html_to_xml(html: &str) -> String {
+    const VOID: &[&str] = &[
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+        "source", "track", "wbr",
+    ];
+    fn escape_text(text: &str) -> String {
+        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    }
+    fn escape_attr(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+    fn valid_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
+            _ => return false,
+        }
+        chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    }
+    fn write_element(el: ElementRef<'_>, out: &mut String) {
+        let name = el.value().name();
+        out.push('<');
+        out.push_str(name);
+        let mut seen = HashSet::new();
+        for (key, value) in el.value().attrs() {
+            if !valid_name(key) || !seen.insert(key) {
+                continue;
+            }
+            out.push(' ');
+            out.push_str(key);
+            out.push_str("=\"");
+            out.push_str(&escape_attr(value));
+            out.push('"');
+        }
+        if VOID.contains(&name) {
+            out.push_str(" />");
+            return;
+        }
+        out.push('>');
+        for child in el.children() {
+            match ElementRef::wrap(child) {
+                Some(child) => write_element(child, out),
+                None => {
+                    if let Some(text) = child.value().as_text() {
+                        out.push_str(&escape_text(text));
+                    }
+                }
+            }
+        }
+        out.push_str("</");
+        out.push_str(name);
+        out.push('>');
+    }
+
+    let document = parse_document(html);
+    let mut out = String::with_capacity(html.len() + 256);
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    write_element(document.root_element(), &mut out);
+    out
+}
+
 pub fn select_xpath(html: &str, xpath: &str) -> Vec<String> {
     let (path, extractor) = split_xpath_axis(xpath);
 
-    let package = match sxd_document::parser::parse(html) {
+    let xml = html_to_xml(html);
+    let package = match sxd_document::parser::parse(&xml) {
         Ok(p) => p,
         Err(_) => return vec![],
     };

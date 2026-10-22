@@ -97,11 +97,30 @@ impl HttpClient {
             Some(client) => client.clone(),
             None => {
                 let client = build_source_client(self.timeout_secs, proxy.as_deref(), session.cookies.clone())?;
-                clients.insert(client_key, client.clone());
+                clients.insert(client_key.clone(), client.clone());
                 client
             }
         };
-        Ok(SourceHttpContext { session, client, proxy, timeout_secs: self.timeout_secs })
+        // 不跟随重定向的孪生 client: legado 的 `java.get/head/post` 对应
+        // `Jsoup.connect(...).followRedirects(false)`, 书源靠读 302 的 `Location`
+        // 做两步搜索(先拿 searchid 再拼结果地址)。与上面的 client 共用同一个
+        // cookie jar, 登录态不受影响。按需构建, 只有真正用到才付这份开销。
+        let no_redirect_key = format!("{client_key}::no-redirect");
+        let client_no_redirect = match clients.get(&no_redirect_key) {
+            Some(client) => client.clone(),
+            None => {
+                let client = build_source_client_no_redirect(self.timeout_secs, proxy.as_deref(), session.cookies.clone())?;
+                clients.insert(no_redirect_key, client.clone());
+                client
+            }
+        };
+        Ok(SourceHttpContext {
+            session,
+            client,
+            client_no_redirect,
+            proxy,
+            timeout_secs: self.timeout_secs,
+        })
     }
 
     /// 当前是否有代理生效。
@@ -207,6 +226,20 @@ fn build_client(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<Client
 
 pub(crate) fn build_source_client(timeout_secs: u64, proxy: Option<&str>, jar: Arc<super::source_session::SourceCookieJar>) -> anyhow::Result<Client> {
     build_client_builder(timeout_secs, proxy)?.cookie_provider(jar).build().map_err(Into::into)
+}
+
+/// 与 [`build_source_client`] 相同, 但不跟随 3xx。
+///
+/// 对应 legado 的 `Jsoup.connect(...).followRedirects(false)`(`java.get`/`java.head`/
+/// `java.post`)。书源用这种写法**读 302 响应的 `Location` 头**完成两步搜索:
+/// 先用搜索词换一个 `searchid`, 再拿它拼结果页地址。跟随后 `Location` 消失,
+/// 脚本在 `location.match(...)` 处抛空引用, 整个搜索直接失败。
+pub(crate) fn build_source_client_no_redirect(timeout_secs: u64, proxy: Option<&str>, jar: Arc<super::source_session::SourceCookieJar>) -> anyhow::Result<Client> {
+    build_client_builder(timeout_secs, proxy)?
+        .redirect(reqwest::redirect::Policy::none())
+        .cookie_provider(jar)
+        .build()
+        .map_err(Into::into)
 }
 
 /// 与 [`build_source_client`] 相同, 但关闭响应的自动解压。
