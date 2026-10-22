@@ -958,8 +958,17 @@ pub async fn cover_route(state: &AppState, query: &str) -> tauri::http::Response
         return local_pdf_cover_route(state, rest).await;
     }
 
+    // 书源反查：`coverDecodeJs` 是**书源**上的字段，而封面请求只带图片地址。
+    // 前端因此把书籍的 `origin`（= bookSourceUrl）作为 `source` 一并传来；
+    // 老链接/直接引用没有该参数时，再按书架里同一条封面地址反查一次。
+    let source = resolve_cover_source(state, params.get("source").map(String::as_str), url).await;
+
     // "public" namespace matches the original unauthenticated cover endpoint.
-    match state.book_service.get_cover("public", url).await {
+    match state
+        .book_service
+        .get_cover_for_source("public", url, source.as_ref())
+        .await
+    {
         Ok((bytes, content_type)) => {
             if let Ok(mut cache) = cover_cache().lock() {
                 if cache.len() >= COVER_CACHE_CAP {
@@ -975,6 +984,76 @@ pub async fn cover_route(state: &AppState, query: &str) -> tauri::http::Response
             .unwrap_or_default(),
     }
 }
+
+/// 为一次封面请求找出它所属的书源。
+///
+/// 优先用调用方显式给的 `source`（书籍的 `origin`），其次按封面地址在书架里
+/// 反查 —— 只为了拿到 `coverDecodeJs`，找不到就返回 `None`（不解密，等调用方
+/// 下次带上参数）。
+///
+/// 搜索结果页一次要渲几十张封面，每张都读一次书架 JSON + 查一次书源库会很贵，
+/// 因此按 `source` 地址缓存一小份（书源被编辑后最多错一个封面）。
+async fn resolve_cover_source(
+    state: &AppState,
+    explicit: Option<&str>,
+    cover_url: &str,
+) -> Option<BookSource> {
+    let explicit = explicit.map(str::trim).filter(|value| !value.is_empty());
+    let source_url = match explicit {
+        Some(value) => value.to_string(),
+        None => {
+            // 没有显式来源（老链接/直接引用）：按封面地址在书架里反查。
+            let books = state.book_service.get_bookshelf("default").await.ok()?;
+            books
+                .iter()
+                .find(|book| {
+                    book.cover_url.as_deref() == Some(cover_url)
+                        || book.custom_cover_url.as_deref() == Some(cover_url)
+                })
+                .map(|book| book.origin.clone())
+                .filter(|origin| !origin.trim().is_empty())?
+        }
+    };
+    if let Some(cached) = cover_source_cache().lock().ok().and_then(|cache| {
+        cache
+            .get(&source_url)
+            .filter(|(_, at)| at.elapsed() < COVER_SOURCE_CACHE_TTL)
+            .map(|(source, _)| source.clone())
+    }) {
+        return Some(cached);
+    }
+    let found = state
+        .book_source_service
+        .get("default", &source_url)
+        .await
+        .ok()
+        .flatten();
+    if let Some(source) = &found {
+        if let Ok(mut cache) = cover_source_cache().lock() {
+            if cache.len() >= COVER_SOURCE_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(source_url, (source.clone(), std::time::Instant::now()));
+        }
+    }
+    found
+}
+
+const COVER_SOURCE_CACHE_CAP: usize = 64;
+
+/// 书源反查缓存：`bookSourceUrl -> (书源, 写入时刻)`（含 `coverDecodeJs`）。
+///
+/// 带 TTL 是刻意的：书源随时可能在「书源管理」里被编辑（改 key、改规则），
+/// 没有失效钩子时缓存会永远返回旧规则，表现为"改了书源封面还是花图"。
+/// 30 秒足够覆盖一次列表渲染（几十张封面），又不会让改动等太久。
+fn cover_source_cache() -> &'static std::sync::Mutex<HashMap<String, (BookSource, std::time::Instant)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, (BookSource, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+const COVER_SOURCE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 本地 PDF 封面: rest = "<hash>/cover.<ext>"。hash 在 service 侧校验
 /// (32 位 hex), 文件名只接受三个固定值, 无路径穿越面。
@@ -3344,6 +3423,29 @@ mod tests {
         assert!(
             rendered.contains(r#"addEventListener("click""#),
             "必须带 click 兜底(老 WebView 无 navigation API)"
+        );
+    }
+
+    /// 封面路由必须把 `source` 参数解析出来（加密封面的 `coverDecodeJs` 靠它
+    /// 反查书源，issue #23）。这里只测查询串解析这一段：`cover_route` 本身
+    /// 需要完整 `AppState`，不适合在单测里构造。
+    #[test]
+    fn cover_query_carries_source_and_path() {
+        let query = format!(
+            "path={}&source={}",
+            urlencoding::encode("https://xi.dzuxta.cn/a/b.jpeg?auth_key=1-2-3"),
+            urlencoding::encode("https://18mh.net/novel"),
+        );
+        let params: HashMap<String, String> =
+            serde_urlencoded::from_str(&query).unwrap_or_default();
+        assert_eq!(
+            params.get("path").map(String::as_str),
+            Some("https://xi.dzuxta.cn/a/b.jpeg?auth_key=1-2-3"),
+            "封面地址里的 & ? 不能被查询串解析吃掉"
+        );
+        assert_eq!(
+            params.get("source").map(String::as_str),
+            Some("https://18mh.net/novel")
         );
     }
 }

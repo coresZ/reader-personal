@@ -143,7 +143,8 @@ const coverSrc = computed(() => {
   if (coverFailed.value) return ''
   const url = (props.book as Book).customCoverUrl || props.book.coverUrl
   if (!url) return ''
-  return getCoverUrl(url)
+  // 带上书源地址: 加密封面要靠它反查 `coverDecodeJs`（issue #23）。
+  return getCoverUrl(url, asBook.value.origin)
 })
 
 const unreadCount = computed(() => {

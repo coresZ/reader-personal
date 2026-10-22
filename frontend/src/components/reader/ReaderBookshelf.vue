@@ -46,7 +46,7 @@ if (!store.books.length) {
 
 /** 书架项的封面: 自定义封面优先于书源自带封面, 与书架页 BookCard 保持一致。 */
 function shelfCover(book: Book) {
-  return getCoverUrl(book.customCoverUrl || book.coverUrl)
+  return getCoverUrl(book.customCoverUrl || book.coverUrl, book.origin)
 }
 
 async function openBook(book: Book) {

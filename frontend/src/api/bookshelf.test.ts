@@ -30,6 +30,22 @@ describe('getCoverUrl', () => {
       .toBe(`${readerOrigin}/cover?path=${encodeURIComponent('https://example.com/c.jpg')}`)
   })
 
+  /** 加密封面要靠书源反查 `coverDecodeJs`, 所以书籍所属书源必须随请求带上
+   *  (issue #23)。少了它, 后端只能退化成按封面地址翻书架。 */
+  it('carries the book source so encrypted covers can be decoded', () => {
+    expect(getCoverUrl('https://example.com/c.jpg', 'https://18mh.net/novel'))
+      .toBe(
+        `${readerOrigin}/cover?path=${encodeURIComponent('https://example.com/c.jpg')}` +
+          `&source=${encodeURIComponent('https://18mh.net/novel')}`,
+      )
+  })
+
+  /** 本地 PDF 封面与书源无关, 不该多带一个用不上的参数。 */
+  it('does not attach a source to a local pdf cover', () => {
+    expect(getCoverUrl('/local-pdf/abc/cover.jpg', 'https://18mh.net/novel'))
+      .toBe(`${readerOrigin}/cover?path=${encodeURIComponent('/local-pdf/abc/cover.jpg')}`)
+  })
+
   it('proxies a root-relative source path', () => {
     expect(getCoverUrl('/covers/1.jpg'))
       .toBe(`${readerOrigin}/cover?path=${encodeURIComponent('/covers/1.jpg')}`)

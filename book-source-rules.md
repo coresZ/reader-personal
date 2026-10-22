@@ -57,7 +57,7 @@
 | `loginUrl` | String? | `null` | 登录 URL 或登录 JS，见 12.1。 |
 | `loginUi` | String? | `null` | 登录表单 JSON，见 12.1。 |
 | `loginCheckJs` | String? | `null` | 每次主要网络请求后执行，输入 `StrResponse`，输出新的 `StrResponse`。 |
-| `coverDecodeJs` | String? | `null` | 封面图片解密 JS。 |
+| `coverDecodeJs` | String? | `null` | 封面图片解密 JS，见 16。 |
 | `bookSourceComment` | String? | `null` | 注释。 |
 | `variableComment` | String? | `null` | 书源变量说明，仅展示。 |
 | `lastUpdateTime` | Long | `0` | 更新时间。 |
@@ -1191,7 +1191,55 @@ else:
 | `chapter` | 当前章节对象。 |
 | `title` | 当前章节标题。 |
 
-## 16. 正文流水线
+## 16. 封面解密（coverDecodeJs）
+
+部分站点的封面图是加密的（AES 等），下载到的字节不是图片。legado 在图片
+加载完成后对字节执行一次书源的 `coverDecodeJs`，本项目的 `/cover` 路由
+（桌面 `reader://` 协议与 Web 阅读模式共用）同样执行。
+
+```text
+GET /cover?path=<封面地址>&source=<bookSourceUrl>
+  下载 → 若书源有 coverDecodeJs → 解密 → 嗅探 Content-Type → 缓存/返回
+```
+
+脚本绑定与 legado 一致：
+
+| 变量 | 值 |
+| --- | --- |
+| `result` | 待解密的图片**字节序列**（数字数组；不是 UTF-8 字符串）。 |
+| `src` | 图片地址。 |
+| 返回值 | 解密后的**字节**（例如 `createSymmetricCrypto(...).decrypt(result)`）。 |
+
+要点：
+
+- `java.createSymmetricCrypto(transformation, key, iv).decrypt(result)` 在封面上下文里
+  返回**字节**（与 legado 的 `decrypt → ByteArray` 一致）；`.decryptStr(...)` 仍返回文本。
+- 密文里 ≥0x80 的字节不能被当成文本处理，否则解密结果必然花屏。
+- 解密失败、或结果根本不是图片时，**回落到原始字节**：坏封面不该变成 404。
+- 解密后才嗅探格式与落盘扩展名（服务端给的 `Content-Type` 描述的是密文）。
+- 修复前落盘的密文缓存会在下次读取时自动就地重写。
+- `source` 由前端从书籍的 `origin`（= `bookSourceUrl`）带上；缺失时后端按封面地址
+  在书架里反查。
+
+示例（18mh）：
+
+```json
+"coverDecodeJs": "java.createSymmetricCrypto(\"AES/CBC/NoPadding\", \"f5d965df75336270\", \"97b60394abc2fbe1\").decrypt(result)"
+```
+
+`result` 同时支持 legado 文档里的**流式**写法（`result` 当 `InputStream`）：
+
+```js
+function decodeImage(data, key) {
+  var out = new Packages.java.io.ByteArrayOutputStream()
+  var byte
+  while ((byte = data.read()) != -1) out.write(byte ^ key)
+  return out.toByteArray()
+}
+decodeImage(result, key)
+```
+
+## 17. 正文流水线
 
 ```text
 getContentAwait(source, book, chapter, nextChapterUrl=null, needSave=true):
@@ -1255,7 +1303,7 @@ getContentAwait(source, book, chapter, nextChapterUrl=null, needSave=true):
 - 返回绝对 URL：打开 WebView。
 - 返回 true-like 字符串：删除本章正文缓存并刷新目录。
 
-## 17. 段评规则状态
+## 18. 段评规则状态
 
 当前项目不可用：
 
@@ -1265,7 +1313,7 @@ getContentAwait(source, book, chapter, nextChapterUrl=null, needSave=true):
 
 兼容实现 SHOULD 保留 `ReviewRule` 字段用于导入导出，但 MUST 默认不执行段评规则，除非明确实现扩展能力。
 
-## 18. 老书源导入兼容
+## 19. 老书源导入兼容
 
 当前项目在 `ImportOldData` 中支持旧格式迁移。若目标支持旧书源导入，需实现：
 
@@ -1299,7 +1347,7 @@ getContentAwait(source, book, chapter, nextChapterUrl=null, needSave=true):
 - `{...}` 页码选择器 -> `<...>`。
 - `<js>` 里的 `=searchKey`、`=searchPage` -> `={{key}}`、`={{page}}`。
 
-## 19. 兼容性测试用例建议
+## 20. 兼容性测试用例建议
 
 实现完成后 SHOULD 建立测试集。以下用例可作为最小验收：
 
@@ -1411,7 +1459,7 @@ $.data.name -> 书名
 | `"1"` | true |
 | `"VIP"` | true |
 
-## 20. 已知兼容陷阱
+## 21. 已知兼容陷阱
 
 - `@js:` 会吞掉后续整段规则；链式规则必须用 `<js>...</js>`。
 - `$0` 不会替换成正则完整匹配，而是保留字面量。

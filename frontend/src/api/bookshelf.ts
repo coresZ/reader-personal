@@ -173,7 +173,14 @@ export function setBookSource(params: {
 }
 
 // ─── Cover helper ───
-export function getCoverUrl(coverUrl?: string) {
+/**
+ * 把书源封面地址转成 reader 协议的 `/cover` 地址。
+ *
+ * `source` 是该书所属书源的 `origin`（= `bookSourceUrl`），只在书源封面
+ * 需要 `coverDecodeJs` 解密时才起作用：后端拿它反查书源并执行解密规则。
+ * 缺省时后端会按封面地址在书架里反查，所以老调用点不改也能工作。
+ */
+export function getCoverUrl(coverUrl?: string, source?: string) {
   if (!coverUrl) return ''
   if (coverUrl.startsWith('/reader3/localEpubAsset')) {
     const [, rawQuery = ''] = coverUrl.split('?')
@@ -189,7 +196,13 @@ export function getCoverUrl(coverUrl?: string) {
     return coverUrl
   }
   if (coverUrl.startsWith('http') || coverUrl.startsWith('/')) {
-    return `${readerOrigin}/cover?path=${encodeURIComponent(coverUrl)}`
+    const query = `path=${encodeURIComponent(coverUrl)}`
+    const origin = source?.trim()
+    // 本地 PDF 封面走 /local-pdf/ 前缀，与书源无关。
+    if (!origin || coverUrl.startsWith('/local-pdf/')) {
+      return `${readerOrigin}/cover?${query}`
+    }
+    return `${readerOrigin}/cover?${query}&source=${encodeURIComponent(origin)}`
   }
   return coverUrl
 }
