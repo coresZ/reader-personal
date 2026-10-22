@@ -25,13 +25,26 @@
         <button
           v-if="activeTab === 'chapters'"
           class="icon-btn"
+          type="button"
+          title="刷新目录"
+          aria-label="刷新目录"
           :disabled="store.chaptersLoading"
           @click="refreshCatalog"
         >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" /></svg>
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            :class="{ spinning: store.chaptersLoading }"
+          ><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" /></svg>
         </button>
-        <button class="close-btn" @click="store.closePanel()">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+        <button class="close-btn" type="button" title="关闭" aria-label="关闭" @click="store.closePanel()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <path d="M6 6l12 12M18 6L6 18" />
+          </svg>
         </button>
       </div>
     </div>
@@ -254,7 +267,13 @@ async function goToChapter(index: number) {
 }
 
 async function refreshCatalog() {
-  await store.refreshChapters()
+  try {
+    await store.refreshChapters()
+  } catch {
+    // 失败原因由 store 统一 toast（含「目录为空」这类后端不回错的场景）;
+    // 这里只要不继续滚动列表即可 —— 抛出去会变成未处理的 Promise 拒绝。
+    return
+  }
   await refreshCachedChapterState()
   scrollToCurrent()
 }
@@ -502,30 +521,68 @@ function formatDate(ts?: number) {
   border-bottom-color: var(--color-primary, #c97f3a);
 }
 
+/* ─── 头部图标按钮 ───
+   与换源面板保持同一规格：30px 热区、16px 图标、1.8 描边、圆头线帽。
+   原来的 32px + 17px + stroke-width 2 让图标顶满按钮，线条偏粗，
+   和「目录 / 书签」这种细字标签摆在一起很抢眼。 */
 .icon-btn,
 .close-btn {
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 8px;
-  color: inherit;
-  opacity: 0.6;
-  background: transparent;
+  padding: 0;
   border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.55;
   cursor: pointer;
+  transition: opacity 0.16s ease, background 0.16s ease;
 }
 
-.header-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.icon-btn svg,
+.close-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.icon-btn:hover:not(:disabled),
+.close-btn:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.icon-btn:active:not(:disabled),
+.close-btn:active {
+  background: rgba(0, 0, 0, 0.09);
 }
 
 .icon-btn:disabled {
   opacity: 0.35;
   cursor: default;
+}
+
+.icon-btn:focus-visible,
+.close-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-primary, #c97f3a) 55%, transparent);
+  outline-offset: 1px;
+}
+
+/* 刷新期间让图标自转：目录刷新可能要走几十页，没有反馈会让人以为没点到。 */
+.icon-btn .spinning {
+  animation: catalog-refresh-spin 0.9s linear infinite;
+}
+
+@keyframes catalog-refresh-spin {
+  to { transform: rotate(360deg); }
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .list-container {
@@ -931,6 +988,13 @@ function formatDate(ts?: number) {
 .reader-catalog.mini .close-btn {
   width: 26px;
   height: 26px;
+}
+
+/* 图标也要跟着缩：26px 热区里放 16px 图标只剩 5px 留白，看着顶手。 */
+.reader-catalog.mini .icon-btn svg,
+.reader-catalog.mini .close-btn svg {
+  width: 14px;
+  height: 14px;
 }
 
 .reader-catalog.mini .chapter-toolbar {

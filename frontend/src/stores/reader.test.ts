@@ -1607,7 +1607,7 @@ describe('reader page background image', () => {
 
   it('keeps both images out of the persisted readConfig payload', () => {
     const readerStore = useReaderStore()
-    const image = 'http://reader.localhost/files?path=default/backgrounds/desktop-abc.png'
+    const image = 'data:image/webp;base64,dGVzdA=='
 
     readerStore.setBackgroundImage(image)
     readerStore.setReaderBackgroundImage(image)
@@ -1798,5 +1798,110 @@ describe('reader page background image', () => {
     const readerStore = useReaderStore()
 
     expect(readerStore.readReaderProgress()).toBeNull()
+  })
+})
+
+describe('reader opening a book restored from a phone backup', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    const storage = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: vi.fn((key: string) => storage.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
+      removeItem: vi.fn((key: string) => storage.delete(key)),
+      clear: vi.fn(() => storage.clear()),
+    })
+    vi.mocked(getChapterList).mockReset()
+    vi.mocked(getBookInfo).mockReset()
+    vi.mocked(getBookContent).mockReset()
+    vi.mocked(saveBookProgress).mockReset()
+    vi.mocked(saveBookProgress).mockResolvedValue('ok')
+    vi.stubGlobal('window', {
+      setTimeout: (handler: () => void, ms?: number) => setTimeout(handler, ms),
+      clearTimeout: (id: number) => clearTimeout(id),
+    })
+  })
+
+  /** Legado 的 `Book.tocUrl` 是 Kotlin 非空 String，备份里就是空串。
+   *  必须当成"没有目录地址"去取详情，而不是拿空 URL 直接抓目录。 */
+  it('falls back to book info when the restored tocUrl is an empty string', async () => {
+    const appStore = useAppStore()
+    appStore.setOnlineStatus(true)
+    const readerStore = useReaderStore()
+    vi.mocked(getBookInfo).mockResolvedValue({
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'https://example.test',
+      bookUrl: 'https://example.test/book',
+      tocUrl: 'https://example.test/book/catalog',
+    })
+    vi.mocked(getChapterList).mockResolvedValue([
+      { title: '第一章', url: 'chapter-0', index: 0 },
+    ])
+    vi.mocked(getBookContent).mockResolvedValue('正文')
+
+    await readerStore.loadBook({
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'https://example.test',
+      bookUrl: 'https://example.test/book',
+      tocUrl: '',
+    })
+
+    expect(getBookInfo).toHaveBeenCalledWith('https://example.test/book', 'https://example.test')
+    expect(getChapterList).toHaveBeenCalledWith(
+      expect.objectContaining({ tocUrl: 'https://example.test/book/catalog' }),
+    )
+    expect(readerStore.content).toBe('正文')
+    expect(readerStore.bookLoadError).toBe('')
+  })
+
+  /** 打开失败必须留下可读原因，并且不再把加载动画挂着 —— 否则页面永久停在
+   *  「加载中…」，用户只能靠反复换源摸索（issue #22 的现象）。 */
+  it('records the failure reason and clears the loading state when the toc request fails', async () => {
+    const appStore = useAppStore()
+    appStore.setOnlineStatus(true)
+    const readerStore = useReaderStore()
+    vi.mocked(getChapterList).mockRejectedValue(new Error('bookSource not found'))
+
+    await expect(readerStore.loadBook({
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'https://example.test/',
+      bookUrl: 'https://example.test/book',
+      tocUrl: 'https://example.test/book/catalog',
+    })).rejects.toThrow('bookSource not found')
+
+    expect(readerStore.bookLoadError).toBe('bookSource not found')
+    expect(readerStore.loading).toBe(false)
+    expect(readerStore.chaptersLoading).toBe(false)
+  })
+
+  /** 目录抓成空数组时同样要报错，而不是接受一个空目录让界面停住。 */
+  it('reports an empty toc instead of silently accepting it', async () => {
+    const appStore = useAppStore()
+    appStore.setOnlineStatus(true)
+    const readerStore = useReaderStore()
+    vi.mocked(getChapterList).mockResolvedValue([])
+    vi.mocked(getBookInfo).mockResolvedValue({
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'https://example.test',
+      bookUrl: 'https://example.test/book',
+    })
+
+    await expect(readerStore.loadBook({
+      name: '测试书籍',
+      author: '测试作者',
+      origin: 'https://example.test',
+      bookUrl: 'https://example.test/book',
+    })).rejects.toThrow('目录为空')
+
+    expect(readerStore.bookLoadError).toContain('目录为空')
+    expect(readerStore.loading).toBe(false)
   })
 })

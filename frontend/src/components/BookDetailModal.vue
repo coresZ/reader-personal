@@ -131,10 +131,37 @@
             两头都缺, 整块藏掉 —— 与顶栏多源搜索的处理一致。
           -->
           <div v-if="!isLocal && !appStore.isWebMode" class="source-section">
-            <h3>{{ singleSourceOnly ? '书源' : '可读书源' }}</h3>
+            <div class="section-heading">
+              <h3>{{ singleSourceOnly ? '书源' : '可读书源' }}</h3>
+              <!-- 与手机端详情页的 menu_refresh 对齐：随时重搜可用书源。
+                   此前只有「部分书源访问失败」时才会冒出「重试」，正常结束
+                   （比如源站刚恢复、或用户刚登录）后没有任何刷新入口。
+                   搜索中则变成「停止」—— 与换源面板和手机端一致，
+                   某个源卡住时不必等所有源都超时。 -->
+              <button
+                v-if="!singleSourceOnly"
+                type="button"
+                class="section-refresh"
+                :title="sourcesLoading ? '停止搜索其他书源' : '重新搜索其他书源'"
+                :aria-label="sourcesLoading ? '停止搜索其他书源' : '重新搜索其他书源'"
+                @click="sourcesLoading ? stopSourceCandidates() : refreshSourceCandidates()"
+              >
+                <svg v-if="sourcesLoading" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="7" y="7" width="10" height="10" rx="1.5" />
+                </svg>
+                <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" />
+                </svg>
+              </button>
+            </div>
             <div v-if="sourcesLoading && !sourceCandidates.length" class="source-loading">
               <div class="loading-spinner"></div>
               正在查找其他书源...
+            </div>
+            <!-- 停止后一条都没搜到：不能说"未找到其他书源" —— 那是搜索跑完的
+                 结论，而这里是被用户主动打断的。 -->
+            <div v-else-if="!sourceCandidates.length && sourcesStopped" class="source-empty">
+              已停止搜索
             </div>
             <div v-else-if="!sourceCandidates.length && !sourcesIncomplete" class="source-empty">
               未找到其他书源
@@ -360,6 +387,9 @@ const showAllChapters = ref(false)
 const sourceCandidates = ref<SearchBook[]>([])
 const sourcesLoading = ref(false)
 const sourcesIncomplete = ref(false)
+/** 用户主动中止过本次书源搜索。用来区分"搜完了没有结果"与"被我停掉了" ——
+ *  只有后者才该显示「已停止搜索」。 */
+const sourcesStopped = ref(false)
 const selectedSource = ref<SearchBook | null>(null)
 const sourceCatalog = ref(new Map<string, string>())
 const removingFromShelf = ref(false)
@@ -397,7 +427,8 @@ const coverSrc = computed(() => {
     : savedOverride.value
     ? (savedOverride.value.customCoverUrl || props.book.coverUrl)
     : ((props.book as Book).customCoverUrl || props.book.coverUrl)
-  return url ? getCoverUrl(url) : ''
+  // 带上书源地址: 加密封面要靠它反查 `coverDecodeJs`（issue #23）。
+  return url ? getCoverUrl(url, props.book.origin) : ''
 })
 
 const displayChapters = computed(() => {
@@ -540,6 +571,7 @@ function resetDetailState() {
   selectedSource.value = null
   sourceCatalog.value = new Map()
   sourcesLoading.value = false
+  sourcesStopped.value = false
   catalogTarget.value = ''
   chapterError.value = ''
   loadedCatalogIdentity.value = ''
@@ -580,6 +612,7 @@ function loadSourceCandidates(loadId: number, bookKey: string, refresh = false) 
   closeSourceSSE()
   sourcesLoading.value = true
   sourcesIncomplete.value = false
+  sourcesStopped.value = false
   if (refresh) sourceCandidatesCache.delete(sourceCandidatesCacheKey(bookKey))
   const current = toSearchBook(b)
   const storedCandidates = b.sourceCandidates || []
@@ -756,6 +789,43 @@ function retryChapters() {
   const source = selectedSource.value
   if (!source || !props.book) return
   void loadChaptersFor(source.bookUrl, source.origin, detailLoadId, detailKey.value)
+}
+
+/** 重搜「可读书源」列表（对齐手机端详情页的刷新）。
+ *
+ *  只重跑书源搜索，不动书籍详情与目录：
+ *  - `refresh = true` 会清掉按书缓存的候选并带 `refresh: 1` 请求后端，
+ *    否则后端直接把上次的结果原样吐回来，用户点了"刷新"看不出任何变化；
+ *  - 列表会先回落到「当前源 + 书架已保存的候选」，再由新结果逐个追加 ——
+ *    刷新本来就该丢掉上次那批可能已失效的源，留着它们等于没刷；
+ *  - 单源模式（发现页的书）本来就不搜其它源，按钮不渲染 —— 与"重试"的取舍一致。 */
+function refreshSourceCandidates() {
+  if (sourcesLoading.value || props.singleSourceOnly) return
+  loadSourceCandidates(detailLoadId, detailKey.value, true)
+}
+
+/** 中止「可读书源」搜索（对齐手机端换源弹窗的停止、以及手机端详情页的取消）。
+ *
+ *  关键是 `closeSourceSSE()`：`openSse().close()` 在未收到 end/error 时会向
+ *  后端发 `cancel_book_search`，取消标志被置位后服务端会 abort 在途请求，
+ *  而不是让剩下几十个源继续跑完（那些请求会占着书源限速槽位，拖慢随后的
+ *  换源和阅读）。
+ *
+ *  状态复位必须自己做：`sourcesLoading` 只在 SSE 的 end/error 回调里清，
+ *  流被本地关掉后不会再触发，留着它按钮会永久停在"停止"态。
+ *  已拿到的候选保留 —— 用户中途停止想要的正是「就这些，别再等了」；
+ *  `hasMoreSources` 没有独立变量，分页链靠 `sourceSSE` 是否仍是当前流来续，
+ *  关流即断，不会再自动请求下一页。 */
+function stopSourceCandidates() {
+  closeSourceSSE()
+  sourcesLoading.value = false
+  // 主动停止不等于"部分源访问失败"：别让底部弹出「重试」提示。
+  sourcesIncomplete.value = false
+  sourcesStopped.value = true
+  // 搜索可能一个结果都还没回来，界面上原本只有一行转圈；给一个明确回执，
+  // 否则用户分不清是"停了"还是"卡住没动"。
+  const found = Math.max(0, sourceCandidates.value.length - 1)
+  appStore.showToast(found > 0 ? `已停止搜索，保留 ${found} 个其他书源` : '已停止搜索书源', 'success')
 }
 
 watch([() => props.modelValue, detailKey], async ([visible, bookKey]) => {
@@ -1288,11 +1358,12 @@ async function removeFromShelf() {
   cursor: pointer;
 }
 
-/* 书源的 `intro` 通常是一整块信息(最新更新/点击/评分/简介), 限死行数会把
-   真正的简介截掉。收起态保留足够行数, 需要时再展开看全文。 */
+/* 书源的 `intro` 通常是一整块信息(最新更新/点击/评分/简介), 收起态只留 5 行
+   —— 详情页里简介是"扫一眼判断这本书是什么"的配角, 给太多行会把目录和
+   书源列表推到很下面。要看全文点「展开全部」。 */
 .book-intro p.collapsed {
   display: -webkit-box;
-  -webkit-line-clamp: 12;
+  -webkit-line-clamp: 5;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
@@ -1316,10 +1387,51 @@ async function removeFromShelf() {
   margin-bottom: var(--space-6);
 }
 
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
 .source-section h3 {
   font-size: var(--text-base);
   font-weight: 600;
-  margin-bottom: var(--space-3);
+  margin: 0;
+}
+
+/* 「可读书源」标题右侧的刷新/停止按钮：与手机端详情页工具栏图标同一语义。
+   空闲时是刷新图标；搜索中换成停止图标，点了能立刻中止，不必等所有源超时。 */
+.section-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  opacity: 0.65;
+  transition: opacity 0.2s ease, background 0.2s ease;
+}
+
+.section-refresh svg {
+  width: 15px;
+  height: 15px;
+}
+
+.section-refresh:hover:not(:disabled) {
+  opacity: 1;
+  background: var(--color-bg-secondary, rgba(0, 0, 0, 0.05));
+}
+
+.section-refresh:disabled {
+  cursor: default;
+  opacity: 0.45;
 }
 
 .source-loading,

@@ -160,12 +160,30 @@
         <div class="loading-spinner"></div>
       </div>
 
+      <!-- 打开书失败：不能只留一个转圈。目录抓取失败(书源地址不匹配、tocUrl 为空、
+           站点超时)在旧实现里会永久停在加载态，用户只能反复换源摸索。 -->
+      <div v-else-if="store.bookLoadError" class="book-load-error">
+        <p class="book-load-error-title">加载失败</p>
+        <p class="book-load-error-message">{{ store.bookLoadError }}</p>
+        <div class="book-load-error-actions">
+          <button type="button" class="book-load-error-btn primary" @click="retryOpenBook">重试</button>
+          <!-- 换源面板靠 IPC 流探测可用书源, Web 端没有对应能力(见 ReaderSource) -->
+          <button
+            v-if="!appStore.isWebMode"
+            type="button"
+            class="book-load-error-btn"
+            @click="openSourcePanelFromError"
+          >换源</button>
+          <button type="button" class="book-load-error-btn" @click="goHome">返回书架</button>
+        </div>
+      </div>
+
       <div v-else-if="offlineBannerText" class="offline-banner">
         {{ offlineBannerText }}
       </div>
 
       <article
-        v-if="!showChapterLoading && !isContinuousMode"
+        v-if="!showChapterLoading && !store.bookLoadError && !isContinuousMode"
         class="chapter-content"
         :class="{ 'horizontal-page-article': isHorizontalPageMode }"
         :style="{
@@ -226,7 +244,7 @@
       </article>
 
       <div
-        v-if="!showChapterLoading && isContinuousMode"
+        v-if="!showChapterLoading && !store.bookLoadError && isContinuousMode"
         class="continuous-reading"
         :style="{
           maxWidth: config.pageWidth + 'px',
@@ -314,7 +332,10 @@
         <button :disabled="store.currentIndex <= 0 || store.loading" @click="prevChapterFromContextMenu">上一章</button>
         <button :disabled="!store.hasNext || store.loading" @click="nextChapterFromContextMenu">下一章</button>
         <button @click="openCatalogFromContextMenu">目录</button>
-        <button v-if="!isLocalBook(store.book)" @click="openSourceFromContextMenu">换源</button>
+        <button
+          v-if="!isLocalBook(store.book) && !appStore.isWebMode"
+          @click="openSourceFromContextMenu"
+        >换源</button>
         <button @click="toggleAutoReadingFromContextMenu">{{ store.isAutoScrolling ? '停止自动翻页' : '开始自动翻页' }}</button>
         <button @click="refreshFromContextMenu">刷新</button>
       </div>
@@ -2674,6 +2695,27 @@ function openSourceFromContextMenu() {
   store.openPanel('source')
 }
 
+/** 打开书失败后的「重试」：重新走一遍 loadBook（会重取详情与目录）。
+ *
+ *  必须在用户点击时重来，而不是自动重试 —— 失败原因常常是书源站点临时
+ *  不可达或需要登录，自动循环重试只会把站点打成限流。 */
+async function retryOpenBook() {
+  const current = store.book
+  if (!current) {
+    goHome()
+    return
+  }
+  try {
+    await store.loadBook(current, false)
+  } catch (error) {
+    appStore.showToast((error as Error).message || '重试失败', 'error')
+  }
+}
+
+function openSourcePanelFromError() {
+  store.openPanel('source')
+}
+
 function toggleAutoReadingFromContextMenu() {
   closeReaderContextMenu()
   store.toggleAutoReading()
@@ -4055,6 +4097,64 @@ watch(
   line-height: 1.5;
   text-align: center;
   backdrop-filter: blur(6px);
+}
+
+/* 打开书失败的错误态。占满阅读区、居中，与加载动画同一个位置，
+   让"转圈"和"失败"在视觉上是同一个坑位的两种状态。 */
+.book-load-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 100%;
+  padding: 40px 24px;
+  text-align: center;
+}
+
+.book-load-error-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-primary);
+}
+
+.book-load-error-message {
+  margin: 0;
+  max-width: 460px;
+  font-size: 13px;
+  line-height: 1.6;
+  opacity: 0.72;
+  word-break: break-word;
+}
+
+.book-load-error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.book-load-error-btn {
+  min-width: 96px;
+  padding: 8px 18px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  opacity: 0.7;
+  cursor: pointer;
+}
+
+.book-load-error-btn:hover { opacity: 1; }
+
+.book-load-error-btn.primary {
+  border-color: transparent;
+  background: var(--color-primary);
+  color: #fff;
+  opacity: 1;
 }
 
 .loading-spinner {

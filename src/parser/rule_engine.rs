@@ -1220,7 +1220,9 @@ impl RuleEngine {
         rule: &SearchRule,
         list_rule: &str,
     ) -> Vec<SearchBook> {
-        let package = match sxd_document::parser::parse(body) {
+        // `sxd_document` 只吃良构 XML, 真实页面几乎都不合格; 先经 HTML5 DOM
+        // 转成良构 XML, 否则整条 XPath 规则静默返回空(见 `html::html_to_xml`)。
+        let package = match sxd_document::parser::parse(&html::html_to_xml(body)) {
             Ok(p) => p,
             Err(_) => return vec![],
         };
@@ -1271,9 +1273,9 @@ impl RuleEngine {
         rule: &SearchRule,
         list_rule: &str,
     ) -> Vec<SearchBook> {
-        let v: Value = match serde_json::from_str(body) {
-            Ok(v) => v,
-            Err(_) => return vec![],
+        let v: Value = match parse_json_body(body) {
+            Some(v) => v,
+            None => return vec![],
         };
         let items = jsonpath::jsonpath_query(&v, self.strip_mode_prefix(list_rule));
         let mut out = Vec::with_capacity(items.len());
@@ -1388,7 +1390,7 @@ fn parse_book_info_xpath(
     book_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Book {
-    let package = match sxd_document::parser::parse(body) {
+    let package = match sxd_document::parser::parse(&html::html_to_xml(body)) {
         Ok(p) => p,
         Err(_) => return parse_book_info_html(source, body, base_url, rule, book_url, ctx),
     };
@@ -1670,7 +1672,7 @@ fn parse_chapter_list_xpath(
     list_rule: &str,
     ctx: &mut HashMap<String, String>,
 ) -> (Vec<BookChapter>, Vec<String>) {
-    let package = match sxd_document::parser::parse(body) {
+    let package = match sxd_document::parser::parse(&html::html_to_xml(body)) {
         Ok(p) => p,
         Err(_) => return parse_chapter_list_html(body, base_url, rule, list_rule, ctx),
     };
@@ -1746,6 +1748,184 @@ fn parse_chapter_list_xpath(
     (out, next_urls)
 }
 
+/// 解析 JSON 响应体，容忍 UTF-8 BOM。
+///
+/// 部分站点（例如 `catalog.chuangke.tv` 的目录接口）会在 JSON 前面带一个
+/// `\u{FEFF}`。`serde_json` 视其为非法字符而直接报 "expected value"，
+/// 目录/搜索就会被静默解析成 0 条 —— 阅读页表现为「打开书一直转圈、
+/// 目录空白」。legado 侧用 Gson 解析，同样不容忍 BOM，但它的 HTTP 层
+/// 已按 charset 解码并剥离 BOM，所以这里补上等价处理。
+fn parse_json_body(body: &str) -> Option<Value> {
+    serde_json::from_str(body)
+        .ok()
+        .or_else(|| serde_json::from_str(body.trim_start_matches('\u{feff}')).ok())
+}
+
+/// 目录逐章求值并发化的最小章节数。
+///
+/// 低于这个规模时开线程的代价（约 100µs/线程 + 每线程要重建一次 JS 上下文）
+/// 超过收益 —— 普通目录只有几十章，串行反而更快。手机端 `BookChapterList`
+/// 直接 `mapAsync(AppConfig.threadCount)`、不设阈值，但它跑在协程上、切换成本
+/// 远低于 OS 线程，这里按实测折中。
+const TOC_PARALLEL_MIN_ITEMS: usize = 120;
+
+/// 并发求值时单线程最多处理的章节数（决定线程数上限）。
+const TOC_PARALLEL_CHUNK: usize = 400;
+
+/// 并发线程数上限。再高只会互相抢 CPU，还会成倍放大每线程重建 JS 上下文的
+/// 固定开销；留一半核数给主线程与 HTTP 任务。
+fn toc_parallel_thread_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .div_ceil(2)
+        .clamp(1, 8)
+}
+
+/// 目录字段规则里是否含 JS。
+///
+/// 只有含 JS 的规则才值得并发：纯 CSS/XPath/JSONPath 的求值是纯 CPU 的
+/// 字符串匹配，单条微秒级，并发收益抵不上线程开销；而 JS 规则每条要走
+/// 一次 rquickjs（即使已优化，单条约 5ms），是唯一值得并行的大头。
+fn toc_rule_has_js(rule: &TocRule) -> bool {
+    [
+        rule.chapter_name.as_deref(),
+        rule.chapter_url.as_deref(),
+        rule.update_time.as_deref(),
+        rule.is_volume.as_deref(),
+        rule.is_vip.as_deref(),
+        rule.is_pay.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| {
+        let trimmed = value.trim();
+        trimmed.contains("@js:") || trimmed.contains("<js>") || trimmed.starts_with("js:")
+    })
+}
+
+/// 单章的求值结果（尚未分配索引与去重）。
+struct RawChapter {
+    title: String,
+    url: String,
+    tag: Option<String>,
+    is_volume: bool,
+    is_vip: bool,
+    is_pay: bool,
+}
+
+/// 在一条 item 上求值全部章节字段。
+fn eval_chapter_fields(
+    rule: &TocRule,
+    item: &Value,
+    base_url: &str,
+    ctx: &mut HashMap<String, String>,
+) -> RawChapter {
+    let title = eval_field_json_with_ctx(
+        rule.chapter_name.as_deref().unwrap_or(""),
+        item,
+        base_url,
+        ctx,
+    )
+    .unwrap_or_default();
+    let url = eval_field_json_with_ctx(
+        rule.chapter_url.as_deref().unwrap_or(""),
+        item,
+        base_url,
+        ctx,
+    )
+    .unwrap_or_default();
+    let tag = eval_field_json_with_ctx(
+        rule.update_time.as_deref().unwrap_or(""),
+        item,
+        base_url,
+        ctx,
+    );
+    let is_volume = eval_field_json_with_ctx(
+        rule.is_volume.as_deref().unwrap_or(""),
+        item,
+        base_url,
+        ctx,
+    )
+    .map(is_truthy)
+    .unwrap_or(false);
+    let is_vip =
+        eval_field_json_with_ctx(rule.is_vip.as_deref().unwrap_or(""), item, base_url, ctx)
+            .map(is_truthy)
+            .unwrap_or(false);
+    let is_pay =
+        eval_field_json_with_ctx(rule.is_pay.as_deref().unwrap_or(""), item, base_url, ctx)
+            .map(is_truthy)
+            .unwrap_or(false);
+    RawChapter { title, url, tag, is_volume, is_vip, is_pay }
+}
+
+/// 并发地对全部 item 求值章节字段，结果按原顺序返回。
+///
+/// 为什么必须用 **OS 线程**而不是 rayon/tokio 任务：JS 上下文、书源信息、
+/// 书籍上下文全部是 thread-local（见 `parser::js` 的 `ACTIVE_*`），跨线程
+/// 共享会踩 `Context::with` 不可重入，也会让 `source.getKey()` 拿到别的源的
+/// 值。每个工作线程各自持有一份 thread-local，才能保证与串行求值相同的语义。
+///
+/// 实现上按块切分、各线程只写自己的 `Vec`，最后按块顺序拼接 —— 不用锁，
+/// 也不会打乱章节顺序（顺序错乱会直接毁掉目录）。
+fn eval_chapter_fields_parallel(
+    rule: &TocRule,
+    items: &[Value],
+    base_url: &str,
+) -> Vec<RawChapter> {
+    let total = items.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    // 主线程的 JS 上下文：工作线程必须各自重放一份，否则 source.getKey() 等
+    // 全部落空（详见 JsThreadContext 的说明）。
+    let thread_context = crate::parser::js::JsThreadContext::capture();
+    // 块大小同时受两个约束：单线程最多 TOC_PARALLEL_CHUNK 条（保证并行度），
+    // 以及线程数不超过 CPU 允许的上限（避免起一堆线程互相抢核）。
+    let limit = toc_parallel_thread_limit();
+    let chunk = TOC_PARALLEL_CHUNK.min(total.div_ceil(limit).max(1));
+
+    // 预先切好块，每个线程拿到互不重叠的一段。
+    let chunks: Vec<&[Value]> = items.chunks(chunk).collect();
+
+    let mut parts: Vec<Vec<RawChapter>> = Vec::with_capacity(chunks.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|slice| {
+                // 每个线程都要一份自己的上下文副本（闭包里按引用借用）。
+                let context = thread_context.clone();
+                scope.spawn(move || {
+                    context.replay(|| {
+                        // 每个线程独立的 @put/@get 状态。
+                        //
+                        // 串行版本跨 item 共享同一个 ctx，理论上书源可以用
+                        // `@put` 把上一章的值带到下一章。但并发下"上一章"没有
+                        // 确定含义；手机端 `mapAsync` 同样是各协程独立，口径一致。
+                        // 目录字段规则里跨章 put 依赖极少见，不值得为它放弃并发。
+                        let mut ctx: HashMap<String, String> = HashMap::new();
+                        slice
+                            .iter()
+                            .map(|item| eval_chapter_fields(rule, item, base_url, &mut ctx))
+                            .collect::<Vec<_>>()
+                    })
+                })
+            })
+            .collect();
+        for handle in handles {
+            match handle.join() {
+                Ok(part) => parts.push(part),
+                // 某块求值 panic 时不能让整次目录解析跟着炸：丢掉该块即可，
+                // 上层会看到章节数偏少，而不是「打开书直接失败」。
+                Err(_) => parts.push(Vec::new()),
+            }
+        }
+    });
+
+    parts.into_iter().flatten().collect()
+}
+
 fn parse_chapter_list_json(
     body: &str,
     base_url: &str,
@@ -1753,53 +1933,32 @@ fn parse_chapter_list_json(
     list_rule: &str,
     ctx: &mut HashMap<String, String>,
 ) -> (Vec<BookChapter>, Vec<String>) {
-    let v: Value = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(_) => return (vec![], vec![]),
+    let v: Value = match parse_json_body(body) {
+        Some(v) => v,
+        None => return (vec![], vec![]),
     };
     let scope = select_json_scope(&v, rule.init.as_deref(), base_url, ctx);
     let items = jsonpath::jsonpath_query(&scope, list_rule);
 
+    // 大目录 + JS 字段规则时并发求值（对齐手机端 `BookChapterList` 的
+    // `mapAsync(threadCount)`）。两个条件缺一不可：
+    //  - 章节少时开线程的固定开销（上下文重建约 6ms/线程）反而更慢；
+    //  - 规则不含 JS 时单条求值是微秒级，并发没有收益。
+    let raw_chapters: Vec<RawChapter> = if items.len() >= TOC_PARALLEL_MIN_ITEMS
+        && toc_rule_has_js(rule)
+    {
+        eval_chapter_fields_parallel(rule, &items, base_url)
+    } else {
+        items
+            .iter()
+            .map(|item| eval_chapter_fields(rule, item, base_url, ctx))
+            .collect()
+    };
+
     let mut seen_urls = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        let title = eval_field_json_with_ctx(
-            rule.chapter_name.as_deref().unwrap_or(""),
-            &item,
-            base_url,
-            ctx,
-        )
-        .unwrap_or_default();
-        let url = eval_field_json_with_ctx(
-            rule.chapter_url.as_deref().unwrap_or(""),
-            &item,
-            base_url,
-            ctx,
-        )
-        .unwrap_or_default();
-        let tag = eval_field_json_with_ctx(
-            rule.update_time.as_deref().unwrap_or(""),
-            &item,
-            base_url,
-            ctx,
-        );
-        let is_volume = eval_field_json_with_ctx(
-            rule.is_volume.as_deref().unwrap_or(""),
-            &item,
-            base_url,
-            ctx,
-        )
-        .map(is_truthy)
-        .unwrap_or(false);
-        let is_vip =
-            eval_field_json_with_ctx(rule.is_vip.as_deref().unwrap_or(""), &item, base_url, ctx)
-                .map(is_truthy)
-                .unwrap_or(false);
-        let is_pay =
-            eval_field_json_with_ctx(rule.is_pay.as_deref().unwrap_or(""), &item, base_url, ctx)
-                .map(is_truthy)
-                .unwrap_or(false);
-        let url_abs = finalize_chapter_url(base_url, &url, &title, is_volume, out.len());
+    let mut out = Vec::with_capacity(raw_chapters.len());
+    for raw in raw_chapters {
+        let url_abs = finalize_chapter_url(base_url, &raw.url, &raw.title, raw.is_volume, out.len());
 
         if seen_urls.contains(&url_abs) {
             continue;
@@ -1807,13 +1966,13 @@ fn parse_chapter_list_json(
         seen_urls.insert(url_abs.clone());
 
         out.push(BookChapter {
-            title,
+            title: raw.title,
             url: url_abs,
             index: out.len() as i32,
-            tag,
-            is_vip,
-            is_pay,
-            is_volume,
+            tag: raw.tag,
+            is_vip: raw.is_vip,
+            is_pay: raw.is_pay,
+            is_volume: raw.is_volume,
             ..Default::default()
         });
     }
@@ -2388,7 +2547,11 @@ fn eval_field_html_doc_with_ctx(
     }
     if rule.starts_with("@xpath:") {
         let pure = &rule[7..];
-        return html::select_xpath(&doc.html(), pure).first().cloned();
+        // 取第一个**非空白**结果: `//text()` 命中的首个节点常是排版空白,
+        // 只取首项会把字段读成空白串(见 `eval_field_xpath_single_with_ctx`)。
+        return html::select_xpath(&doc.html(), pure)
+            .into_iter()
+            .find(|value| !value.trim().is_empty());
     }
 
     if let Some(res) = try_put_get_html_doc(rule, doc, base_url, ctx) {
@@ -2537,9 +2700,13 @@ fn eval_field_xpath_single_with_ctx(
             .find_map(|n| html::node_extract(&n, ext))
             .unwrap_or_default()
     } else {
+        // 取第一个**非空白**结果: `//text()` 这类规则命中的第一个节点常是排版
+        // 用的纯空白(如 `<span></span>` 之间的缩进), legado 的 `getString`
+        // 会 trim 后判空再继续, 只取首个节点会把字段读成一片空白。
         xpath_eval_strings(node, xpath_str)
             .into_iter()
-            .next()
+            .map(|value| value.trim().to_string())
+            .find(|value| !value.is_empty())
             .unwrap_or_default()
     };
     if text.is_empty() && had_templates && !pure.is_empty() {
@@ -2574,17 +2741,35 @@ fn select_xpath_scope<'a>(
         .unwrap_or(node)
 }
 
+/// 把规则里的绝对路径改写成相对当前节点。
+///
+/// legado 的字段规则是对 **item 节点**求值的(jsoupXpath 的 `//div` 从该元素向下
+/// 搜索), 而标准 XPath 里 `//div` 是"从文档根开始的绝对路径"。用标准语义求值
+/// 时, 每条 item 都会命中文档里**第一个**匹配元素 —— 列表就变成 20 条一模一样
+/// 的书(本源的 `bookList` + 字段全是 `//…` 写法, 正是这样)。
+///
+/// 只有以 `/` 开头、且当前不是文档根时才补一个 `.`(`//a` → `.//a`,
+/// `/div/a` → `./div/a`); 其余(相对路径、`(` 开头的表达式)原样返回。
+fn relativize_xpath<'a>(node: sxd_xpath::nodeset::Node<'_>, xpath: &'a str) -> std::borrow::Cow<'a, str> {
+    use sxd_xpath::nodeset::Node;
+    if matches!(node, Node::Root(_)) || !xpath.starts_with('/') {
+        return std::borrow::Cow::Borrowed(xpath);
+    }
+    std::borrow::Cow::Owned(format!(".{xpath}"))
+}
+
 fn xpath_select_nodes<'a>(
     node: sxd_xpath::nodeset::Node<'a>,
     xpath: &str,
 ) -> Vec<sxd_xpath::nodeset::Node<'a>> {
     let (path, _extractor) = html::split_xpath_axis(xpath);
-    let xpath = path.trim();
-    if xpath.is_empty() {
+    let raw = path.trim();
+    if raw.is_empty() {
         return vec![];
     }
+    let xpath = relativize_xpath(node, raw);
     let context = XPathContext::new();
-    match XPathFactory::new().build(xpath) {
+    match XPathFactory::new().build(xpath.as_ref()) {
         Ok(Some(expr)) => match expr.evaluate(&context, node) {
             Ok(XPathValue::Nodeset(ns)) => ns.document_order(),
             _ => vec![],
@@ -2595,12 +2780,13 @@ fn xpath_select_nodes<'a>(
 
 fn xpath_eval_strings(node: sxd_xpath::nodeset::Node<'_>, xpath: &str) -> Vec<String> {
     let (path, _extractor) = html::split_xpath_axis(xpath);
-    let xpath = path.trim();
-    if xpath.is_empty() {
+    let raw = path.trim();
+    if raw.is_empty() {
         return vec![];
     }
+    let xpath = relativize_xpath(node, raw);
     let context = XPathContext::new();
-    match XPathFactory::new().build(xpath) {
+    match XPathFactory::new().build(xpath.as_ref()) {
         Ok(Some(expr)) => match expr.evaluate(&context, node) {
             Ok(XPathValue::Nodeset(ns)) => ns
                 .document_order()
@@ -3596,6 +3782,7 @@ mod tests {
     use crate::model::book_source::BookSource;
     use crate::model::rule::{BookInfoRule, ContentRule, SearchRule, TocRule};
 
+
     /// 空字段规则必须给空值。某书源 `ruleExplore.kind` / `updateTime` 是空串,
     /// 早先会落到"纯 JS 规则"分支返回**当前元素的 outerHtml**, 于是整段 `<li>`
     /// 被当成字段值, 详情页标签显示 HTML 源码。对齐 legado
@@ -4206,6 +4393,125 @@ mod tests {
             content,
             r#"<div class="con"><p>第一段,{"click":"showCommentPanel(1)"}</p></div>"#
         );
+    }
+    /// 带 UTF-8 BOM 的 JSON 目录必须能解析出章节。
+    ///
+    /// 实测 `catalog.chuangke.tv` 的目录接口响应就是 `\u{FEFF}{"code":1,...}`。
+    /// `serde_json` 遇到 BOM 直接报 "expected value"，目录被静默解析成 0 条 ——
+    /// 阅读页表现为「打开书一直转圈、目录空白、书源也加载不出来」（issue #22）。
+    #[test]
+    fn json_toc_tolerates_utf8_bom() {
+        let body = "\u{feff}{\"code\":1,\"data\":[{\"name\":\"第一章\",\"path\":\"1.html\"},{\"name\":\"第二章\",\"path\":\"2.html\"}]}";
+        let rule = TocRule {
+            chapter_list: Some("$.data".to_string()),
+            chapter_name: Some("$.name".to_string()),
+            chapter_url: Some("{{$.path}}".to_string()),
+            ..Default::default()
+        };
+        let mut ctx = HashMap::new();
+        let (chapters, _) = parse_chapter_list_json(
+            body,
+            "https://example.test/book/",
+            &rule,
+            "$.data",
+            &mut ctx,
+        );
+        assert_eq!(chapters.len(), 2, "带 BOM 的 JSON 也必须解析出章节");
+        assert_eq!(chapters[0].title, "第一章");
+    }
+
+    /// 不带 BOM 时行为不变。
+    #[test]
+    fn json_toc_without_bom_still_parses() {
+        let body = "{\"data\":[{\"name\":\"第一章\",\"path\":\"1.html\"}]}";
+        let rule = TocRule {
+            chapter_list: Some("$.data".to_string()),
+            chapter_name: Some("$.name".to_string()),
+            chapter_url: Some("{{$.path}}".to_string()),
+            ..Default::default()
+        };
+        let mut ctx = HashMap::new();
+        let (chapters, _) = parse_chapter_list_json(
+            body,
+            "https://example.test/book/",
+            &rule,
+            "$.data",
+            &mut ctx,
+        );
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].title, "第一章");
+    }
+    /// 并发求值必须与串行**逐章一致**（顺序、标题、地址都要相同）。
+    ///
+    /// 这是并发化的正确性底线：章节顺序错乱或域名拼接失效会直接毁掉目录。
+    /// 用真实书源「小小阅读（+++）」的 1826 章目录做对照，只有在 fixture
+    /// 存在时才跑（CI 上没有该文件，自动跳过）。
+    #[test]
+    #[ignore]
+    fn parallel_toc_matches_serial_on_real_1826_chapters() {
+        let Ok(src_raw) = std::fs::read_to_string(r"E:\Desktop\reader\.tmp-issue22\src.json") else {
+            eprintln!("skip: fixture missing");
+            return;
+        };
+        let Ok(body) = std::fs::read_to_string(r"E:\Desktop\reader\.tmp-issue22\body.json") else {
+            eprintln!("skip: fixture missing");
+            return;
+        };
+        let body = body.trim_start_matches('\u{feff}').to_string();
+        let source: BookSource = serde_json::from_str(&src_raw).expect("source");
+        let toc = source.rule_toc.clone().unwrap_or_default();
+        let base = "https://catalog.chuangke.tv/qu/241/57/ae/229.html";
+
+        let v: Value = serde_json::from_str(&body).expect("json");
+        let items = jsonpath::jsonpath_query(&v, "$.data");
+        assert!(items.len() > 1000, "样本应是大目录, got {}", items.len());
+
+        let serial = crate::parser::js::with_source(&source, || {
+            let mut ctx = HashMap::new();
+            items
+                .iter()
+                .map(|item| eval_chapter_fields(&toc, item, base, &mut ctx))
+                .collect::<Vec<_>>()
+        });
+
+        let parallel = crate::parser::js::with_source(&source, || {
+            eval_chapter_fields_parallel(&toc, &items, base)
+        });
+
+        assert_eq!(serial.len(), parallel.len(), "并发后章节数必须一致");
+        for (index, (a, b)) in serial.iter().zip(parallel.iter()).enumerate() {
+            assert_eq!(a.title, b.title, "第 {index} 章标题必须一致");
+            assert_eq!(a.url, b.url, "第 {index} 章地址必须一致");
+        }
+        eprintln!("verified {} chapters identical", serial.len());
+    }
+
+    /// 并发求值必须保留 source.getKey() 等 thread-local 上下文。
+    #[test]
+    fn parallel_toc_keeps_source_context() {
+        let source = BookSource {
+            book_source_name: "并发上下文".to_string(),
+            book_source_url: "https://s.example.test".to_string(),
+            ..Default::default()
+        };
+        // 构造一个足够大的目录，触发并发路径；地址规则依赖 source.getKey()。
+        let items: Vec<Value> = (0..TOC_PARALLEL_MIN_ITEMS + 10)
+            .map(|i| serde_json::json!({ "name": format!("第{i}章"), "path": format!("{i}.html") }))
+            .collect();
+        let rule = TocRule {
+            chapter_name: Some("$.name".to_string()),
+            chapter_url: Some("{{source.getKey().replace('//s','//c')}}/{{$.path}}".to_string()),
+            ..Default::default()
+        };
+
+        let out = crate::parser::js::with_source(&source, || {
+            eval_chapter_fields_parallel(&rule, &items, "https://s.example.test/book/")
+        });
+
+        assert_eq!(out.len(), items.len(), "并发不能丢章");
+        // source.getKey() 丢失时这里会变成 "/0.html" 之类的相对地址。
+        assert_eq!(out[0].url, "https://c.example.test/0.html", "并发线程必须拿到书源上下文");
+        assert_eq!(out[0].title, "第0章");
     }
 }
 

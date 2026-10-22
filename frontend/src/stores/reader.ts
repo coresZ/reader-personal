@@ -220,7 +220,7 @@ function loadConfig(): ReadConfig {
         // 自定义配色来自 localStorage, 必须收紧为合法色值再进 style。
         fontColor: normalizeReaderColor(savedConfig.fontColor),
         readerBackgroundColor: normalizeReaderColor(savedConfig.readerBackgroundColor),
-        // 阅读页专属背景图与桌面背景图分开存(都是 dataURL, 不进 readConfig)。
+        // 阅读页专属背景图与桌面背景图分开存(都是 reader:// 的 URL, 不进 readConfig)。
         readerBackgroundImage: localStorage.getItem(READER_PAGE_BACKGROUND_IMAGE_KEY)
           || (typeof savedConfig.readerBackgroundImage === 'string' ? savedConfig.readerBackgroundImage : ''),
         readerImageOpacity: normalizeReaderBackgroundOpacity(savedConfig.readerImageOpacity),
@@ -281,6 +281,19 @@ const OPENAI_AUDIO_PRELOAD_LIMIT = 8
 /** 复用在途预载时的加载动画延迟。命中预载本该是"瞬间换章", 200ms 内返回就完全
  *  不显示动画; 超过则说明书源确实慢, 亮出动画免得用户以为翻页没反应。 */
 const CHAPTER_LOADING_INDICATOR_DELAY_MS = 200
+
+/**
+ * 空/纯空白的 URL 字段归一成 undefined。
+ *
+ * Legado 的 `Book.tocUrl` 是非空 `String`，从手机端备份恢复（或从手机端 WebDAV
+ * 同步过来）的书架里它常常就是 `""`。前端若把这个空串当成"有目录地址"，
+ * 就会带着空 URL 去请求目录，同时跳过"缺 tocUrl 就取详情"的分支 ——
+ * 结果正是 issue #22 的「打开书一直转圈，切换一次书源才好」。
+ */
+function normalizeOptionalUrl(value?: string | null): string | undefined {
+  const trimmed = (value ?? '').trim()
+  return trimmed ? trimmed : undefined
+}
 
 export type SpeechProvider = 'system' | 'openai'
 export type OpenAISpeechSource = 'browser' | 'server'
@@ -375,6 +388,9 @@ export const useReaderStore = defineStore('reader', () => {
     }
   }
   const chaptersLoading = ref(false)
+  /** 打开书失败时的原因（空串表示没有失败）。阅读页据此显示可重试的错误态，
+   *  而不是把所有失败都表现成永久的「加载中…」。 */
+  const bookLoadError = ref('')
   const bookmarks = ref<Bookmark[]>([])
   const replaceRules = ref<ReplaceRule[]>([])
   const preloadedContent = ref<Map<number, string>>(new Map()) // index -> content
@@ -1915,6 +1931,7 @@ export const useReaderStore = defineStore('reader', () => {
   /* ─── Book / chapter ops ─── */
   async function loadBook(b: Book, syncProgress = true) {
     loading.value = true
+    bookLoadError.value = ''
     const requestId = ++bookLoadRequestId
     chapterLoadRequestId += 1
     pendingLegadoProgress.value = null
@@ -1943,13 +1960,19 @@ export const useReaderStore = defineStore('reader', () => {
     lastServerProgressKey.value = ''
     chaptersLoading.value = true
     try {
-      let tocUrl = b.tocUrl
+      // 空白目录地址必须当成"没有"。
+      //
+      // 从手机端(Legado)导入的书架里 `tocUrl` 常是空串(Kotlin 侧是非空 String)，
+      // 前端原样带着它去请求目录，后端就会拿空 URL 抓页 —— 既不回落去取详情，
+      // 也报不出可读原因。这里统一归一成 undefined，让下面"缺 tocUrl 就取详情"
+      // 的分支真正生效。
+      let tocUrl = normalizeOptionalUrl(b.tocUrl)
       if (!tocUrl && !isLocalBook(b)) {
         // 搜索结果还没有详情；取回书源脚本设置的每书配置，再用详情中的目录地址加载。
         const detail = await getBookInfo(b.bookUrl, b.origin).catch(() => null)
         if (requestId !== bookLoadRequestId || book.value?.bookUrl !== b.bookUrl) return
         if (detail) {
-          tocUrl = detail.tocUrl || tocUrl
+          tocUrl = normalizeOptionalUrl(detail.tocUrl) || tocUrl
           book.value = {
             ...b,
             tocUrl,
@@ -1991,11 +2014,24 @@ export const useReaderStore = defineStore('reader', () => {
       // 打开书后台静默检查目录更新(按书 30 分钟节流), 不阻塞首屏渲染
       void refreshTocFromSource()
     } catch (error) {
-      loading.value = false
+      // 只清掉自己那一次的加载态：loadBook 之后可能又发起了新的 loadBook/loadChapter,
+      // 无条件置 false 会把它们的加载动画一起关掉。
+      if (requestId === bookLoadRequestId) {
+        loading.value = false
+        bookLoadError.value = (error instanceof Error ? error.message : String(error ?? '')).trim()
+          || '打开书籍失败'
+      }
+      // 失败必须让用户看见原因，并且把「这本书打不开」这件事告诉调用方。
+      //
+      // 早先这里只把错误往上抛，调用点(书架/最近/详情)都是 `void loadBook(...).catch(...)`，
+      // 而阅读页在 store.book 已赋值的情况下不会做任何兜底 —— 于是目录抓失败
+      // (书源地址对不上、tocUrl 为空、站点超时)就停在「加载中…」不动，
+      // 连"为什么"都没有，用户只能靠反复换源摸索。
       throw error
     } finally {
       if (requestId === bookLoadRequestId) {
         chaptersLoading.value = false
+        if (chapters.value.length === 0) loading.value = false
       }
     }
   }
@@ -2372,6 +2408,7 @@ export const useReaderStore = defineStore('reader', () => {
     const previousIndex = currentIndex.value
     const previousProgress = chapterScrollProgress.value
     loading.value = true
+    bookLoadError.value = ''
     try {
       const updatedBook = await apiSetBookSource({
         bookUrl: book.value.bookUrl,
@@ -2459,7 +2496,12 @@ export const useReaderStore = defineStore('reader', () => {
   async function fetchTocListWithStabilizing(): Promise<BookChapter[]> {
     const b = book.value
     if (!b) return []
-    const base = { bookUrl: b.bookUrl, bookSourceUrl: b.origin, tocUrl: b.tocUrl }
+    // tocUrl 为空串时不要传 —— 后端会把它当成"没给目录地址"并回落到 bookUrl 取详情。
+    const base = {
+      bookUrl: b.bookUrl,
+      bookSourceUrl: b.origin,
+      ...(normalizeOptionalUrl(b.tocUrl) ? { tocUrl: b.tocUrl } : {}),
+    }
     let list = await getChapterList({ ...base, refresh: 1 })
     for (let attempt = 0; attempt < 3; attempt += 1) {
       if (!list.length) break
@@ -2514,16 +2556,27 @@ export const useReaderStore = defineStore('reader', () => {
   async function refreshChapters() {
     if (!book.value) return
     chaptersLoading.value = true
+    bookLoadError.value = ''
     try {
       preloadedContent.value.clear()
       preloadingContent.clear()
       chapterPreloadGeneration += 1
       markTocChecked(book.value.bookUrl)
-      chapters.value = await fetchTocListWithStabilizing()
+      const fresh = await fetchTocListWithStabilizing()
+      if (!fresh.length) {
+        // 目录刷成空必须报出来。此前这里静默接受空数组：目录列表直接变空白，
+        // 阅读页正文也不动，用户只会以为"刷新按钮坏了"。
+        throw new Error('目录为空，请检查书源或稍后重试')
+      }
+      chapters.value = fresh
       const targetIndex = Math.max(0, Math.min(chapters.value.length - 1, currentIndex.value))
       if (chapters.value[targetIndex]) {
         await loadChapter(targetIndex, true)
       }
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error ?? '')).trim()
+      appStore.showToast(message || '刷新目录失败', 'error')
+      throw error
     } finally {
       chaptersLoading.value = false
     }
@@ -2607,6 +2660,7 @@ export const useReaderStore = defineStore('reader', () => {
     restoringLegadoProgress.value = false
     legadoPositionRestore.value = null
     legadoPositionRestoreCompleted.value = null
+    bookLoadError.value = ''
     book.value = null
     openPosition.value = null
     refreshing.value = false
@@ -2659,6 +2713,7 @@ export const useReaderStore = defineStore('reader', () => {
 
   return {
     book, chapters, currentIndex, content, loading, loadStage, refreshing, contentRefreshToken, chaptersLoading, openPosition, restoringLegadoProgress,
+    bookLoadError,
     legadoPositionRestore,
     legadoPositionRestoreCompleted,
     currentChapter, hasNext, hasPrev, readingProgress,

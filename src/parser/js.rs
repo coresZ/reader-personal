@@ -244,6 +244,57 @@ pub fn with_book_context<T>(ctx: Option<JsBookContext>, f: impl FnOnce() -> T) -
     with_thread_local(&ACTIVE_BOOK_CTX, ctx, f)
 }
 
+/// 当前线程 JS 上下文的可跨线程快照。
+///
+/// 目录解析为了并发（对齐手机端 `BookChapterList.mapAsync`）会在多个 OS 线程
+/// 上求值。JS 上下文全是 thread-local，新线程默认什么都拿不到 ——
+/// `source.getKey()` 会变成空串（章节域名拼不出来）、`book.bookUrl` 为空、
+/// 默认请求头与 cookie 全部丢失，结果就是"并发之后目录全错"。
+///
+/// 这里把主线程登记过的那几项打包出来，由工作线程在开始求值前原样重放。
+#[derive(Clone)]
+pub struct JsThreadContext {
+    source: Option<JsSourceInfo>,
+    js_lib: Option<String>,
+    book_url: Option<String>,
+    book: Option<JsBookContext>,
+    http: Option<SourceHttpContext>,
+    search: Option<(String, i32)>,
+}
+
+impl JsThreadContext {
+    /// 捕获当前线程的 JS 上下文（在工作线程上重放前调用）。
+    pub fn capture() -> Self {
+        Self {
+            source: ACTIVE_SOURCE.with(|cell| cell.borrow().clone()),
+            js_lib: ACTIVE_JS_LIB.with(|cell| cell.borrow().clone()),
+            book_url: ACTIVE_BOOK_URL.with(|cell| cell.borrow().clone()),
+            book: ACTIVE_BOOK_CTX.with(|cell| cell.borrow().clone()),
+            http: ACTIVE_HTTP.with(|cell| cell.borrow().clone()),
+            search: ACTIVE_SEARCH.with(|cell| cell.borrow().clone()),
+        }
+    }
+
+    /// 在工作线程上重放捕获的上下文后执行 f。
+    ///
+    /// 只重放"决定规则语义"的那几项（书源 / jsLib / 书籍 / 请求头）；
+    /// 日志与副作用队列（`JS_LOGS`、`EXPLORE_INTENTS` 等）故意不重放 ——
+    /// 它们属于产生它们的那个线程，跨线程搬运反而会串味。
+    pub fn replay<T>(self, f: impl FnOnce() -> T) -> T {
+        with_thread_local(&ACTIVE_SOURCE, self.source, || {
+            with_thread_local(&ACTIVE_JS_LIB, self.js_lib, || {
+                with_thread_local(&ACTIVE_BOOK_URL, self.book_url, || {
+                    with_thread_local(&ACTIVE_BOOK_CTX, self.book, || {
+                        with_thread_local(&ACTIVE_HTTP, self.http, || {
+                            with_thread_local(&ACTIVE_SEARCH, self.search, f)
+                        })
+                    })
+                })
+            })
+        })
+    }
+}
+
 fn active_source() -> JsSourceInfo {
     ACTIVE_SOURCE.with(|cell| cell.borrow().clone().unwrap_or_default())
 }
@@ -360,6 +411,34 @@ pub fn eval_js(script: &str, input: &str, base_url: &str) -> anyhow::Result<Stri
     eval_js_inner(script, Some(input), Some(base_url), None, None, None)
 }
 
+/// 求值 `coverDecodeJs` / `imageDecode` 这类**图片解密**脚本, 取回二进制字节。
+///
+/// 与普通规则求值的差异全在"字节"上:
+///
+/// - 注入: `result` 必须是**字节序列**(数字数组), 不能先转成 UTF-8 文本 ——
+///   AES/CBC/NoPadding 的密文任意字节都可能出现, 一旦按 UTF-8 解码就是有损的,
+///   解密出来必然花屏。legado 注入的是 `ByteArray`(封面是 `InputStream`)。
+/// - 返回: 脚本普遍写 `createSymmetricCrypto(...).decrypt(result)`, 而 legado 的
+///   `decrypt` 返回 `ByteArray`。本端 prelude 里 `decrypt` 默认按文本输出
+///   (`String::from_utf8_lossy`), 这里在求值期间把 `__byteMode` 置 1, 让
+///   `decrypt`/`decryptStr` 改走"原始字节"分支(见 prelude 里 `symmetric`)。
+///
+/// `src` 是图片地址(legado 的同名变量), 同时用作 `base_url`。
+pub fn eval_js_cover_decode(script: &str, src: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let out = eval_js_inner_with_source(
+        script,
+        Some(src),
+        Some(src),
+        None,
+        None,
+        None,
+        None,
+        Some(raw),
+    )?;
+    // 宿主取回的是 latin1 承载的字节序列(每 char 一个字节), 这里还原成原始字节。
+    Ok(latin1_bytes(&out))
+}
+
 /// `eval_js_with_bindings` 中绑定值的标记前缀: 值为 JSON 响应文本,
 /// 注入时用 `Resp()` 包装成 legado `StrResponse` 语义(带 `code()`/`body()`
 /// 等方法的对象), 供 `loginCheckJs` 这类按方法调用响应的脚本使用。
@@ -412,7 +491,7 @@ pub fn eval_js_search_with_source(
     // 书源地址：`with_source` 已提供 source 绑定，这里只是它的空值回退。
     source_key: &str,
 ) -> anyhow::Result<String> {
-    eval_js_inner_with_source(script, None, None, Some(key), Some(page), Some(source_key), None)
+    eval_js_inner_with_source(script, None, None, Some(key), Some(page), Some(source_key), None, None)
 }
 
 /// 求值发现页分类里的 `exploreUrl`（`@js:` / `<js>` 规则）。
@@ -439,6 +518,7 @@ pub fn eval_explore_kinds(
         None,
         Some(source_key),
         Some(&bindings),
+        None,
     )
 }
 
@@ -466,6 +546,7 @@ pub fn eval_explore_action(
         None,
         Some(source_key),
         Some(&bindings),
+        None,
     )
 }
 
@@ -517,6 +598,7 @@ pub fn eval_explore_view_name(
         None,
         Some(source_key),
         Some(&bindings),
+        None,
     ) {
         Ok(value) => {
             let value = value.trim().to_string();
@@ -556,6 +638,7 @@ pub fn eval_js_url(
         Some(page),
         Some(source_key),
         None,
+        None,
     )
 }
 
@@ -567,7 +650,7 @@ fn eval_js_inner(
     page: Option<i32>,
     bindings: Option<&HashMap<String, JsonValue>>,
 ) -> anyhow::Result<String> {
-    eval_js_inner_with_source(script, input, base_url, key, page, None, bindings)
+    eval_js_inner_with_source(script, input, base_url, key, page, None, bindings, None)
 }
 
 /// legado 兼容层: 在原生 `__xxx` 原语之上组装 `java` / `source` / `book` / `chapter` / `cache`
@@ -856,13 +939,15 @@ const JS_PRELUDE: &str = r#"(function (g) {
     // AnalyzeRule.get(key) reads variables; explicit HTTP URLs retain the
     // existing one-argument HTTP convenience, and headers select HTTP too.
     if (arguments.length === 1 && !/^(?:https?:)?\/\//i.test(S(u))) return ruleGet(S(u));
-    return Resp(g.__http('GET', S(u), '', requestHeaders(h)));
+    // legado 的 java.get 是 `Jsoup.connect(...).followRedirects(false)`:
+    // 书源靠读 302 的 Location 头做两步搜索, 这里必须同样不跟随。
+    return Resp(g.__http('GET', S(u), '', requestHeaders(h), false));
   };
-  J.head = function (u, h) { return httpResp(g.__http('HEAD', S(u), '', requestHeaders(h)), stripUrlOption(S(u))); };
-  J.post = function (u, b, h) { return httpResp(g.__http('POST', S(u), S(b), requestHeaders(h)), stripUrlOption(S(u))); };
+  J.head = function (u, h) { return httpResp(g.__http('HEAD', S(u), '', requestHeaders(h), false), stripUrlOption(S(u))); };
+  J.post = function (u, b, h) { return httpResp(g.__http('POST', S(u), S(b), requestHeaders(h), false), stripUrlOption(S(u))); };
   J.put = function (u, b, h) {
     if (arguments.length < 3) return rulePut(S(u), S(b));
-    return httpResp(g.__http('PUT', S(u), S(b), requestHeaders(h)), stripUrlOption(S(u)));
+    return httpResp(g.__http('PUT', S(u), S(b), requestHeaders(h), false), stripUrlOption(S(u)));
   };
   J.getCookie = function (tag, key) {
     var raw = S(g.cookie.getCookie(S(tag)));
@@ -888,19 +973,23 @@ const JS_PRELUDE: &str = r#"(function (g) {
     t = S(t);
     var keyIsBytes = J.__isByteSequence(k), ivIsBytes = J.__isByteSequence(iv);
     k = J.__bytesArg(k); iv = J.__bytesArg(iv);
-    var run = function (op, d, fmt) {
+    var run = function (op, d, fmt, rawOut) {
       var isBytes = J.__isByteSequence(d) && typeof d.length === 'number';
       var payload = isBytes ? J.__bytesArg(d) : S(d);
       // flags: 1=key 是字节序列, 2=iv 是字节序列, 4=载荷是字节序列。
       var flags = (keyIsBytes ? 1 : 0) | (ivIsBytes ? 2 : 0) | (isBytes ? 4 : 0);
+      // 图片解密: legado 的 `decrypt` 返回 ByteArray(hutool), 不是文本。
+      // 置 8 让宿主把明文按 latin1 逐字节交回, 避免 UTF-8 转换毁掉图片数据。
+      // `decryptStr` 在 legado 里明确返回 String, 因此不走这条分支。
+      if (rawOut && op === 'dec' && g.__byteMode === true) flags |= 8;
       return g.__sym(op, t, k, iv, payload, isBytes ? 'raw' : fmt, flags);
     };
     return {
-      encrypt: function (d) { return run('enc', d, 'base64'); },
-      encryptBase64: function (d) { return run('enc', d, 'base64'); },
-      encryptHex: function (d) { return run('enc', d, 'hex'); },
-      decrypt: function (d) { return run('dec', d, 'auto'); },
-      decryptStr: function (d) { return run('dec', d, 'auto'); },
+      encrypt: function (d) { return run('enc', d, 'base64', false); },
+      encryptBase64: function (d) { return run('enc', d, 'base64', false); },
+      encryptHex: function (d) { return run('enc', d, 'hex', false); },
+      decrypt: function (d) { return run('dec', d, 'auto', true); },
+      decryptStr: function (d) { return run('dec', d, 'auto', false); },
       setIv: function (v) { iv = S(v); return this; }
     };
   }
@@ -1185,6 +1274,9 @@ const JS_PRELUDE: &str = r#"(function (g) {
     toJSON: function () { return this.__a; }
   };
   J.util = { HashMap: HashMap, LinkedHashMap: HashMap, Map: HashMap, ArrayList: ArrayList };
+  // `java.io.*` 由 `java_compat.js` 提供（ByteArrayInputStream/OutputStream、
+  // GZIP、Reader 等），这里不再重复实现 —— 早先在这里加过一份同名构造，
+  // 结果被 compat 的同名注册覆盖，`available()` 之类的差异就变成了灵异现象。
   // `new java.util.Date()` / `Date(millis)`: 书源用它做时间戳运算。
   // `getTime()` 与 JS 一致; `toString()` 按 ISO 给出可读时间。
   J.util.Date = function (millis) {
@@ -2009,6 +2101,9 @@ fn eval_js_inner_with_source(
     // 只用来兜底补齐 JS 的 `book.bookUrl`。
     source_key: Option<&str>,
     bindings: Option<&HashMap<String, JsonValue>>,
+    // 图片解密：`Some(bytes)` 时 `result` 注入为**字节序列**，且 prelude 的
+    // `decrypt` 走原始字节分支（见 `eval_js_cover_decode`）。
+    binary_input: Option<&[u8]>,
 ) -> anyhow::Result<String> {
     let shared_js = active_js_lib_script();
     let source_info = active_source();
@@ -2046,7 +2141,52 @@ fn eval_js_inner_with_source(
         let base_url_value = base_url.unwrap_or("");
 
         globals.set("input", input_value)?;
-        globals.set("result", input_value)?;
+        // 图片解密：`result` 必须是字节序列，而不是 UTF-8 文本。
+        //
+        // 传成字符串会让 `decrypt(result)` 走 `auto` 分支 —— 既可能被误判成
+        // hex/base64，也已经把 ≥0x80 的字节改写过一次。这里按预扫描好的
+        // JSON 数组字面量注入，再包一层"数组 + 流"的双面对象：
+        //
+        // - 数组语义：legado 的 `ByteArray` 就是按数组用的（`.length`/索引/
+        //   `.slice()`/传给 `createSymmetricCrypto`），所以 `decrypt(result)` 直接可用。
+        // - 流语义：legado 文档里另一种写法把封面 `result` 当 `InputStream`
+        //   （`while ((byte = data.read()) != -1)`），见 `java.io.ByteArrayInputStream`。
+        match binary_input {
+            Some(bytes) => {
+                // 注意：prelude 在下面才执行，这里不能调用它定义的辅助函数。
+                //
+                // 封面解密的 `result` 要同时满足两种书源写法：
+                // - `createSymmetricCrypto(...).decrypt(result)`：按数组/字节序列用；
+                // - `while ((byte = data.read()) != -1)`：按 InputStream 用。
+                // 因此先建普通数组，再把 read/available/close 作为**不可枚举**
+                // 方法挂上去（下标与 `.length` 语义不受影响，`__isByteSequence`
+                // 也仍认它是字节序列）。
+                let literal = bytes_to_json_array(bytes);
+                let value = eval_script(
+                    ctx.clone(),
+                    &format!(
+                        "(function (b) {{\n\
+                         var def = function (name, fn) {{\n\
+                           Object.defineProperty(b, name, {{ value: fn, enumerable: false, configurable: true }});\n\
+                         }};\n\
+                         def('read', function () {{\n\
+                           if (this.__pos === undefined) this.__pos = 0;\n\
+                           if (this.__pos >= this.length) return -1;\n\
+                           return this[this.__pos++];\n\
+                         }});\n\
+                         def('available', function () {{ return this.length - (this.__pos || 0); }});\n\
+                         def('close', function () {{}});\n\
+                         return b;\n\
+                         }})({literal})"
+                    ),
+                )?;
+                globals.set("result", value)?;
+            }
+            None => globals.set("result", input_value)?,
+        }
+        // `__byteMode`: prelude 的 `decrypt` 见到它就返回原始字节（latin1 承载），
+        // 与 legado 的 `SymmetricCrypto.decrypt -> ByteArray` 对齐。
+        globals.set("__byteMode", binary_input.is_some())?;
         globals.set("src", input_value)?;
         globals.set("base_url", base_url_value)?;
         globals.set("baseUrl", base_url_value)?;
@@ -2124,8 +2264,12 @@ fn eval_js_inner_with_source(
         globals.set(
             "__http",
             Func::new(
-                move |method: String, url: String, body: String, headers: String| -> String {
-                    js_http(&method, &url, &body, &headers, &default_headers).to_string()
+                move |method: String, url: String, body: String, headers: String, follow: Opt<bool>| -> String {
+                    // 第五个参数是 legado 的 `followRedirects` 语义: `java.get/head/post`
+                    // 传 false(对应 `Jsoup.connect(...).followRedirects(false)`),
+                    // 缺省按 true 与原行为一致(`java.ajax`/`java.connect` 等)。
+                    let follow = follow.0.unwrap_or(true);
+                    js_http_with_redirect(&method, &url, &body, &headers, &default_headers, follow).to_string()
                 },
             ),
         )?;
@@ -2599,9 +2743,31 @@ fn eval_js_inner_with_source(
         globals.set("nextChapterUrl", "")?;
         globals.set("rssArticle", Object::new(ctx.clone())?)?;
 
-        // prelude 每次都要跑: 它包装的是本次新建的 java 对象与本次的 source/book/chapter
-        eval_script(ctx.clone(), JS_PRELUDE)?;
-        eval_script(ctx.clone(), include_str!("java_compat.js"))?;
+        // prelude 与 java_compat 的**执行**每次求值都不能少:
+        // 它们把本次新建的 `java`/`source`/`cookie` 等对象包装成 legado 接口
+        // (`java.aesBase64DecodeToString` 等), 而这些对象每次求值都会重建
+        // (捕获了本次的 input/base_url)。若只在 initialize 时执行一次,
+        // 后续求值就会拿到 undefined 的函数 —— 实测表现为 `not a function`。
+        //
+        // 但两者合计约 94KB, 每次重新**解析**才是目录解析的主要开销:
+        // 实测某书源 1826 章的目录(每章跑一次 AES 解密)耗时 60 秒、单章
+        // 33ms —— 阅读页表现为"打开书一直转圈、CPU 飙高、ESC 失灵"。
+        // 因此首次把整段包成函数对象存进全局, 后续只调用这个函数:
+        // 函数体只解析一次, 执行仍是每次一次(语义完全不变), 60s → 9s。
+        if initialize {
+            let wrapped = format!("globalThis.__runPrelude = function(){{{JS_PRELUDE}}};");
+            eval_script(ctx.clone(), &wrapped)?;
+        }
+        eval_script(ctx.clone(), "globalThis.__runPrelude();")?;
+        // java_compat.js 同理(33KB): 也是每次都要执行、但只需解析一次。
+        if initialize {
+            let wrapped = format!(
+                "globalThis.__runCompat = function(){{{}}};",
+                include_str!("java_compat.js")
+            );
+            eval_script(ctx.clone(), &wrapped)?;
+        }
+        eval_script(ctx.clone(), "globalThis.__runCompat();")?;
         if initialize && !shared_js.trim().is_empty() {
             if let Err(err) = eval_script(ctx.clone(), &shared_js) {
                 push_js_log(format!("[jsLib] {err}"));
@@ -2693,6 +2859,14 @@ fn eval_js_inner_with_source(
              if (v && typeof v.__javaStringText === 'function') return v.__javaStringText();
              if (v instanceof String) return v.valueOf();\n\
              if (v && v.__isResp) return JSON.parse(v.__respJson());\n\
+             // 图片解密上下文: 脚本可能直接交回字节数组(`.toByteArray()` 一类)。\n\
+             // 按 latin1 逐字节拼成字符串, 由宿主还原 —— 走 JSON 文本会把\n\
+             // ≥0x80 的字节变成数组字面量文本, 图片就废了。\n\
+             if (globalThis.__byteMode === true && v && typeof v !== 'string'\n\
+                 && typeof v.length === 'number') {\n\
+               var bytes = ''; for (var i = 0; i < v.length; i++) bytes += String.fromCharCode(Number(v[i]) & 0xff);\n\
+               return bytes;\n\
+             }\n\
              return v;\n\
              })(__result)",
         )?;
@@ -2823,7 +2997,8 @@ fn symmetric_codec(
 
 /// 带字节标记的 `__sym` 实现。
 ///
-/// `flags` 是 JS 侧 `symmetric()` 传来的位标记: 1=key、2=iv、4=载荷是**字节序列**。
+/// `flags` 是 JS 侧 `symmetric()` 传来的位标记: 1=key、2=iv、4=载荷是**字节序列**,
+/// 8=解密结果按**原始字节**返回(图片解密, 见 `coverDecodeJs`)。
 /// 置位的入参按 latin1 逐字节取字节（每个 char 就是一个字节）；未置位的是普通
 /// 文本，按 UTF-8 编码 —— 后者保证 `café` 这类文本 key 不被改写。
 fn symmetric_codec_with_flags(
@@ -2868,6 +3043,12 @@ fn symmetric_codec_with_flags(
         _ => decode_base64_lenient(trimmed)?,
     };
     let out = symmetric_crypt(false, transformation, &key_bytes, &iv_bytes, &bytes)?;
+    // flags 位 8: 返回**原始字节**(latin1 承载), 供 `coverDecodeJs`/`imageDecode`
+    // 这类图片解密使用 —— legado 的 `SymmetricCrypto.decrypt` 返回 `ByteArray`,
+    // 图片数据不能过 UTF-8(否则 ≥0x80 的字节全被替换成 U+FFFD, 图片花掉)。
+    if flags & 8 != 0 {
+        return Ok(latin1_string(&out));
+    }
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
@@ -2900,6 +3081,13 @@ pub(crate) fn decode_base64_lenient(input: &str) -> Result<Vec<u8>, base64::Deco
 /// 不做断言/panic：入参来自书源脚本，不能让异常输入中断求值。
 fn latin1_bytes(value: &str) -> Vec<u8> {
     value.chars().map(|c| (c as u32 & 0xFF) as u8).collect()
+}
+
+/// `latin1_bytes` 的逆操作：把任意字节按「每 char 一个字节」编码成字符串。
+///
+/// JS 侧用 `charCodeAt(i) & 0xff` 还原，因此 ≥0x80 的字节不会被 UTF-8 改写。
+fn latin1_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| *byte as char).collect()
 }
 
 /// 在 QuickJS 里求值一段脚本。
@@ -3829,6 +4017,14 @@ fn js_request_with_bytes(
     let request_url = crate::crawler::url_analyzer::absolute_url(&source.url, &url);
     let proxy = merged.iter().find(|(key, _)| key.eq_ignore_ascii_case("proxy")).map(|(_, value)| value.clone());
     merged.retain(|(key, _)| !key.eq_ignore_ascii_case("proxy"));
+    // 默认跟随重定向; `java.get/head/post` 显式关掉(legado
+    // `Jsoup.connect(...).followRedirects(false)`, 见 `js_http_with_redirect`)。
+    // 这个开关只影响**选哪个 client**, 不进 RequestSpec: 客户端本身决定了
+    // reqwest 的 redirect policy。
+    let follow_redirects = options
+        .get("follow_redirects")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
     let spec = RequestSpec {
         url: request_url, method, headers: merged, body,
         body_bytes,
@@ -3845,11 +4041,15 @@ fn js_request_with_bytes(
         let client = if let Some(proxy) = proxy.as_deref().filter(|v| Some(*v) != http.proxy.as_deref()) {
             if raw_response {
                 crate::crawler::http_client::build_raw_source_client(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
+            } else if !follow_redirects {
+                crate::crawler::http_client::build_source_client_no_redirect(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
             } else {
                 crate::crawler::http_client::build_source_client(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
             }
         } else if raw_response {
             crate::crawler::http_client::build_raw_source_client(http.timeout_secs, http.proxy.as_deref(), http.session.cookies.clone())?
+        } else if !follow_redirects {
+            http.client_no_redirect.clone()
         } else { http.client };
         // 面板请求(浏览器 `fetch` 过桥的那些)只压单次超时, 不重建 client:
         // 面板首屏会并发几十个头像, 每次新建 reqwest::Client 就得重做一轮 TLS
@@ -3922,9 +4122,23 @@ fn js_http(
     headers: &str,
     default_headers: &[(String, String)],
 ) -> JsonValue {
+    js_http_with_redirect(method, url, body, headers, default_headers, true)
+}
+
+/// `__http` 的宿主实现。`follow_redirects` 为 false 时走不跟随 3xx 的 client,
+/// 并把 3xx 响应的 `Location` 原样交回脚本(legado `java.get/head/post` 语义)。
+fn js_http_with_redirect(
+    method: &str,
+    url: &str,
+    body: &str,
+    headers: &str,
+    default_headers: &[(String, String)],
+    follow_redirects: bool,
+) -> JsonValue {
     let headers = serde_json::from_str::<JsonValue>(headers).unwrap_or(JsonValue::Null);
     let body = (!body.is_empty() || method.eq_ignore_ascii_case("POST")).then(|| body.to_string());
-    js_request(method, url, body, &headers, default_headers, &JsonValue::Null)
+    let options = json!({ "follow_redirects": follow_redirects });
+    js_request(method, url, body, &headers, default_headers, &options)
 }
 
 /// legado `java.ajax(url)` / `java.connect(url, header)`: url 可带 `,{method, body, headers}` 选项。
@@ -5360,8 +5574,171 @@ mod tests {
         assert_eq!(out, "true", "正则字面量被改写会破坏匹配语义");
     }
 
+    /// prelude 被包成函数对象后，**多次调用**必须与"每次重新执行整段"等价。
+    ///
+    /// 这是 1826 章目录提速的关键（60s → 9s）：prelude + java_compat 合计约
+    /// 94KB，原先每次求值都重新解析执行，单章 33ms。改成首次定义
+    /// `__runPrelude`/`__runCompat`、之后只调用后，函数体只解析一次，
+    /// **执行次数不变**。这条测试盯住"执行次数不变"这个语义前提：
+    /// 第二次求值仍要能正常使用 java 的加密/编码接口。
+    #[test]
+    fn prelude_runs_on_every_eval_not_just_the_first() {
+        let source = BookSource {
+            book_source_name: "prelude".to_string(),
+            book_source_url: "https://prelude.example".to_string(),
+            ..Default::default()
+        };
+        with_source(&source, || {
+            // 第一次：建立上下文并安装 prelude
+            let script = "String(java.md5Encode('abc')) + '|' + String(java.base64Encode('中文'))";
+            let first = eval_js(script, "", "").unwrap();
+            assert!(first.contains('|'), "首次求值应能调用 java 接口: {first}");
+
+            // 第二次：复用同一上下文，prelude 走 __runPrelude() 快速路径
+            let second = eval_js(script, "", "").unwrap();
+            assert_eq!(second, first, "复用上下文后 java 接口必须仍然可用且结果一致");
+
+            // 每次的 result 绑定必须是最新一次传入的值
+            assert_eq!(eval_js("String(result)", "第一次", "").unwrap(), "第一次");
+            assert_eq!(eval_js("String(result)", "第二次", "").unwrap(), "第二次");
+        });
+    }
+
+    /// 封面解密（issue #23）：`coverDecodeJs` 的 `result` 是**字节**，返回值也是字节。
+    ///
+    /// 18mh 的规则是
+    /// `java.createSymmetricCrypto("AES/CBC/NoPadding", key, iv).decrypt(result)`，
+    /// 密文与明文都含 ≥0x80 的字节。若 `result` 按字符串注入、`decrypt` 按
+    /// UTF-8 文本返回，解出来必然是花图 —— 这条用例把字节往返钉死。
+    #[test]
+    fn cover_decode_js_returns_raw_image_bytes() {
+        // AES-128/CBC/NoPadding, key/iv 取自 18mh 书源；明文是一个 JPEG 头
+        // + 0x00..0x3F + 尾部标记，长度 96（16 的整数倍）。
+        let cipher_hex = "\
+            093de3b1fc4af46ff223ac4c8bdb076a2cd8265cb34aa1f5b2108d081a019956\
+            d014684a3ea5f29b05c20175c3d50f1e78835c48eef745af103df74d525e9010080\
+            cbb77195f73e94364a9dd5237613c674c340a17dc360501cb9b9ba5835b8b";
+        let cipher: Vec<u8> = (0..cipher_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&cipher_hex[i..i + 2], 16).unwrap())
+            .collect();
+        let rule = r#"java.createSymmetricCrypto("AES/CBC/NoPadding", "f5d965df75336270", "97b60394abc2fbe1").decrypt(result)"#;
+
+        let source = BookSource {
+            book_source_name: "封面解密".to_string(),
+            book_source_url: "https://18mh.example".to_string(),
+            cover_decode_js: Some(rule.to_string()),
+            ..Default::default()
+        };
+        let decoded = with_source(&source, || {
+            eval_js_cover_decode(rule, "https://img.example/c.jpg", &cipher).unwrap()
+        });
+
+        assert_eq!(decoded.len(), 96, "NoPadding 不应改变长度");
+        assert_eq!(&decoded[..4], &[0xFF, 0xD8, 0xFF, 0xE0], "必须是 JPEG 魔数");
+        assert_eq!(&decoded[16..80], &(0u8..64).collect::<Vec<_>>()[..]);
+        assert!(decoded.ends_with(b"TAIL-MARKER-1234"));
+    }
+
+    /// 字节输入不能被当成文本：`result` 必须是数组，`src` 仍是图片地址。
+    #[test]
+    fn cover_decode_js_injects_bytes_and_src() {        let source = BookSource {
+            book_source_name: "字节注入".to_string(),
+            book_source_url: "https://img.example".to_string(),
+            ..Default::default()
+        };
+        let out = with_source(&source, || {
+            eval_js_cover_decode(
+                "src + '|' + result.length + '|' + result[0] + '|' + result[3]",
+                "https://img.example/c.jpg",
+                &[0xFF, 0x01, 0x80, 0x00],
+            )
+            .unwrap()
+        });
+        // 返回值按 latin1 承载，这里直接比对字节。
+        let expected = "https://img.example/c.jpg|4|255|0".as_bytes().to_vec();
+        assert_eq!(out, expected);
+    }
+
+    /// 没有封面解密上下文时，`decrypt` 仍按文本输出（不能影响正文/目录规则）。
+    #[test]
+    fn decrypt_stays_text_outside_cover_context() {        let source = BookSource {
+            book_source_name: "文本解密".to_string(),
+            book_source_url: "https://text.example".to_string(),
+            ..Default::default()
+        };
+        let out = with_source(&source, || {
+            // 用同一 key 加密 "测试文本"，普通求值下应当能拿回原字符串。
+            let encrypted = eval_js(
+                r#"java.createSymmetricCrypto("AES/CBC/PKCS5Padding", "0123456789abcdef", "abcdef0123456789").encryptBase64("测试文本")"#,
+                "",
+                "",
+            )
+            .unwrap();
+            eval_js(
+                &format!(
+                    r#"String(java.createSymmetricCrypto("AES/CBC/PKCS5Padding", "0123456789abcdef", "abcdef0123456789").decrypt("{}"))"#,
+                    encrypted
+                ),
+                "",
+                "",
+            )
+            .unwrap()
+        });
+        assert_eq!(out, "测试文本");
+    }
+
+    /// legado 文档里另一种封面解密写法：`result` 当 `InputStream` 用。
+    ///
+    /// ```js
+    /// function decodeImage(data, key) {
+    ///   var out = new Packages.java.io.ByteArrayOutputStream()
+    ///   var byte
+    ///   while ((byte = data.read()) != -1) out.write(byte ^ key)
+    ///   return out.toByteArray()
+    /// }
+    /// decodeImage(result, key)
+    /// ```
+    ///
+    /// 用户书源里确实有这种写法，字节流接口缺了会直接 `data.read is not a function`。
+    #[test]
+    fn cover_decode_js_supports_input_stream_style() {
+        let source = BookSource {
+            book_source_name: "流式解密".to_string(),
+            book_source_url: "https://stream.example".to_string(),
+            ..Default::default()
+        };
+        let script = r#"
+            function decodeImage(data, key) {
+              var out = new Packages.java.io.ByteArrayOutputStream();
+              var one;
+              while ((one = data.read()) != -1) out.write(one ^ key);
+              return out.toByteArray();
+            }
+            decodeImage(result, 0xFF)
+        "#;
+        let out = with_source(&source, || {
+            eval_js_cover_decode(script, "https://img.example/x.jpg", &[0x00, 0x01, 0xFE, 0xFF]).unwrap()
+        });
+        assert_eq!(out, vec![0xFF, 0xFE, 0x01, 0x00], "逐字节异或必须按原始字节算");
+    }
+
+    /// `java.io.ByteArrayInputStream` 在封面上下文里也能用（compat 层提供）。
+    #[test]
+    fn cover_decode_js_supports_byte_array_stream_constructors() {
+        let source = BookSource {
+            book_source_name: "流式构造".to_string(),
+            book_source_url: "https://stream.example".to_string(),
+            ..Default::default()
+        };
+        let out = with_source(&source, || {
+            eval_js_cover_decode(
+                "var s = new java.io.ByteArrayInputStream([65, 66, 67]); s.read() + '|' + (s.read() + s.read())",
+                "https://img.example/x.jpg",
+                &[0x41],
+            )
+            .unwrap()
+        });
+        assert_eq!(out, b"65|133".to_vec());
+    }
 }
-
-
-
-

@@ -165,6 +165,9 @@ async fn fetch_inner(
             HttpMethod::PATCH => request_client.patch(&req.url),
             HttpMethod::DELETE => request_client.delete(&req.url),
         };
+        // 是否跟随 3xx 由调用方选用的 client 决定: `java.get/head/post` 走
+        // 不跟随的 client, 以便脚本读到 302 的 `Location`
+        // (见 `http_client::build_source_client_no_redirect`)。
         if let Some(timeout) = req.timeout {
             builder = builder.timeout(timeout);
         }
@@ -271,14 +274,32 @@ pub(crate) fn decode_body(bytes: &[u8], charset: Option<&str>, content_type: Opt
         .filter(|value| !value.is_empty())
         .map(str::to_string));
 
-    if let Some(label) = label {
-        if let Some(encoding) = Encoding::for_label(label.trim().as_bytes()) {
-            let (text, _, _) = encoding.decode(bytes);
-            return text.into_owned();
+    let text = if let Some(label) = label {
+        match Encoding::for_label(label.trim().as_bytes()) {
+            Some(encoding) => {
+                let (text, _, _) = encoding.decode(bytes);
+                text.into_owned()
+            }
+            None => String::from_utf8_lossy(bytes).into_owned(),
         }
-    }
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    strip_bom(&text).to_string()
+}
 
-    String::from_utf8_lossy(bytes).into_owned()
+/// 去掉响应体开头的 BOM。
+///
+/// 站点偶尔会在 JSON 前面带一个 `\u{FEFF}`（实测 `catalog.chuangke.tv` 的
+/// 目录接口就是）。`serde_json` / JSONPath 会把 BOM 当非法字符，整段解析失败，
+/// 于是目录和搜索都变成 0 条 —— 阅读页表现为「打开书一直转圈、目录空白」，
+/// 用户只能反复换源。
+///
+/// legado 的 HTTP 层在按 charset 解码时就会消费掉 BOM（`String(response.body)`
+/// 走 Gson 的 Reader），所以拿到的 JSON 里没有它。这里在解码处统一剥掉，
+/// 比让每条 JSON 规则各自容错更彻底。
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
 pub(crate) fn data_uri_response(req: &RequestSpec) -> anyhow::Result<Option<FetchResponse>> {
@@ -385,5 +406,26 @@ mod tests {
         let text = decode_body(bytes, None, None);
 
         assert!(text.contains("飞卢小说"));
+    }
+
+    /// 带 BOM 的 JSON 必须剥掉，否则 `serde_json` 直接报 "expected value"，
+    /// 目录/搜索会被静默解析成 0 条（issue #22 的"打开书一直转圈"）。
+    #[test]
+    fn decode_body_strips_utf8_bom() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(r#"{"code":1,"data":[{"name":"第一章"}]}"#.as_bytes());
+
+        let text = decode_body(&bytes, None, Some("application/json"));
+
+        assert!(!text.starts_with('\u{feff}'), "BOM 必须被剥掉");
+        assert_eq!(text, r#"{"code":1,"data":[{"name":"第一章"}]}"#);
+        assert!(serde_json::from_str::<serde_json::Value>(&text).is_ok());
+    }
+
+    /// 没有 BOM 时不能改变内容。
+    #[test]
+    fn decode_body_leaves_plain_json_untouched() {
+        let text = decode_body(br#"{"a":1}"#, None, Some("application/json"));
+        assert_eq!(text, r#"{"a":1}"#);
     }
 }

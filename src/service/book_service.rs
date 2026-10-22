@@ -2734,6 +2734,29 @@ impl BookService {
     }
 
     pub async fn get_cover(&self, user_ns: &str, url: &str) -> Result<(Vec<u8>, String), AppError> {
+        self.get_cover_for_source(user_ns, url, None).await
+    }
+
+    /// 取封面，并按书源的 `coverDecodeJs` 解密。
+    ///
+    /// 很多站点（如 18mh）的封面图是 AES 加密的：下载到的字节不是图片，直接
+    /// 交给 `<img>` 只能是花图/空白。legado 在 Glide 拿到流之后调用
+    /// `ImageUtils.decode(..., isCover = true)` 执行书源的 `coverDecodeJs`
+    /// （见 `app/src/main/java/io/legado/app/utils/ImageUtils.kt`），本端此前
+    /// 只把该字段解析进模型、封面流水线从未执行 —— 于是同一书源在手机上正常、
+    /// 在桌面端花屏（issue #23）。
+    ///
+    /// 解密必须发生在**嗅探 Content-Type 与写缓存之前**：密文的魔数不是任何
+    /// 图片格式，先嗅探只会得到 `application/octet-stream`，落盘扩展名也就错了。
+    ///
+    /// `source` 由 `/cover` 路由反查得到（前端把书籍的 `origin` 带在查询串里）。
+    /// 拿不到书源时保持原行为，只是不解密。
+    pub async fn get_cover_for_source(
+        &self,
+        user_ns: &str,
+        url: &str,
+        source: Option<&BookSource>,
+    ) -> Result<(Vec<u8>, String), AppError> {
         let cover_dir = self
             .storage_dir
             .join("cache")
@@ -2750,7 +2773,9 @@ impl BookService {
                     .and_then(serde_json::Value::as_str),
             ) {
                 if let Ok(data) = fs::read(cover_dir.join(file)).await {
-                    return Ok((data, content_type.to_string()));
+                    return self
+                        .repair_cached_cover(url, data, content_type, source, &cover_dir)
+                        .await;
                 }
             }
         }
@@ -2781,7 +2806,9 @@ impl BookService {
                             let _ = fs::write(&mapping_path, &mapped).await;
                             let _ = fs::remove_file(&legacy_mapping).await;
                         }
-                        return Ok((data, content_type.to_string()));
+                        return self
+                            .repair_cached_cover(url, data, content_type, source, &cover_dir)
+                            .await;
                     }
                 }
             }
@@ -2803,7 +2830,9 @@ impl BookService {
             {
                 let _ = fs::remove_file(&legacy_path).await;
             }
-            return Ok((data, content_type));
+            return self
+                .repair_cached_cover(url, data, &content_type, source, &cover_dir)
+                .await;
         }
         if let Some(parent) = mapping_path.parent() {
             fs::create_dir_all(parent)
@@ -2898,9 +2927,38 @@ impl BookService {
             .await
             .map_err(|e| AppError::Internal(e.into()))?
             .to_vec();
+        // 书源带 coverDecodeJs → 解密后再当图片处理（legado 的
+        // `ImageUtils.decode(src, bytes, isCover = true, source)`，手机端是
+        // 无条件执行规则）。
+        //
+        // 两条兜底，都是为了"坏封面不等于 404"：
+        // 1. 脚本报错 → 用原始字节；
+        // 2. 解出来的不是图片、但原始字节本来就是图片 → 用原始字节。
+        //    少数书源只对部分封面加密（或站点换了未加密的图床），无条件解密
+        //    会把本来能看的图画坏。
+        let original_is_image = sniff_image_content_type(&bytes).is_some();
+        let (bytes, decoded) = match self.decode_cover_bytes(source, url, &bytes).await {
+            Ok(Some(decoded)) => {
+                if sniff_image_content_type(&decoded).is_some() || !original_is_image {
+                    (decoded, true)
+                } else {
+                    tracing::debug!(url = %url, "封面解密结果不是图片，保留原图");
+                    (bytes, false)
+                }
+            }
+            Ok(None) => (bytes, false),
+            Err(err) => {
+                tracing::warn!(url = %url, "封面解密失败，按原始字节返回: {err:?}");
+                (bytes, false)
+            }
+        };
         // 服务器没给 Content-Type 时, 上面的兜底会拿 URL 后缀猜, 而番茄一类的
         // `…:1200:0.image` 猜不出来。图就在手里, 按魔数认格式最可靠。
-        let content_type = if is_unknown_image_type(&content_type) {
+        //
+        // 解密过的字节要**无条件**重认: 服务端给的 content-type 描述的是密文
+        // (18mh 回 `binary/octet-stream`, 也有站点照旧回 `image/jpeg`), 而真正
+        // 落盘的扩展名必须按解密后明文的魔数来定。
+        let content_type = if decoded || is_unknown_image_type(&content_type) {
             sniff_image_content_type(&bytes).unwrap_or(content_type)
         } else {
             content_type
@@ -2912,6 +2970,103 @@ impl BookService {
             tracing::warn!("写入封面缓存失败: {err:?}");
         }
         Ok((bytes, content_type))
+    }
+
+    /// 缓存命中时的解密补救。
+    ///
+    /// 修复前落盘的封面是**密文**（解密逻辑此前不存在），映射里记的
+    /// `contentType` 也是按 URL 后缀或 `application/octet-stream` 猜的。
+    /// 直接返回这份字节，用户会一直看到花图，而且「清了缓存再来」也一样
+    /// —— 因为每次都会命中同一个坏文件。这里识别出"缓存里不是图片"的情况，
+    /// 当场解密并把正确的字节与 content-type 写回缓存。
+    async fn repair_cached_cover(
+        &self,
+        url: &str,
+        data: Vec<u8>,
+        content_type: &str,
+        source: Option<&BookSource>,
+        cover_dir: &Path,
+    ) -> Result<(Vec<u8>, String), AppError> {
+        // 已经是图片：正常返回，不做任何多余工作（绝大多数字节走这条）。
+        if sniff_image_content_type(&data).is_some() {
+            return Ok((data, content_type.to_string()));
+        }
+        // 不是图片、又没有解密规则 —— 原始站点就是这样，原样返回。
+        if source.and_then(|s| s.cover_decode_js.as_deref()).map(str::trim).unwrap_or("").is_empty() {
+            return Ok((data, content_type.to_string()));
+        }
+        let decoded = match self.decode_cover_bytes(source, url, &data).await {
+            Ok(Some(decoded)) if !decoded.is_empty() => decoded,
+            Ok(_) => return Ok((data, content_type.to_string())),
+            Err(err) => {
+                tracing::warn!(url = %url, "缓存封面解密失败，保留原字节: {err:?}");
+                return Ok((data, content_type.to_string()));
+            }
+        };
+        // 解密结果仍认不出是图片（规则写错/密钥不对）：不要覆盖缓存，
+        // 让下次还有机会在规则修正后自愈。
+        let Some(new_type) = sniff_image_content_type(&decoded) else {
+            tracing::warn!(url = %url, "封面解密结果不是已知图片格式，保留原缓存");
+            return Ok((data, content_type.to_string()));
+        };
+        // 记下旧的密文文件名：重写映射后它就没人引用了。**必须当场删掉**，
+        // 不能指望 `clean_stale_search_covers` —— 那条清理只在启动时跑一次，
+        // 且要求文件闲置 30 分钟，否则这份密文会一直占着磁盘到下次重启。
+        let previous_file = cover_mapping_file(cover_dir, url).await;
+        if let Err(err) = self
+            .store_cover_mapping(url, &decoded, &new_type, cover_dir)
+            .await
+        {
+            tracing::warn!("重写封面缓存失败: {err:?}");
+        } else if let Some(previous) = previous_file {
+            // 只有确认没有别的 URL 还引用它时才删（内容寻址，可能被共享）。
+            let referenced = collect_referenced_cover_files(cover_dir)
+                .await
+                .map(|set| set.contains(&previous))
+                .unwrap_or(true);
+            if !referenced {
+                let _ = fs::remove_file(cover_dir.join(&previous)).await;
+            }
+        }
+        tracing::info!(url = %url, "已解密历史的密文封面缓存");
+        Ok((decoded, new_type))
+    }
+
+    /// 执行书源的 `coverDecodeJs`，把下载到的封面字节解密成图片字节。
+    ///
+    /// 语义对齐 legado `ImageUtils.decode(src, bytes, isCover = true, source)`：
+    /// 规则为空就是"不处理"（返回 `None`），脚本抛错由调用方决定怎么兜底。
+    ///
+    /// 脚本里 `result` / `src` / `sj` 的约定与手机端一致：`result` 是**字节序列**
+    /// （不能是 UTF-8 文本，否则密文里 ≥0x80 的字节已经被改写），`src` 是图片地址。
+    /// 返回值同样按字节取回 —— 书源普遍写 `.decrypt(result)`，而 legado 的
+    /// `SymmetricCrypto.decrypt` 返回 `ByteArray`。
+    async fn decode_cover_bytes(
+        &self,
+        source: Option<&BookSource>,
+        src: &str,
+        raw: &[u8],
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let Some(source) = source else { return Ok(None) };
+        let Some(script) = source
+            .cover_decode_js
+            .as_deref()
+            .map(str::trim)
+            .filter(|script| !script.is_empty())
+        else {
+            return Ok(None);
+        };
+        let script = script.to_string();
+        let source = source.clone();
+        let (src, raw) = (src.to_string(), raw.to_vec());
+        // JS 求值是同步的（且脚本内部可能发同步 HTTP），放阻塞线程池，
+        // 与其它规则解析保持一致，避免占住 tokio worker。
+        self.run_source_task("public", &source, move |_source| {
+            crate::parser::js::eval_js_cover_decode(&script, &src, &raw)
+                .map_err(|err| AppError::BadRequest(format!("封面解密失败: {err}")))
+        })
+        .await?
+        .map(Some)
     }
 
     async fn store_cover_mapping(
@@ -3019,6 +3174,12 @@ impl BookService {
     ///
     /// 内容文件是内容寻址且可能被多个 URL 共享, 只有在映射扫描确认无人引用
     /// 之后才删除。
+    ///
+    /// **书架上的封面必须豁免**: 前端只会在会话结束时释放搜索/发现页的封面,
+    /// 但那条路径可能整体失效（进程被强杀、IPC 失败、`release` 没被调用）。
+    /// 单靠"文件闲置 30 分钟"会把**书架书的封面**也一起回收 —— 用户隔天打开
+    /// 书架, 三本书的封面全没了。所以先收集书架引用的封面 URL, 再把它们
+    /// 对应的映射与内容文件钉住。
     pub async fn clean_stale_search_covers(&self, max_age: Duration) -> Result<usize, AppError> {
         let cover_dir = self
             .storage_dir
@@ -3028,19 +3189,34 @@ impl BookService {
         if !cover_dir.exists() {
             return Ok(0);
         }
+        let pinned = self.shelf_cover_mapping_files().await;
         let mut removed = 0usize;
-        removed += self.prune_stale_cover_mappings(&cover_dir, max_age).await?;
+        removed += prune_stale_cover_mappings(&cover_dir, max_age, &pinned).await?;
         removed += remove_orphan_cover_files(&cover_dir, max_age).await?;
         Ok(removed)
     }
 
-    /// 回收 `urls/` 下超过 `max_age` 未更新的映射文件。
-    async fn prune_stale_cover_mappings(
-        &self,
-        cover_dir: &Path,
-        max_age: Duration,
-    ) -> Result<usize, AppError> {
-        prune_stale_cover_mappings(cover_dir, max_age).await
+    /// 书架上仍然引用的封面，其映射文件名（`<md5(url)>.json`）。
+    ///
+    /// 这些映射**不能**被按年龄回收：它们的 URL 还在书架里，回收等于把用户
+    /// 书架上的封面删掉。读书架失败时返回空集合（宁可多留，也不误删）。
+    async fn shelf_cover_mapping_files(&self) -> HashSet<String> {
+        // 书架在 `default` 命名空间；封面缓存统一在 `public`（未登录也可读）。
+        let Ok(books) = self.read_bookshelf("default").await else {
+            return HashSet::new();
+        };
+        let mut pinned = HashSet::new();
+        for book in books {
+            for url in [book.cover_url.as_deref(), book.custom_cover_url.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+            {
+                pinned.insert(format!("{}.json", md5_hex(url)));
+            }
+        }
+        pinned
     }
 
     pub async fn load_book_sources_cache(
@@ -3538,20 +3714,53 @@ fn resolve_explore_view_names(
     }
 }
 
-fn normalize_relaxed_explore_json(text: &str) -> String {    let mut normalized = String::with_capacity(text.len());
+/// 把"宽松 JSON"（GSON 能读、`serde_json` 读不了）归一化到严格 JSON。
+///
+/// 目前处理两件事：
+///
+/// 1. `<` / `>` 在字符串外当作 `{` / `}`（部分书源用尖括号代替花括号）。
+/// 2. **字符串内的裸控制字符按转义序列改写**。这一条是刚需：书源的
+///    `exploreUrl` 常把多行 JS 内嵌进 `{{ ... }}`，像这样
+///
+///    ```text
+///    "url":"/popular/{{\n\tvar pjstr='index.html';\n\tpjstr}}"
+///    ```
+///
+///    JSON 规范不允许字符串里出现裸换行/制表符，`serde_json` 会直接报
+///    「control character found while parsing a string」；而 GSON 的宽松
+///    reader 接受，所以手机端能正常显示分类。改写后字符串内容不变
+///    （`\n` 仍是换行），只是变成合法 JSON —— 后续 URL 分析照常处理多行 `{{ }}`。
+fn normalize_relaxed_explore_json(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
     let mut in_string = false;
     let mut quote = '\0';
     let mut escaped = false;
 
     for ch in text.chars() {
         if in_string {
-            normalized.push(ch);
             if escaped {
                 escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == quote {
-                in_string = false;
+                normalized.push(ch);
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    escaped = true;
+                    normalized.push(ch);
+                }
+                // 裸控制字符：改写成 JSON 转义序列（内容等价，语法合法）。
+                '\n' => normalized.push_str("\\n"),
+                '\r' => normalized.push_str("\\r"),
+                '\t' => normalized.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    normalized.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                _ => {
+                    if ch == quote {
+                        in_string = false;
+                    }
+                    normalized.push(ch);
+                }
             }
             continue;
         }
@@ -3849,8 +4058,17 @@ fn merge_book_read_config(existing: &Book, incoming: &mut Book) {
 fn sanitize_book_urls(book: &mut Book) {
     book.book_url = repair_encoded_url(&book.book_url);
     book.origin = normalize_source_url(&book.origin);
+    // 空串目录地址归一成 None。
+    //
+    // Legado 的 `Book.tocUrl` 是 Kotlin 非空 `String`，从未取过详情的书在备份里
+    // 就是 `"tocUrl": ""`。这边若原样存成 `Some("")`，前端 `b.tocUrl` 是 Truthy
+    // 之外的假值但**字段存在**，各类"缺 tocUrl 就去取详情"的判断(`is_none()` /
+    // `!tocUrl`)会分叉：有的地方判 `is_none()`（为假，于是不补），有的判空串
+    // （为真，于是去补）。表现为同一本书有时能打开、有时一直转圈。
+    // 统一收口成 None，让"没有目录地址"只有一种表示。
     if let Some(toc_url) = &book.toc_url {
-        book.toc_url = Some(repair_encoded_url(toc_url));
+        let repaired = repair_encoded_url(toc_url);
+        book.toc_url = if repaired.trim().is_empty() { None } else { Some(repaired) };
     }
     // 封面地址只 trim, 不做百分号反转义。
     //
@@ -4031,8 +4249,26 @@ fn content_type_from_ext(ext: &str) -> String {
     .to_string()
 }
 
-/// 按 mtime 回收 `urls/` 下过期的封面映射文件。
-async fn prune_stale_cover_mappings(cover_dir: &Path, max_age: Duration) -> Result<usize, AppError> {
+/// 读某条封面 URL 映射里记的内容文件名（读不到就 `None`）。
+///
+/// 用于"重写映射后清掉旧内容文件"：内容文件是内容寻址的，重写后旧文件
+/// 不再被这条 URL 引用，但可能仍被别的 URL 共享，所以调用方还要再查一次引用。
+async fn cover_mapping_file(cover_dir: &Path, url: &str) -> Option<String> {
+    let path = cover_dir.join("urls").join(format!("{}.json", md5_hex(url)));
+    let raw = fs::read_to_string(path).await.ok()?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("file")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// 按 mtime 回收 `urls/` 下过期的封面映射文件，`pinned` 里的文件名永不回收。
+async fn prune_stale_cover_mappings(
+    cover_dir: &Path,
+    max_age: Duration,
+    pinned: &HashSet<String>,
+) -> Result<usize, AppError> {
     let urls_dir = cover_dir.join("urls");
     let mut entries = match fs::read_dir(&urls_dir).await {
         Ok(entries) => entries,
@@ -4044,6 +4280,14 @@ async fn prune_stale_cover_mappings(cover_dir: &Path, max_age: Duration) -> Resu
     while let Some(entry) = entries.next_entry().await.map_err(|e| AppError::Internal(e.into()))? {
         let path = entry.path();
         if !path.is_file() {
+            continue;
+        }
+        // 书架引用的映射：无论多旧都留着。
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| pinned.contains(name))
+        {
             continue;
         }
         let stale = entry
@@ -5254,4 +5498,352 @@ mod tests {
         let _ = std::fs::remove_dir_all(storage_dir);
     }
 
+    /// issue #23 端到端：书源的 `coverDecodeJs` 必须在封面流水线里执行。
+    ///
+    /// 用一个本地 HTTP 服务返回**加密的封面字节**（Content-Type 还是
+    /// `binary/octet-stream`，和 18mh 的真实响应一致），断言 `get_cover_for_source`
+    /// 返回的是解密后的 JPEG。
+    #[tokio::test]
+    async fn cover_is_decoded_with_source_cover_decode_js() {
+        use std::sync::Arc;
+
+        // AES-128/CBC/NoPadding，key/iv 与 18mh 书源相同；明文以 JPEG 魔数开头。
+        let cipher: Vec<u8> = hex::decode(
+            "093de3b1fc4af46ff223ac4c8bdb076a2cd8265cb34aa1f5b2108d081a019956\
+             d014684a3ea5f29b05c20175c3d50f1e78835c48eef745af103df74d525e9010080\
+             cbb77195f73e94364a9dd5237613c674c340a17dc360501cb9b9ba5835b8b",
+        )
+        .unwrap();
+        let payload = Arc::new(cipher);
+        let router = axum::Router::new().route(
+            "/c.jpg",
+            axum::routing::get(move || {
+                let payload = payload.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "binary/octet-stream")],
+                        (*payload).clone(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-decode-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let source: BookSource = serde_json::from_value(serde_json::json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "加密封面",
+            "coverDecodeJs": "java.createSymmetricCrypto(\"AES/CBC/NoPadding\", \"f5d965df75336270\", \"97b60394abc2fbe1\").decrypt(result)",
+        }))
+        .unwrap();
+
+        let cover_url = format!("{base}/c.jpg");
+        let (data, content_type) = service
+            .get_cover_for_source("public", &cover_url, Some(&source))
+            .await
+            .unwrap();
+
+        assert_eq!(&data[..4], &[0xFF, 0xD8, 0xFF, 0xE0], "应解出 JPEG");
+        assert_eq!(data.len(), 96, "NoPadding 不应改变长度");
+        assert_eq!(content_type, "image/jpeg", "解密后按魔数认格式");
+        // 缓存里也必须是解密后的字节, 否则下次命中又会花图。
+        let (cached, cached_type) = service.get_cover_for_source("public", &cover_url, Some(&source)).await.unwrap();
+        assert_eq!(cached, data);
+        assert_eq!(cached_type, "image/jpeg");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    /// 没有 `coverDecodeJs` 的书源不能被解密逻辑影响: 原样返回服务端字节。
+    #[tokio::test]
+    async fn cover_passthrough_without_cover_decode_js() {
+        use std::sync::Arc;
+
+        let payload = Arc::new(vec![0xFFu8, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4]);
+        let router = axum::Router::new().route(
+            "/plain.jpg",
+            axum::routing::get(move || {
+                let payload = payload.clone();
+                async move { (*payload).clone() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-plain-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let source: BookSource = serde_json::from_value(serde_json::json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "普通封面",
+        }))
+        .unwrap();
+
+        let (data, content_type) = service
+            .get_cover_for_source("public", &format!("{base}/plain.jpg"), Some(&source))
+            .await
+            .unwrap();
+        assert_eq!(data, vec![0xFFu8, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4]);
+        assert_eq!(content_type, "image/jpeg");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    /// 只对**部分**封面加密的书源：明文封面不能被解密规则弄坏。
+    ///
+    /// 一些书源的封面图床混了两种情况（老图未加密、新图加密）。无条件解密
+    /// 会把本来正常的 JPEG 变成一堆乱码 —— 此时应保留原图。
+    #[tokio::test]
+    async fn plain_image_survives_a_broken_cover_decode_rule() {
+        use std::sync::Arc;
+
+        // 一段合法 JPEG 头 + 若干字节，长度不是 16 的倍数。
+        let payload = Arc::new(vec![0xFFu8, 0xD8, 0xFF, 0xE0, 9, 8, 7, 6, 5, 4, 3]);
+        let router = axum::Router::new().route(
+            "/plain.jpg",
+            axum::routing::get(move || {
+                let payload = payload.clone();
+                async move { (*payload).clone() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-mixed-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let source: BookSource = serde_json::from_value(serde_json::json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "部分加密",
+            "coverDecodeJs": "java.createSymmetricCrypto(\"AES/CBC/NoPadding\", \"f5d965df75336270\", \"97b60394abc2fbe1\").decrypt(result)",
+        }))
+        .unwrap();
+
+        let (data, content_type) = service
+            .get_cover_for_source("public", &format!("{base}/plain.jpg"), Some(&source))
+            .await
+            .unwrap();
+        assert_eq!(data, vec![0xFFu8, 0xD8, 0xFF, 0xE0, 9, 8, 7, 6, 5, 4, 3]);
+        assert_eq!(content_type, "image/jpeg");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    /// 搜索/发现页会话结束时释放封面：解密过的封面也必须能删干净。
+    ///
+    /// `release()` 走的是 `clearSearchCoverCache` → `delete_cover_caches("public")`。
+    /// 解密只发生在下载那一步，落盘后与普通封面完全同构，所以这里验证的是
+    /// "解密路径不会把文件写到别的目录/换成别的键"。
+    #[tokio::test]
+    async fn decoded_cover_is_released_with_the_search_session() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-release-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let cover_dir = storage_dir.join("cache").join("public").join("cover");
+
+        // 直接写解密后的字节（等价于 get_cover 成功解密后的落盘结果）。
+        let plain = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4];
+        let url = "https://img.example/search-result.jpg";
+        service
+            .store_cover_mapping(url, &plain, "image/jpeg", &cover_dir)
+            .await
+            .unwrap();
+        assert!(cover_dir.join("urls").exists());
+
+        // 会话结束时的释放。
+        service
+            .delete_cover_caches("public", &[url.to_string()])
+            .await
+            .unwrap();
+
+        assert!(
+            !cover_dir
+                .join("urls")
+                .join(format!("{}.json", md5_hex(url)))
+                .exists(),
+            "映射必须被删除"
+        );
+        let left: Vec<String> = std::fs::read_dir(&cover_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.is_empty(), "会话释放后不应留下内容文件: {left:?}");
+
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    /// 启动清理**不能**把书架书的封面当垃圾删掉（issue #23 后续）。
+    ///
+    /// 前端只在搜索页/发现页卸载时释放封面。进程被强杀、直接关窗、
+    /// IPC 失败都会漏，于是书架封面也会变成"超过 30 分钟未更新"的候选。
+    /// 旧实现只按 mtime 回收 → 隔天启动一次，书架封面全被删光。
+    #[tokio::test]
+    async fn stale_cleanup_never_evicts_a_shelf_cover() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-shelf-pin-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let cover_dir = storage_dir.join("cache").join("public").join("cover");
+
+        // 书架上一本书 + 一张发现页残留的封面。
+        let shelf_url = "https://img.example/on-shelf.jpg";
+        let search_url = "https://img.example/from-explore.jpg";
+        service
+            .store_cover_mapping(shelf_url, b"shelf-cover-bytes", "image/jpeg", &cover_dir)
+            .await
+            .unwrap();
+        service
+            .store_cover_mapping(search_url, b"explore-cover-bytes", "image/jpeg", &cover_dir)
+            .await
+            .unwrap();
+        service
+            .save_book(
+                "default",
+                crate::model::book::Book {
+                    name: "书架书".to_string(),
+                    author: "作者".to_string(),
+                    book_url: "https://s.example/book/1".to_string(),
+                    origin: "https://s.example".to_string(),
+                    cover_url: Some(shelf_url.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // 阈值 0 = 全部视为过期。
+        service
+            .clean_stale_search_covers(Duration::from_secs(0))
+            .await
+            .unwrap();
+
+        assert!(
+            cover_dir
+                .join("urls")
+                .join(format!("{}.json", md5_hex(shelf_url)))
+                .exists(),
+            "书架书的封面映射必须被保住"
+        );
+        assert!(
+            !cover_dir
+                .join("urls")
+                .join(format!("{}.json", md5_hex(search_url)))
+                .exists(),
+            "发现页残留的映射应被回收"
+        );
+        // 书架的图还在，发现页那张（连内容）已被清掉。
+        let (data, _) = service.get_cover("public", shelf_url).await.unwrap();
+        assert_eq!(data, b"shelf-cover-bytes");
+
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    /// 修复前落盘的「密文封面」缓存必须能自愈。
+    /// 用户已经踩过一次坑: 旧版本把密文按 URL 后缀存成了 `.jpg`，
+    /// 映射里 content-type 也是 `image/jpeg`。若只在新下载路径解密，这些
+    /// 用户永远看到花图（清缓存也一样，因为每次都会命中同一个坏文件）。
+    #[tokio::test]
+    async fn legacy_encrypted_cover_cache_is_repaired() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-cover-repair-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let cover_dir = storage_dir.join("cache").join("public").join("cover");
+        let cipher = hex::decode(
+            "093de3b1fc4af46ff223ac4c8bdb076a2cd8265cb34aa1f5b2108d081a019956\
+             d014684a3ea5f29b05c20175c3d50f1e78835c48eef745af103df74d525e9010080\
+             cbb77195f73e94364a9dd5237613c674c340a17dc360501cb9b9ba5835b8b",
+        )
+        .unwrap();
+        let url = "https://img.example/legacy.jpg";
+        service
+            .store_cover_mapping(url, &cipher, "image/jpeg", &cover_dir)
+            .await
+            .unwrap();
+
+        let source: BookSource = serde_json::from_value(serde_json::json!({
+            "bookSourceUrl": "https://18mh.example",
+            "bookSourceName": "加密封面",
+            "coverDecodeJs": "java.createSymmetricCrypto(\"AES/CBC/NoPadding\", \"f5d965df75336270\", \"97b60394abc2fbe1\").decrypt(result)",
+        }))
+        .unwrap();
+
+        let (data, content_type) = service
+            .get_cover_for_source("public", url, Some(&source))
+            .await
+            .unwrap();
+        assert_eq!(&data[..4], &[0xFF, 0xD8, 0xFF, 0xE0], "缓存里的密文应被就地修好");
+        assert_eq!(content_type, "image/jpeg");
+
+        // 重写映射后旧的密文文件必须当场删掉：清理任务只在启动时跑，
+        // 留着它要等到下次重启、再闲置 30 分钟才会被回收。
+        let content_files: Vec<String> = std::fs::read_dir(&cover_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            content_files.len(),
+            1,
+            "只应留下解密后的图，密文孤儿要被就地清掉: {content_files:?}"
+        );
+        assert_eq!(
+            std::fs::read(cover_dir.join(&content_files[0])).unwrap(),
+            data
+        );
+
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
 }

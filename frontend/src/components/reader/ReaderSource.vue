@@ -5,9 +5,41 @@
         <h3>切换书源</h3>
         <span class="source-count" v-if="preparedResults.length">{{ preparedResults.length }} 个结果</span>
       </div>
-      <button class="close-btn" @click="store.closePanel()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-      </button>
+      <div class="header-actions">
+        <!-- 与手机端换源弹窗的 menu_start_stop 对齐: 搜索中显示「停止」,
+             结束后显示「刷新」。此前只有搜完(或被判定失败)才能重新开始,
+             某个源卡住时用户只能干等全部源超时。 -->
+        <button
+          v-if="searching"
+          class="icon-btn"
+          type="button"
+          title="停止搜索"
+          aria-label="停止搜索"
+          @click="stopSearch"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <rect x="7" y="7" width="10" height="10" rx="1.5" />
+          </svg>
+        </button>
+        <button
+          v-else
+          class="icon-btn"
+          type="button"
+          title="重新搜索书源"
+          aria-label="重新搜索书源"
+          :disabled="isLocal"
+          @click="startSearch(true)"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" />
+          </svg>
+        </button>
+        <button class="close-btn" type="button" title="关闭" aria-label="关闭" @click="store.closePanel()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <path d="M6 6l12 12M18 6L6 18" />
+          </svg>
+        </button>
+      </div>
     </div>
     
     <div class="source-list" ref="listRef">
@@ -18,9 +50,14 @@
         <div class="source-url">{{ currentSource.origin }}</div>
       </div>
 
+      <!--
+        当前书籍概览：只留判断换源需要的最小信息（封面/书名/作者/读到哪/最新章）。
+        书源脚本返回的 `intro` 是一整块信息（最新章、点击、评分、上次更新…），
+        铺在这里既长又和上面几行重复，换源时没有决策价值 —— 直接不显示。
+      -->
       <div v-if="store.book" class="book-brief">
         <div class="book-brief-cover">
-          <img v-if="store.book.coverUrl" :src="store.book.coverUrl" :alt="store.book.name">
+          <img v-if="store.book.coverUrl" :src="getCoverUrl(store.book.coverUrl, store.book.origin)" :alt="store.book.name">
           <div v-else class="book-brief-placeholder">{{ store.book.name.slice(0, 1) }}</div>
         </div>
         <div class="book-brief-main">
@@ -28,17 +65,6 @@
           <div class="book-brief-meta">{{ store.book.author || '未知作者' }}</div>
           <div class="book-brief-meta" v-if="store.currentChapter?.title">当前章节：{{ store.currentChapter.title }}</div>
           <div class="book-brief-meta" v-if="store.book.latestChapterTitle">最新章节：{{ store.book.latestChapterTitle }}</div>
-          <div
-            class="book-brief-intro"
-            :class="{ collapsed: !introExpanded }"
-            v-if="store.book.intro"
-            @click="toggleIntro"
-          >{{ store.book.intro }}</div>
-          <button
-            v-if="store.book.intro"
-            class="book-brief-intro-toggle"
-            @click="toggleIntro"
-          >{{ introExpanded ? '收起' : '展开全部' }}</button>
         </div>
       </div>
 
@@ -54,35 +80,44 @@
 
       <div v-else-if="!preparedResults.length && !sourcesIncomplete" class="empty">未找到其他书源</div>
       
-      <div
-        v-else
-        v-for="item in preparedResults"
-        :key="sourceCandidateKey(item.book)"
-        class="source-item"
-        :class="{ selected: selectedCandidate?.book.bookUrl === item.book.bookUrl && selectedCandidate?.book.origin === item.book.origin }"
-        @click="selectCandidate(item)"
-      >
-        <div class="source-main">
-          <div class="source-name-row">
-            <span class="source-name">{{ sourceNameByOrigin(item.book.origin) }}</span>
-            <span class="source-tag" v-if="item.book.kind">{{ item.book.kind }}</span>
-            <span v-if="item.sameLatest" class="compare-badge good">最新章节一致</span>
-            <span v-else-if="item.book.lastChapter" class="compare-badge">章节不同</span>
-          </div>
-          <div class="source-book-name" v-if="item.book.name">{{ item.book.name }}</div>
-          <div class="source-author">{{ item.book.author }}</div>
-          <div class="source-intro" v-if="item.book.intro">{{ item.book.intro }}</div>
-          <div class="source-chapter" v-if="item.book.lastChapter">最新: {{ item.book.lastChapter }}</div>
-          <div class="source-update" v-if="item.book.updateTime">更新时间: {{ item.book.updateTime }}</div>
-          <div class="source-compare-line">
-            <span v-if="item.sameName" class="compare-text">书名匹配</span>
-            <span v-if="item.sameAuthor" class="compare-text">作者匹配</span>
-            <span v-if="item.chapterHint" class="compare-text strong">{{ item.chapterHint }}</span>
-          </div>
-        </div>
-        <div class="source-action">
-          <button class="switch-btn" @click.stop="handleSwitch(item.book)">切换</button>
-        </div>
+      <!--
+        候选列表：紧凑的一行一源。
+        旧版把简介正文、书名、作者、最新章、更新时间、三项匹配标签、独立的
+        「切换」按钮全部堆进每一行，多源时列表被撑成几十屏，同一个书名还要
+        重复几十遍 —— 那正是"看着不美观"的来源。这里按手机端
+        `item_change_source.xml` 的信息密度收拢：主行只留书源名 + 关键状态，
+        次行给「最新章节 · 更新时间」，其余细节放下方的选中详情里按需展示。
+      -->
+      <div class="candidate-list" v-else>
+        <button
+          v-for="item in preparedResults"
+          :key="sourceCandidateKey(item.book)"
+          type="button"
+          class="candidate"
+          :class="{ active: selectedCandidate?.book.bookUrl === item.book.bookUrl && selectedCandidate?.book.origin === item.book.origin }"
+          @click="selectCandidate(item)"
+        >
+          <span class="candidate-rail" aria-hidden="true"></span>
+          <span class="candidate-body">
+            <span class="candidate-title-row">
+              <span class="candidate-name">{{ sourceNameByOrigin(item.book.origin) }}</span>
+              <span v-if="item.sameLatest" class="candidate-badge good">最新章一致</span>
+              <span v-else-if="item.book.lastChapter" class="candidate-badge">章节有差异</span>
+              <span v-if="!item.sameName" class="candidate-badge warn">书名不完全一致</span>
+            </span>
+            <span class="candidate-meta">
+              <span v-if="item.book.author" class="candidate-author">{{ item.book.author }}</span>
+              <span v-if="item.book.lastChapter" class="candidate-latest" :title="item.book.lastChapter">
+                {{ item.book.lastChapter }}
+              </span>
+            </span>
+          </span>
+          <span class="candidate-go" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="m9 6 6 6-6 6" />
+            </svg>
+          </span>
+        </button>
       </div>
 
       <div v-if="searching && preparedResults.length" class="inline-loading">
@@ -90,31 +125,6 @@
         继续搜索其他书源...
       </div>
       </template>
-
-      <div v-if="selectedCandidate" class="compare-panel">
-        <div class="compare-header">
-          <h4>书源对照</h4>
-          <button class="switch-btn primary" :disabled="store.loading" @click="handleSwitch(selectedCandidate.book)">切换到此书源</button>
-        </div>
-        <div class="compare-grid">
-          <div class="compare-card">
-            <div class="compare-title">当前</div>
-            <div class="compare-name">{{ store.book?.name }}</div>
-            <div class="compare-meta">{{ store.book?.author || '未知作者' }}</div>
-            <div class="compare-line">书源：{{ store.book?.originName || store.book?.origin }}</div>
-            <div class="compare-line">当前章节：{{ store.currentChapter?.title || '未知' }}</div>
-            <div class="compare-line">最新章节：{{ store.book?.latestChapterTitle || '未知' }}</div>
-          </div>
-          <div class="compare-card highlight">
-            <div class="compare-title">目标</div>
-            <div class="compare-name">{{ candidatePreview?.name || selectedCandidate.book.name }}</div>
-            <div class="compare-meta">{{ candidatePreview?.author || selectedCandidate.book.author || '未知作者' }}</div>
-            <div class="compare-line">书源：{{ candidatePreview?.originName || selectedCandidate.book.origin }}</div>
-            <div class="compare-line">最新章节：{{ candidatePreview?.latestChapterTitle || selectedCandidate.book.lastChapter || '未知' }}</div>
-            <div class="compare-line compare-intro" v-if="candidatePreview?.intro || selectedCandidate.book.intro">{{ candidatePreview?.intro || selectedCandidate.book.intro }}</div>
-          </div>
-        </div>
-      </div>
 
       <div v-if="sourcesIncomplete && !searching && !loadingMore" class="source-incomplete" role="status">
         <span>部分书源访问失败，可重试。</span>
@@ -126,6 +136,39 @@
         </button>
       </div>
     </div>
+
+    <!--
+      选中书源的详情与「切换」动作：固定在底部，不随列表滚动。
+      旧版把这块当普通内容放在列表末尾，选中任意一项都要滚到底才能点到
+      「切换到此书源」；源多时等于把主操作藏起来。
+
+      版式收成两行：列表里已经能看到书源名/作者/最新章，这里再铺三列事实
+      加一段简介会把卡片撑到接近半屏，反而挡住用户正在挑的那几个源。
+      只留「书源名（+作者/更新时间）」和「最新章节 · 衔接状态」+ 按钮。
+    -->
+    <Transition name="detail-slide">
+      <div v-if="selectedCandidate && !isLocal" class="candidate-detail">
+        <div class="detail-row detail-row-main">
+          <span class="detail-name">{{ sourceNameByOrigin(selectedCandidate.book.origin) }}</span>
+          <span class="detail-sub">{{ detailSubLine }}</span>
+          <button class="detail-dismiss" type="button" title="收起" aria-label="收起" @click="clearSelection">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        <div class="detail-row detail-row-action">
+          <span class="detail-latest" :title="detailLatestLine">{{ detailLatestLine }}</span>
+          <button
+            class="switch-btn primary"
+            type="button"
+            :disabled="store.loading"
+            @click="handleSwitch(selectedCandidate.book)"
+          >切换到此书源</button>
+        </div>
+      </div>
+    </Transition>
 
     <!-- Switching Overlay -->
     <Transition name="fade">
@@ -144,7 +187,7 @@ import { useAppStore } from '../../stores/app'
 import { useSourceStore } from '../../stores/source'
 import { getAvailableBookSourceSSE } from '../../api/search'
 import type { SseLike } from '../../api/sse'
-import { getBookInfo } from '../../api/bookshelf'
+import { getBookInfo, getCoverUrl } from '../../api/bookshelf'
 import { isLocalBook } from '../../utils/localBook'
 import { matchesSourceSwitchTitle, mergeSourceCandidates, normalizeSourceSwitchAuthor, sourceCandidateKey } from '../../utils/searchRank'
 import type { Book, SearchBook } from '../../types'
@@ -163,12 +206,6 @@ const appStore = useAppStore()
 const sourceStore = useSourceStore()
 const theme = computed(() => store.chromeTheme)
 const isLocal = computed(() => isLocalBook(store.book))
-// 书源详情里的 `intro` 常常是**整块信息**（最新/点击/评分/简介拼接在一起），
-// 固定行数会把真正的简介截掉。默认展示足够多行，并允许展开查看全部。
-const introExpanded = ref(false)
-function toggleIntro() {
-  introExpanded.value = !introExpanded.value
-}
 const searching = ref(false)
 const sourcesIncomplete = ref(false)
 const loadingMore = ref(false)
@@ -314,6 +351,21 @@ function closeAvailableSourceSSE() {
   availableSourceSSE = null
 }
 
+/** 停止当前搜索(对齐手机端 `ChangeBookSourceViewModel.stopSearch`)。
+ *
+ *  只关流不够: `searching` 必须复位, 否则"停止"后按钮还停在停止态、
+ *  「继续搜索其他书源...」的转圈也永远不会消失。已拿到的结果保留 ——
+ *  用户在搜索中途点停止, 想要的正是"就这些, 别再等了"。 */
+function stopSearch() {
+  closeAvailableSourceSSE()
+  searching.value = false
+  loadingMore.value = false
+  hasMoreSources.value = false
+  if (!selectedCandidate.value && preparedResults.value.length) {
+    void selectCandidate(preparedResults.value[0])
+  }
+}
+
 function parseAvailableSourcePayload(event: { data: unknown }): AvailableSourceSSEPayload | null {
   try {
     return event.data as AvailableSourceSSEPayload
@@ -429,6 +481,41 @@ async function selectCandidate(item: CandidateItem) {
   }
 }
 
+/** 收起底部详情，回到纯列表。选中态一并清掉，避免列表里留着高亮却看不到对应详情。 */
+function clearSelection() {
+  selectedCandidate.value = null
+  candidatePreview.value = null
+}
+
+/**
+ * 底部详情的副标题：作者 +（有的话）更新时间。
+ * 只放一行，省略号截断 —— 卡片要尽量矮，正文信息在列表行里已经有了。
+ */
+const detailSubLine = computed(() => {
+  const book = selectedCandidate.value?.book
+  if (!book) return ''
+  const author = (book.author || '未知作者').trim()
+  const updated = (book.updateTime || '').trim()
+  return updated ? `${author} · ${updated}` : author
+})
+
+/**
+ * 底部详情的关键信息行：「最新章节 + 衔接状态」。
+ *
+ * 换源时用户真正关心的只有两件事 —— 目标源有没有最新章节、切过去会不会
+ * 断章。这两件事合成一行就够，不必再摆成三列带 dt 标签的表格。
+ */
+const detailLatestLine = computed(() => {
+  const candidate = selectedCandidate.value
+  if (!candidate) return ''
+  const latest = (candidatePreview.value?.latestChapterTitle || candidate.book.lastChapter || '').trim()
+  const hint = candidate.sameLatest
+    ? '可无缝续读'
+    : (candidate.chapterHint || '')
+  if (latest && hint) return `${latest} · ${hint}`
+  return latest || hint || '最新章节未知'
+})
+
 function loadMoreSources() {
   if (!store.book || loadingMore.value || !hasMoreSources.value) return
 
@@ -470,17 +557,65 @@ async function handleSwitch(res: SearchBook) {
 .source-header h3 { font-size: 16px; margin: 0; }
 .source-count { font-size: 11px; opacity: 0.5; }
 
+.header-actions { display: flex; align-items: center; gap: 2px; }
+
+/* ─── 头部图标按钮 ───
+   统一规格：30px 热区、16px 图标、1.8 描边、圆头线帽。
+   之前是 32px + 17px + stroke-width 2，图标顶到边缘、线条又粗又长，
+   放在「切换书源」这种细字标题旁边显得笨重。 */
+.icon-btn,
 .close-btn {
-  width: 32px; height: 32px;
-  display: flex; align-items: center; justify-content: center;
-  border-radius: 8px; color: inherit; opacity: 0.6;
-  background: transparent; border: none; cursor: pointer;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+  transition: opacity 0.16s ease, background 0.16s ease;
+}
+
+.icon-btn svg,
+.close-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.icon-btn:hover:not(:disabled),
+.close-btn:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.icon-btn:active:not(:disabled),
+.close-btn:active {
+  background: rgba(0, 0, 0, 0.09);
+}
+
+.icon-btn:disabled {
+  opacity: 0.25;
+  cursor: not-allowed;
+}
+
+.icon-btn:focus-visible,
+.close-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-primary, #c97f3a) 55%, transparent);
+  outline-offset: 1px;
 }
 
 .source-incomplete { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; font-size: 12px; opacity: .85; }
 
 .source-list {
   flex: 1;
+  /* 必须有 min-height: 0：flex 子项默认 min-height:auto，内容一多就会把
+     滚动区撑开、连同下方固定的详情一起顶出可视区，详情里的「切换」按钮
+     反而看不见了。 */
+  min-height: 0;
   overflow-y: auto;
   padding: 8px 0;
 }
@@ -495,11 +630,13 @@ async function handleSwitch(res: SearchBook) {
   border: 1px solid rgba(201, 127, 58, 0.14);
 }
 
+/* 封面按四行文本的高度收：不再是简介撑高的长卡片，56×76 会留出多余
+   上下空白，显得松散。 */
 .book-brief-cover {
-  width: 56px;
-  height: 76px;
+  width: 52px;
+  height: 70px;
   flex-shrink: 0;
-  border-radius: 10px;
+  border-radius: 9px;
   overflow: hidden;
   background: rgba(0, 0, 0, 0.06);
 }
@@ -540,38 +677,6 @@ async function handleSwitch(res: SearchBook) {
   line-height: 1.4;
 }
 
-/* 书源的 `intro` 通常是一整块信息：最新更新、点击、评分，最后才是简介。
-   限制成 3 行会让真正的简介整段不可见，因此收起态给足行数并支持展开。 */
-.book-brief-intro {
-  font-size: 12px;
-  line-height: 1.45;
-  opacity: 0.76;
-  white-space: pre-wrap;
-  cursor: pointer;
-}
-
-.book-brief-intro.collapsed {
-  display: -webkit-box;
-  -webkit-line-clamp: 12;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.book-brief-intro-toggle {
-  margin-top: 4px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--color-primary, #c97f3a);
-  font-size: 11px;
-  cursor: pointer;
-  opacity: 0.8;
-}
-
-.book-brief-intro-toggle:hover {
-  opacity: 1;
-}
-
 .section-label {
   padding: 12px 20px 4px;
   font-size: 11px;
@@ -587,178 +692,272 @@ async function handleSwitch(res: SearchBook) {
   align-items: center;
   padding: 12px 20px;
   border-bottom: 1px solid rgba(0,0,0,0.02);
-  cursor: pointer;
+  cursor: default;
   transition: background 0.2s;
 }
 
-.source-item:hover { background: rgba(0,0,0,0.03); }
-.source-item.current { background: rgba(201, 127, 58, 0.04); cursor: default; }
-.source-item.selected {
-  background: rgba(201, 127, 58, 0.08);
-  box-shadow: inset 3px 0 0 var(--color-primary, #c97f3a);
+.source-item.current { background: rgba(201, 127, 58, 0.04); }
+
+/* ─── 候选书源列表 ───
+   一行一源，信息密度对齐手机端 item_change_source.xml：
+   主行「书源名 + 状态徽标」，次行「作者 · 最新章节」。 */
+.candidate-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 12px 8px;
 }
 
-.source-main { flex: 1; min-width: 0; }
-.source-name-row { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
-.source-name { font-weight: 600; font-size: 14px; }
-.source-tag { font-size: 10px; opacity: 0.5; border: 1px solid currentColor; padding: 0 3px; border-radius: 3px; }
-.compare-badge {
-  font-size: 10px;
-  padding: 1px 6px;
+.candidate {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px 10px 14px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease;
+}
+
+.candidate:hover { background: rgba(0, 0, 0, 0.035); }
+
+.candidate:active { transform: scale(0.995); }
+
+.candidate:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-primary, #c97f3a) 55%, transparent);
+  outline-offset: 1px;
+}
+
+/* 选中指示用左侧色条，避免整行套一个高饱和底色把列表压得发闷。 */
+.candidate-rail {
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  width: 3px;
+  height: 0;
   border-radius: 999px;
-  background: rgba(0, 0, 0, 0.06);
-  opacity: 0.72;
+  background: var(--color-primary, #c97f3a);
+  transform: translateY(-50%);
+  transition: height 0.18s ease;
 }
 
-.compare-badge.good {
-  background: rgba(82, 196, 26, 0.14);
+.candidate.active {
+  background: color-mix(in srgb, var(--color-primary, #c97f3a) 9%, transparent);
+  border-color: color-mix(in srgb, var(--color-primary, #c97f3a) 26%, transparent);
+}
+
+.candidate.active .candidate-rail { height: 60%; }
+
+.candidate-body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.candidate-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.candidate-name {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.candidate-badge {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.055);
+  font-size: 10px;
+  line-height: 1.5;
+  opacity: 0.72;
+  white-space: nowrap;
+}
+
+.candidate-badge.good {
+  background: rgba(82, 196, 26, 0.15);
   color: #3f8f16;
   opacity: 1;
 }
 
-.source-book-name {
-  font-size: 13px;
-  margin-bottom: 2px;
-  opacity: 0.86;
+.candidate-badge.warn {
+  background: rgba(201, 127, 58, 0.16);
+  color: #a4631f;
+  opacity: 1;
 }
 
-.source-author { font-size: 11px; opacity: 0.5; margin-bottom: 4px; }
-.source-chapter { font-size: 11px; opacity: 0.7; color: var(--color-primary, #c97f3a); }
-.source-update { font-size: 11px; opacity: 0.48; margin-top: 2px; }
-.source-compare-line {
+.candidate-meta {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-size: 11.5px;
+  line-height: 1.4;
+  opacity: 0.58;
 }
 
-.compare-text {
-  font-size: 11px;
-  opacity: 0.62;
-}
+.candidate-author { flex-shrink: 0; }
 
-.compare-text.strong {
-  color: var(--color-primary, #c97f3a);
-  opacity: 0.92;
-}
-
-.source-intro {
-  font-size: 12px;
-  opacity: 0.68;
-  line-height: 1.45;
-  margin-bottom: 4px;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+.candidate-latest {
+  min-width: 0;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.candidate-go {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  opacity: 0.22;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.candidate-go svg { width: 15px; height: 15px; }
+
+.candidate:hover .candidate-go,
+.candidate.active .candidate-go {
+  opacity: 0.55;
+  transform: translateX(1px);
+}
+
+/* ─── 底部选中详情 ───
+   固定在列表下方（flex-shrink: 0），主操作始终可见，不用滚到列表末尾。
+   两行、约 88px 高：列表本身已经显示书名/作者/最新章，这里只补「切过去
+   是否安全」这一个决定性问题，不再重复列表里已有的信息。 */
+.candidate-detail {
+  flex-shrink: 0;
+  margin: 0 12px 12px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--color-primary, #c97f3a) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-primary, #c97f3a) 20%, transparent);
+}
+
+.detail-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.detail-row-main { margin-bottom: 8px; }
+
+.detail-name {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-sub {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.3;
+  opacity: 0.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 撑开中间空隙，把关闭按钮推到最右。 */
+.detail-row-main .detail-sub { flex: 1; }
+
+.detail-dismiss {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin: -2px -2px -2px 0;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.35;
+  transition: opacity 0.18s ease, background 0.18s ease;
+}
+
+.detail-dismiss svg { width: 12px; height: 12px; }
+
+.detail-dismiss:hover {
+  opacity: 0.85;
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.detail-latest {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11.5px;
+  line-height: 1.35;
+  opacity: 0.66;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-slide-enter-active,
+.detail-slide-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.detail-slide-enter-from,
+.detail-slide-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
 }
 
 .source-url { font-size: 11px; opacity: 0.3; }
 
+/* 主操作：实心，底部详情里唯一的强调色元素，视觉焦点不会被列表抢走。 */
 .switch-btn {
-  padding: 4px 12px;
-  font-size: 11px;
-  border-radius: 12px;
-  border: 1px solid var(--color-border);
-  background: transparent;
-  color: inherit;
+  flex-shrink: 0;
+  padding: 7px 16px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--color-primary, #c97f3a);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.2;
   cursor: pointer;
-  opacity: 0.7;
+  transition: filter 0.18s ease, transform 0.12s ease;
 }
 
-.source-item:hover .switch-btn {
-  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
-  color: currentColor;
-  border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
-  opacity: 1;
-}
+.switch-btn:hover:not(:disabled) { filter: brightness(1.07); }
 
-.compare-panel {
-  margin: 8px 16px 18px;
-  padding: 14px;
-  border-radius: 16px;
-  background: rgba(201, 127, 58, 0.08);
-  border: 1px solid rgba(201, 127, 58, 0.14);
-}
+.switch-btn:active:not(:disabled) { transform: scale(0.97); }
 
-.compare-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.compare-header h4 {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 700;
-}
-
-.switch-btn.primary {
-  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
-  border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
-  color: currentColor;
-  opacity: 1;
+.switch-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-primary, #c97f3a) 60%, transparent);
+  outline-offset: 2px;
 }
 
 .switch-btn:disabled {
   cursor: not-allowed;
-  opacity: 0.45;
-}
-
-.compare-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.compare-card {
-  padding: 12px;
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.6);
-  border: 1px solid rgba(0, 0, 0, 0.06);
-}
-
-.compare-card.highlight {
-  border-color: rgba(201, 127, 58, 0.28);
-  background: rgba(201, 127, 58, 0.12);
-}
-
-.compare-title {
-  margin-bottom: 8px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  opacity: 0.58;
-}
-
-.compare-name {
-  font-size: 14px;
-  font-weight: 700;
-  line-height: 1.4;
-  margin-bottom: 4px;
-}
-
-.compare-meta {
-  font-size: 12px;
-  opacity: 0.68;
-  margin-bottom: 10px;
-}
-
-.compare-line {
-  font-size: 12px;
-  line-height: 1.5;
-  opacity: 0.78;
-  margin-top: 4px;
-}
-
-.compare-intro {
-  display: -webkit-box;
-  -webkit-line-clamp: 4;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  opacity: 0.5;
 }
 
 .loading, .empty {
@@ -836,27 +1035,13 @@ async function handleSwitch(res: SearchBook) {
 .switch-overlay p { margin-top: 16px; font-size: 14px; opacity: 0.8; }
 
 @media (max-width: 640px) {
-  .source-item {
-    padding: 12px 16px;
-    align-items: flex-start;
+  /* 窄屏下让按钮独占第二行右侧，信息行仍然保持单行不换行。 */
+  .detail-latest {
+    font-size: 11px;
   }
 
-  .source-action {
-    padding-top: 2px;
-  }
-
-  .compare-panel {
-    margin: 8px 12px 16px;
-    padding: 12px;
-  }
-
-  .compare-header {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .compare-grid {
-    grid-template-columns: 1fr;
+  .switch-btn {
+    padding: 7px 14px;
   }
 }
 </style>
