@@ -66,6 +66,7 @@ reader-rust 是「阅读3.0」的 Rust 实现，主形态是 **Tauri v2 桌面�
 
 ## 已知注意事项
 
+- **简繁转换用 legado 同款词表，别换回 OpenCC 预设**（`frontend/src/utils/chinese.js` + `legadoT2sDict.js`/`legadoS2tDict.js`，由 `scripts/build-legado-chinese-dicts.mjs` 从 quick-transfer-core 0.2.17 的 `tc/t2s.txt`、`tc/s2t.txt` 生成，t2s 侧合并了 legado `ChineseUtils.fixT2sDict()` 的排除表）。OpenCC 的 preset 与手机端**不是同一份词表**：`twp` 会把「序列」变「串行」（#12），`tw` 的 TSCharacters 把「乾」无条件映射成「干」，于是「乾國」→「干国」（#25）；而 legado 词表里「乾」没有单字映射，只在「乾燥/乾淨/乾杯」等短语里转换。两端显示不一致才是 bug，因此这里逐字照搬手机端词表（CJK 基本区 + GB2312 全表做过逐字比对）。`chineseMode` 有 `off`/`simplified`/`traditional` 三档，`off` 不加载那 ~1.2MB 词典分块。
 - **杀软并发编译竞态**：Windows 杀软实时扫描与 cargo 并行写 `.rlib` 冲突（随机 `invalid metadata files` / `link.exe 0xC000012D`）。**构建和测试务必用 `-j 4` 或更低并发**。建议给 `target/` 加 Defender 排除。
 - **不要在测试里构造 `server::assets::StaticSource`**：它带 `tauri::AppHandle`，链接器会把 tauri 的 `TaskDialogIndirect`（comctl32 v6）拉进测试 exe 的导入表；而 cargo 生成的测试 exe 没有应用 manifest，只加载得到 comctl32 v5，进程会在进 `main` 之前以 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 退出 —— 输出里没有任何 Rust panic，看起来像"链接器坏了"。`assets.rs` 因此把路径判定抽成不碰 tauri 的 `resolve_lookup()` 纯函数来测。
 - **`toml` 版本钉在 0.8.2**：共享 lockfile 因 `tauri -> gtk -> proc-macro-crate` 约束无法升级。无害（`config` 只用 Environment source，运行时从不解析 TOML）。不要尝试修复。

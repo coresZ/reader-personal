@@ -248,6 +248,7 @@
       <div class="setting-row">
         <label>简繁转换</label>
         <div class="btn-group">
+          <button class="opt-btn" :class="{ active: config.chineseMode === 'off' }" @click="store.updateConfig('chineseMode', 'off')">关闭</button>
           <button class="opt-btn" :class="{ active: config.chineseMode === 'simplified' }" @click="store.updateConfig('chineseMode', 'simplified')">简体</button>
           <button class="opt-btn" :class="{ active: config.chineseMode === 'traditional' }" @click="store.updateConfig('chineseMode', 'traditional')">繁体</button>
         </div>

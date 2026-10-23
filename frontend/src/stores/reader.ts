@@ -118,7 +118,8 @@ export interface ReadConfig {
   autoScrollSpeed: number
   clickAction: 'next' | 'auto' | 'none'
   selectAction: 'popup' | 'ignore'
-  chineseMode: 'simplified' | 'traditional'
+  /** 简繁转换档位。'off' 表示原文直出（与手机端 legado 的「关闭」一致）。 */
+  chineseMode: 'off' | 'simplified' | 'traditional'
   enablePreload: boolean
   /** 桌面指针靠近阅读区边缘时自动展开工具栏/悬浮钮。
    *  默认关闭: 边缘热区会吃掉正文的点击(左右各 84px), 用户反馈鼠标停在边缘就弹按钮、
@@ -192,6 +193,13 @@ function loadConfig(): ReadConfig {
       return {
         ...defaultConfig,
         ...savedConfig,
+        // 旧存档只有简化/繁体两档; 脏值(手改 localStorage)一律回落默认,
+        // 否则 convertContent 会走进一个不存在的分支。
+        chineseMode: savedConfig.chineseMode === 'off'
+          || savedConfig.chineseMode === 'traditional'
+          || savedConfig.chineseMode === 'simplified'
+          ? savedConfig.chineseMode
+          : defaultConfig.chineseMode,
         pageWidth: typeof savedConfig.pageWidth === 'number'
           ? Math.min(
               READER_PAGE_WIDTH_MAX,
@@ -626,7 +634,10 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   /** 两个方向的转换函数。以前只加载 traditionalized, 「简体」档因此无从转换 ——
-   *  繁体内容(常见于本地导入的书)选「简体」时毫无变化, 就是 issue #6 第 6 条。 */
+   *  繁体内容(常见于本地导入的书)选「简体」时毫无变化, 就是 issue #6 第 6 条。
+   *
+   *  词表与手机端 legado 一致(见 utils/chinese.js 的说明); 「关闭」档不转换,
+   *  因此不需要为它加载这份几十万字的词典。 */
   const chineseConverters = ref<{
     traditional: (text: string) => string
     simplified: (text: string) => string
@@ -634,6 +645,7 @@ export const useReaderStore = defineStore('reader', () => {
   let chineseLoading: Promise<void> | null = null
 
   async function ensureChineseConverterLoaded() {
+    if (config.chineseMode === 'off') return
     if (chineseConverters.value || chineseLoading) return chineseLoading || Promise.resolve()
     chineseLoading = import('../utils/chinese.js')
       .then((module) => {
@@ -772,10 +784,13 @@ export const useReaderStore = defineStore('reader', () => {
    *
    *  两档都真正转换(此前「简体」档直接返回原文, 繁体内容因此"无效"):
    *    'traditional' → 简转繁; 'simplified' → 繁转简。
-   *  已经是目标字形的文本转换后不变, 所以对简体书选「简体」、繁体书选「繁体」
-   *  都不会有副作用。 */
+   *  词表与手机端 legado 一致, 所以简体书选「简体」、繁体书选「繁体」时
+   *  文本逐字不变（那套词表本身是幂等的）。
+   *
+   *  'off' 档直接返回原文 —— 转换器不加载也不会跑, 用户因此有一条
+   *  「任何字都不想被改写」的退路(issue #12 的原始诉求)。 */
   function convertContent(text: string) {
-    if (!text || !chineseConverters.value) return text
+    if (!text || config.chineseMode === 'off' || !chineseConverters.value) return text
     const convert = config.chineseMode === 'traditional'
       ? chineseConverters.value.traditional
       : chineseConverters.value.simplified
@@ -788,8 +803,8 @@ export const useReaderStore = defineStore('reader', () => {
     // 本身, 因此原样返回。
     if (text.includes(PDF_PAGE_ATTR)) return text
     // 与手机端 ContentProcessor 一致: 先简繁转换, 再应用净化替换。
-    // 旧顺序会把替换结果再次交给 OpenCC, 例如「串行 → 序列」又会被 twp→cn
-    // 词表改回「串行」, 表现为替换规则怎么设都无效。
+    // 旧顺序会把替换结果再次交给词表, 例如「串行 → 序列」又被改回「串行」,
+    // 表现为替换规则怎么设都无效(issue #12 的另一半)。
     return applyReplaceRules(convertContent(text))
   }
 
@@ -798,6 +813,7 @@ export const useReaderStore = defineStore('reader', () => {
   })
 
   // 两个档位都要加载转换器: 「简体」档现在也要真的做繁→简(此前它什么都不做)。
+  // 「关闭」档不加载 —— 那份词表本身就有 60KB+1MB, 不需要为不转换的档位付费。
   watch(
     () => config.chineseMode,
     () => {

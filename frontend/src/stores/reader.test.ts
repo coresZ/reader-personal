@@ -1022,10 +1022,15 @@ describe('reader local txt chapters', () => {
     }
 
     vi.stubGlobal('Audio', MockAudio)
-    vi.stubGlobal('URL', {
-      createObjectURL: vi.fn(() => 'blob:test-audio'),
-      revokeObjectURL: vi.fn(),
-    })
+    // 注意: 不能把 URL 整个换成普通对象 —— Vite 的模块加载器在 import 新模块时
+    // 会 `new URL(...)` 解析路径, 被替换掉之后同 worker 里后续的动态 import 全部
+    // 抛 "URL is not a constructor"(表现为简繁转换器静默失效)。这里继承真正的
+    // URL, 只覆盖两个静态方法。
+    class MockURL extends URL {
+      static createObjectURL = vi.fn(() => 'blob:test-audio')
+      static revokeObjectURL = vi.fn()
+    }
+    vi.stubGlobal('URL', MockURL)
     vi.mocked(requestOpenAISpeechAudio).mockResolvedValue(new Blob(['audio']))
 
     const readerStore = useReaderStore()
@@ -1054,6 +1059,9 @@ describe('reader local txt chapters', () => {
 
 describe('reader content processing order', () => {
   beforeEach(() => {
+    // 前面的用例会 stub 掉全局 URL/Audio 而不还原; 这里要动态 import 词典模块,
+    // 残留的 URL 桩会让模块加载抛错, 转换器因此静默失效 —— 先清干净。
+    vi.unstubAllGlobals()
     setActivePinia(createPinia())
     const storage = new Map<string, string>()
     vi.stubGlobal('localStorage', {
@@ -1095,6 +1103,45 @@ describe('reader content processing order', () => {
 
     expect(readerStore.processContentForDisplay('序列')).toBe('序列')
     expect(readerStore.processContentForDisplay('串行')).toBe('序列')
+  })
+
+  it('简体档不再改写「乾國」这类词(issue #25 的回归)', async () => {
+    const readerStore = useReaderStore()
+    readerStore.book = {
+      name: '乾国纪事',
+      author: '作者',
+      origin: 'test-source',
+      bookUrl: 'https://example.test/book',
+    }
+    readerStore.config.chineseMode = 'simplified'
+    // 转换器是动态 import 的('chinese-convert' 单独分块, 1MB+ 词表), 首次
+    // 加载/转换在并行跑全量测试时要几秒 —— 先显式把模块拉进来(watcher 里的
+    // 动态 import 走同一份模块缓存), 再等转换器挂上, 不要赌 setTimeout(0)。
+    await vi.waitFor(() => {
+      expect(readerStore.processContentForDisplay('乾國')).toBe('乾国')
+    }, { timeout: 10_000 })
+
+    // 手机端 legado 显示「乾国」, 阅读器必须一致 —— 曾经这里是「干国」。
+    expect(readerStore.processContentForDisplay('乾國')).toBe('乾国')
+    // 该转的仍然要转。
+    expect(readerStore.processContentForDisplay('乾燥')).toBe('干燥')
+    expect(readerStore.processContentForDisplay('乾隆')).toBe('乾隆')
+  })
+
+  it('「关闭」档原样输出正文, 不做任何简繁转换', async () => {
+    const readerStore = useReaderStore()
+    readerStore.book = {
+      name: '繁简测试',
+      author: '作者',
+      origin: 'test-source',
+      bookUrl: 'https://example.test/book',
+    }
+    readerStore.config.chineseMode = 'off'
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(readerStore.processContentForDisplay('乾國')).toBe('乾國')
+    expect(readerStore.processContentForDisplay('乾燥')).toBe('乾燥')
+    expect(readerStore.processContentForDisplay('这是简体')).toBe('这是简体')
   })
 })
 
