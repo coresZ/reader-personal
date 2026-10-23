@@ -473,6 +473,7 @@ const activeSettingsTab = ref<(typeof allSettingsTabs)[number]['value']>(
   // 否则会停在一个根本不渲染的「常用」上, 面板看起来是空的。
   appStore.isWebMode ? 'appearance' : 'common',
 )
+
 const proxyModeDraft = ref<'system' | 'manual'>(appStore.networkProxyMode)
 const proxyUrlDraft = ref(appStore.networkProxyUrl)
 const savingProxy = ref(false)
@@ -1424,5 +1425,6 @@ async function handleCheckVersionUpdate() {
 
 .theme-option:hover:not(.active) {
   border-color: var(--color-border);
+  color: var(--color-text-secondary);
 }
 </style>
