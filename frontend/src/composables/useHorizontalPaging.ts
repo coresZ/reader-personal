@@ -233,6 +233,35 @@ function splitBlockAtMedia(block: Element): string[] | null {
   return blocks.length > 1 ? blocks : null
 }
 
+/** 已解码插图的真实尺寸: `src -> "宽x高"`。
+ *
+ *  为什么需要缓存: 每次重建分页都会从 HTML 字符串重新创建一遍 `<img>`, 那是全新的
+ *  元素, `naturalWidth/Height` 要等它自己解码完才有效。重建却必须当场算出比例,
+ *  否则这一轮又读不到尺寸。书源插图绝大多数不带 `width`/`height` 属性(实测缓存里
+ *  2323 张有 2321 张没有), 这个缓存就是它们唯一的尺寸来源。 */
+const decodedImageSizes = new Map<string, string>()
+
+/** 记录一张已解码插图的真实尺寸。由阅读页在图片 `load` 时调用。 */
+export function rememberDecodedImageSize(
+  src: string,
+  width: number,
+  height: number,
+): void {
+  if (!src || !(width > 0) || !(height > 0)) return
+  const size = `${width}x${height}`
+  if (decodedImageSizes.get(src) === size) return
+  decodedImageSizes.set(src, size)
+}
+
+/** 读取缓存的真实尺寸; 没有记录时返回 null。 */
+function readDecodedImageSize(src: string): { width: number; height: number } | null {
+  const cached = decodedImageSizes.get(src)
+  if (!cached) return null
+  const [width, height] = cached.split('x').map(Number)
+  if (!(width > 0) || !(height > 0)) return null
+  return { width, height }
+}
+
 /** 给横向分页的媒体元素设一页之内的最大高度。
  *
  *  竖长图原本按原始比例铺满行宽, 高度可以远超一屏; 页容器 `overflow: hidden` 会把
@@ -268,6 +297,18 @@ function constrainBlockMedia(blockHtml: string, pageHeightPx: number, lineHeight
   for (const element of media) {
     // 段评气泡等行内小图标靠 em 尺寸维持在行内, 不参与插图缩放。
     if (element.matches(INLINE_ICON_IMAGE_SELECTOR)) continue
+    // 没有 `width`/`height` 属性时, 用已解码的真实尺寸补上这两个属性。
+    // 下面是按属性推导宽高比的(`height: auto`), 属性缺省就推不出比例 —— 补上之后
+    // 这类插图才和带属性的插图一样, 在加载前就能占住正确高度。
+    const declaredWidth = Number(element.getAttribute('width'))
+    const declaredHeight = Number(element.getAttribute('height'))
+    if (!(declaredWidth > 0 && declaredHeight > 0)) {
+      const cached = readDecodedImageSize(element.getAttribute('src') || '')
+      if (cached) {
+        element.setAttribute('width', String(cached.width))
+        element.setAttribute('height', String(cached.height))
+      }
+    }
     // 书源常给插图写死布局(如 `style="width:100%;height:100%"`)。页容器高度固定,
     // 那个 height 会把画面撑满整页并纵向拉伸, 图后文字随即被挤出可视区 —— 而 EPUB
     // 路径进过清洗器, 这些属性早被剥掉, 所以同样的插图在 EPUB 里是正常的。

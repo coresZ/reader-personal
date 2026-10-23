@@ -1,78 +1,97 @@
 <template>
-  <div class="cache-manager" :style="{ background: theme.popup, color: theme.fontColor }">
-    <div class="cache-header">
-      <div>
-        <h3>缓存章节</h3>
-        <p v-if="store.book" class="cache-subtitle">{{ store.book.name }}</p>
+  <div
+    class="cache-manager"
+    :style="{
+      background: theme.popup,
+      color: theme.fontColor,
+      '--cm-font': theme.fontColor,
+      '--cm-popup': theme.popup,
+    }"
+  >
+    <header class="panel-head">
+      <div class="panel-head-main">
+        <h3>离线缓存</h3>
+        <p v-if="store.book" class="panel-sub">{{ store.book.name }}</p>
       </div>
-      <button class="close-btn" @click="store.backPanel()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="m15 18-6-6 6-6" />
-        </svg>
+      <button class="icon-btn" type="button" aria-label="返回" title="返回" @click="store.backPanel()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6" /></svg>
       </button>
-    </div>
+    </header>
 
-    <div class="cache-body">
-      <div v-if="!isLocalBookInServer" class="summary-grid">
-        <div class="summary-card">
-          <span class="summary-label">本地缓存</span>
-          <strong>{{ localCachedCount }}</strong>
-          <small>已缓存章节</small>
-        </div>
+    <div class="panel-body">
+      <!-- 本地书不需要缓存：只说明情况，不摆一堆无效操作。 -->
+      <div v-if="isLocalBookInServer" class="note">
+        本地书已存放在应用书架中，不需要额外缓存。阅读时会直接读取上传后的本地文件。
       </div>
 
-      <div v-if="working" class="caching-status">
-        <div class="progress-circle">
-          <svg viewBox="0 0 36 36">
-            <path class="circle-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
-            <path class="circle" :stroke-dasharray="`${progress}, 100`" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
-          </svg>
-          <div class="percentage">{{ progress }}%</div>
-        </div>
-        <div class="status-text">
-          <p class="main-status">{{ currentStatus }}</p>
-          <p class="sub-status">{{ currentChapterName || '正在准备...' }}</p>
-        </div>
-        <button class="stop-btn" @click="stopWorking">停止</button>
-      </div>
-
-      <div v-else class="cache-sections">
-        <div v-if="isLocalBookInServer" class="info-card">
-          <p>本地书已存放在应用书架文件中，不需要额外缓存；阅读时会直接读取上传后的本地文件。</p>
-        </div>
-
-        <template v-else>
-          <div class="info-card">
-            <p>已缓存的章节直接从本地读取，不再联网，断网也能照常翻页。</p>
+      <template v-else>
+        <!-- ── 本机缓存 ── -->
+        <section class="group">
+          <div class="group-head">
+            <h4>本机缓存</h4>
+            <button class="link-btn" type="button" @click="refreshStats">刷新</button>
           </div>
-
-          <section class="cache-section">
-            <div class="section-head">
-              <h4>缓存到本地</h4>
-              <button class="link-btn" @click="refreshStats">刷新</button>
+          <div class="card">
+            <div class="stat-row">
+              <div class="stat">
+                <span class="stat-value">{{ localCachedCount }}</span>
+                <span class="stat-unit">章</span>
+              </div>
+              <span class="stat-caption">已缓存到本机</span>
             </div>
-            <div class="option-list">
-              <button class="cache-opt" @click="startServerCaching(50)">
-                <span class="label">缓存后续 50 章</span>
-                <span class="sub">适合当前追更</span>
-              </button>
-              <button class="cache-opt" @click="startServerCaching(100)">
-                <span class="label">缓存后续 100 章</span>
-                <span class="sub">中度离线阅读</span>
-              </button>
-              <button class="cache-opt primary" @click="startServerCaching(0)">
-                <span class="label">全本缓存到本地</span>
-                <span class="sub">保存到应用磁盘</span>
-              </button>
-              <button class="cache-opt danger" @click="clearServerCache">
-                <span class="label">清除本地缓存</span>
-                <span class="sub">删除当前书所有本地缓存</span>
-              </button>
-            </div>
-          </section>
 
-        </template>
-      </div>
+            <div v-if="working" class="progress-block">
+              <div class="progress-line">
+                <div class="progress-track">
+                  <div class="progress-fill" :style="{ width: progress + '%' }"></div>
+                </div>
+                <span class="progress-num">{{ progress }}%</span>
+              </div>
+              <p class="progress-status">{{ currentStatus }}</p>
+              <p class="progress-chapter">{{ currentChapterName || '正在准备…' }}</p>
+              <button class="btn btn-quiet" type="button" @click="stopWorking">停止缓存</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ── 缓存操作 ── -->
+        <section class="group">
+          <div class="group-head"><h4>缓存到本地</h4></div>
+          <div class="card card-rows">
+            <button class="row-btn" type="button" @click="startServerCaching(50)">
+              <span class="row-text">
+                <span class="row-label">后续 50 章</span>
+                <span class="row-sub">适合正在追更的书</span>
+              </span>
+            </button>
+            <button class="row-btn" type="button" @click="startServerCaching(100)">
+              <span class="row-text">
+                <span class="row-label">后续 100 章</span>
+                <span class="row-sub">中度离线阅读</span>
+              </span>
+            </button>
+            <button class="row-btn" type="button" @click="startServerCaching(0)">
+              <span class="row-text">
+                <span class="row-label">全本缓存</span>
+                <span class="row-sub">从当前章缓存到最后一章</span>
+              </span>
+            </button>
+            <button
+              class="row-btn row-danger"
+              type="button"
+              :disabled="!localCachedCount"
+              :title="localCachedCount ? '删除当前书的全部本地缓存' : '这本书还没有本地缓存'"
+              @click="clearServerCache"
+            >
+              <span class="row-text">
+                <span class="row-label">清除本地缓存</span>
+                <span class="row-sub">只删本机文件，不影响书架里的书</span>
+              </span>
+            </button>
+          </div>
+          <p class="hint">已缓存的章节直接从本机读取，不再联网，断网也能照常翻页。</p>
+        </section>
+      </template>
     </div>
   </div>
 </template>
@@ -194,176 +213,399 @@ function stopWorking() {
 </script>
 
 <style scoped>
+/* 颜色从 --cm-font（阅读主题文字色）派生：本面板跟随 9 套阅读主题，
+ * 写死 rgba(0,0,0,x) 在暗色主题下会整块消失。 */
 .cache-manager {
+  --cm-line: color-mix(in srgb, var(--cm-font, currentColor) 9%, transparent);
+  --cm-line-strong: color-mix(in srgb, var(--cm-font, currentColor) 18%, transparent);
+  --cm-label: color-mix(in srgb, var(--cm-font, currentColor) 70%, transparent);
+  --cm-muted: color-mix(in srgb, var(--cm-font, currentColor) 46%, transparent);
+  --cm-card: color-mix(in srgb, var(--cm-font, currentColor) 3.2%, transparent);
+  --cm-card-border: color-mix(in srgb, var(--cm-font, currentColor) 7%, transparent);
+  --cm-accent: var(--color-primary, #c97f3a);
+  --cm-accent-fill: color-mix(in srgb, var(--cm-accent) 13%, transparent);
+  --cm-danger: #c43f3a;
+
   display: flex;
   flex-direction: column;
   height: 100%;
+  /* 组件内统一 border-box：本面板有一层 padding 容器 + 一层 padding 卡片，
+   * 任何一层按 content-box 计算都会让内容比抽屉宽出内边距，右侧被裁掉。 */
+  box-sizing: border-box;
 }
 
-.cache-header {
+.cache-manager *,
+.cache-manager *::before,
+.cache-manager *::after {
+  box-sizing: border-box;
+}
+
+/* ─── 顶栏：与阅读设置同一套尺寸与留白 ─── */
+.panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 22px 20px 14px;
+  flex-shrink: 0;
+}
+
+.panel-head-main {
+  min-width: 0;
+}
+
+.panel-head h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.panel-sub {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--cm-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.icon-btn {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 16px 20px;
-  border-bottom: 1px solid rgba(0,0,0,0.06);
+  justify-content: center;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--cm-label);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 
-.cache-header h3 { margin: 0; font-size: 16px; }
-.cache-subtitle { margin: 4px 0 0; font-size: 12px; opacity: 0.55; }
-
-.close-btn {
-  width: 32px; height: 32px;
-  display: flex; align-items: center; justify-content: center;
-  border-radius: 8px; color: inherit; opacity: 0.6;
-  background: transparent; border: none; cursor: pointer;
+.icon-btn svg {
+  width: 16px;
+  height: 16px;
 }
 
-.cache-body {
+.icon-btn:hover {
+  background: color-mix(in srgb, var(--cm-font, currentColor) 6%, transparent);
+  color: var(--cm-font, currentColor);
+}
+
+.panel-body {
   flex: 1;
-  padding: 24px;
+  min-height: 0;
   overflow-y: auto;
+  padding: 0 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
 }
 
-.summary-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
-  margin-bottom: 20px;
+/* ─── 分组 ─── */
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-.summary-card {
-  border-radius: 16px;
-  padding: 16px;
-  background: rgba(201, 127, 58, 0.08);
+.group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 3px;
+}
+
+.group-head h4 {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--cm-muted);
+}
+
+.card {
+  border-radius: 14px;
+  border: 1px solid var(--cm-card-border);
+  background: var(--cm-card);
+  padding: 4px 14px;
+  /* 同理：卡片本身也要 border-box，避免内容区被内边距撑出面板。 */
+  box-sizing: border-box;
+}
+
+.card-rows {
+  display: flex;
+  flex-direction: column;
+  /* 行自己带左右内边距（见 .row-btn），卡片这里只留上下空隙，
+     否则内边距会叠加成两层。 */
+  padding: 2px 0;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+/* ─── 统计 ─── */
+.stat-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 12px 0;
+}
+
+.stat {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+}
+
+.stat-value {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-unit {
+  font-size: 12px;
+  color: var(--cm-muted);
+}
+
+.stat-caption {
+  font-size: 12px;
+  color: var(--cm-muted);
+}
+
+/* ─── 进度 ─── */
+.progress-block {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding: 4px 0 12px;
+  border-top: 1px solid var(--cm-line);
 }
 
-.summary-label { font-size: 12px; opacity: 0.65; }
-.summary-card strong { font-size: 28px; line-height: 1; }
-.summary-card small { font-size: 12px; opacity: 0.5; }
-
-.cache-sections {
+.progress-line {
   display: flex;
-  flex-direction: column;
-  gap: 24px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
 }
 
-.cache-section {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.progress-track {
+  flex: 1;
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--cm-font, currentColor) 15%, transparent);
+  overflow: hidden;
 }
 
-.section-head {
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--cm-accent);
+  transition: width 0.28s ease;
+}
+
+.progress-num {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--cm-label);
+}
+
+.progress-status {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  color: var(--cm-label);
+}
+
+.progress-chapter {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--cm-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn {
+  align-self: flex-start;
+  margin-top: 6px;
+  min-height: 30px;
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--cm-line-strong);
+  background: transparent;
+  color: var(--cm-label);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.btn-quiet:hover {
+  background: color-mix(in srgb, var(--cm-font, currentColor) 6%, transparent);
+  color: var(--cm-font, currentColor);
+}
+
+/* ─── 操作行 ─── */
+.row-btn {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  /* 行自己带左右内边距（卡片在这里不留内边距），
+     这样文字与上方标题对齐，悬停底色又能铺到卡片边缘。
+     不要用负外边距抵内边距：那样行会比卡片宽 28px，右侧连同卡片圆角一起被裁掉。 */
+  width: 100%;
+  /* 显式 border-box：按钮若按 content-box 计算，width:100% 再加左右内边距
+   * 会比卡片宽 28px，右侧连同圆角与箭头一起被裁掉。 */
+  box-sizing: border-box;
+  margin: 0;
+  padding: 11px 14px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s;
 }
 
-.section-head h4 {
+.row-btn + .row-btn {
+  /* 分隔线用伪元素而不是 border-top：行有圆角，边框会顺着圆角拐弯，
+   * 而伪元素可以只画一条两端内缩的直线。 */
+  border-top: none;
+}
+
+.row-btn + .row-btn::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 14px;
+  right: 14px;
+  height: 1px;
+  background: var(--cm-line);
+}
+
+.row-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--cm-font, currentColor) 5%, transparent);
+}
+
+.row-btn:hover:not(:disabled) .row-label {
+  color: var(--cm-accent);
+}
+
+/* 右侧箭头：这些行整行可点，没有它就只有文字变色这一点提示。 */
+.row-btn::after {
+  content: "";
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin-left: 2px;
+  border-right: 1.5px solid var(--cm-muted);
+  border-bottom: 1.5px solid var(--cm-muted);
+  transform: rotate(-45deg);
+  transition: border-color 0.15s, transform 0.15s;
+}
+
+.row-btn:hover:not(:disabled)::after {
+  border-color: var(--cm-accent);
+  transform: rotate(-45deg) translate(2px, 0);
+}
+
+/* 禁用态只弱化文字与箭头，不整体降透明度：
+ * 整体变淡会让红色「清除本地缓存」变成浑浊的暗红，看起来像样式错了。 */
+.row-btn:disabled {
+  cursor: not-allowed;
+}
+
+.row-btn:disabled .row-label {
+  color: var(--cm-muted);
+}
+
+.row-btn:disabled .row-sub {
+  opacity: 0.7;
+}
+
+.row-btn:disabled::after {
+  opacity: 0.35;
+}
+
+.row-btn:active:not(:disabled) {
+  background: color-mix(in srgb, var(--cm-font, currentColor) 8%, transparent);
+}
+
+.row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.row-label {
+  font-size: 13.5px;
+  font-weight: 500;
+  transition: color 0.15s;
+}
+
+.row-sub {
+  font-size: 11.5px;
+  color: var(--cm-muted);
+  line-height: 1.4;
+}
+
+.row-danger .row-label {
+  color: var(--cm-danger);
+}
+
+.row-danger:hover:not(:disabled) .row-label {
+  color: var(--cm-danger);
+  text-decoration: underline;
+}
+
+/* ─── 说明 ─── */
+.hint {
   margin: 0;
-  font-size: 15px;
+  padding: 0 3px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--cm-muted);
+}
+
+.note {
+  margin-top: 4px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--cm-card-border);
+  background: var(--cm-card);
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--cm-label);
 }
 
 .link-btn {
-  background: transparent;
+  padding: 2px 6px;
   border: none;
-  color: var(--color-primary, #c97f3a);
-  cursor: pointer;
-}
-
-.info-card {
-  background: rgba(201, 127, 58, 0.08);
-  padding: 16px;
-  border-radius: 12px;
-  border-left: 4px solid var(--color-primary, #c97f3a);
-}
-
-.info-card p { margin: 0; font-size: 13px; line-height: 1.6; opacity: 0.8; }
-
-.option-list { display: flex; flex-direction: column; gap: 12px; }
-
-.cache-opt {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  padding: 16px 20px;
-  border-radius: 16px;
-  border: 1px solid rgba(0,0,0,0.1);
+  border-radius: 6px;
   background: transparent;
-  color: inherit;
+  color: var(--cm-accent);
+  font-size: 12px;
   cursor: pointer;
-  text-align: left;
-  transition: all 0.2s;
+  transition: background 0.15s;
 }
 
-.cache-opt:hover {
-  border-color: var(--color-primary, #c97f3a);
-  background: rgba(201, 127, 58, 0.04);
+.link-btn:hover {
+  background: var(--cm-accent-fill);
 }
 
-.cache-opt.primary {
-  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
-  border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
-  /* 文字跟随阅读主题: 主色文字在浅色阅读主题下与底几乎同亮(约 2.3:1)。 */
-  color: currentColor;
-  font-weight: 600;
-}
-
-.cache-opt.primary:hover {
-  background: color-mix(in srgb, var(--color-primary) 20%, transparent);
-}
-
-.cache-opt.danger {
-  border-color: rgba(239, 68, 68, 0.2);
-  color: #dc2626;
-}
-
-.cache-opt .label { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
-.cache-opt .sub { font-size: 11px; opacity: 0.6; }
-
-.caching-status {
-  min-height: 360px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding-bottom: 40px;
-}
-
-.progress-circle {
-  position: relative;
-  width: 150px;
-  height: 150px;
-  margin-bottom: 24px;
-}
-
-.progress-circle svg { transform: rotate(-90deg); width: 100%; height: 100%; }
-.circle-bg { fill: none; stroke: rgba(0,0,0,0.05); stroke-width: 2.8; }
-.circle { fill: none; stroke: var(--color-primary, #c97f3a); stroke-width: 2.8; stroke-linecap: round; transition: stroke-dasharray 0.3s; }
-
-.percentage {
-  position: absolute;
-  top: 50%; left: 50%;
-  transform: translate(-50%, -50%);
-  font-size: 24px; font-weight: 700;
-}
-
-.status-text { text-align: center; margin-bottom: 32px; }
-.main-status { font-weight: 600; font-size: 16px; margin: 0 0 8px 0; }
-.sub-status { font-size: 13px; opacity: 0.5; margin: 0; }
-
-.stop-btn {
-  padding: 8px 24px;
-  border-radius: 20px;
-  background: rgba(239, 68, 68, 0.1);
-  color: #ef4444;
-  border: 1px solid rgba(239, 68, 68, 0.2);
-  cursor: pointer;
-  font-size: 14px;
+@media (prefers-reduced-motion: reduce) {
+  .cache-manager * {
+    transition-duration: 0.01ms !important;
+  }
 }
 </style>

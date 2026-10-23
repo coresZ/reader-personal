@@ -10,17 +10,16 @@
     }"
   >
     <div class="settings-header">
-      <h3 class="settings-title">设置</h3>
+      <h3 class="settings-title">阅读设置</h3>
       <button
         v-if="!standalone"
         class="reset-btn"
         title="重置排版参数；阅读配色与背景图会保留"
         @click="store.resetConfig()"
-      >重置为默认配置</button>
+      >重置为默认</button>
       <!-- 独立模式从主设置抽屉打开, 需要一个自己的关闭入口。 -->
       <button v-else class="reset-btn" @click="emit('close')">关闭</button>
     </div>
-    <div class="settings-sep"></div>
 
     <nav class="reader-settings-tabs" aria-label="阅读设置分类">
       <button
@@ -34,414 +33,527 @@
 
     <div class="settings-body">
       <section v-show="activeSettingsTab === 'display'" class="settings-group">
-      <!-- 阅读主题 -->
-      <div class="setting-row">
-        <label>阅读主题</label>
-        <div class="theme-swatches">
-          <button
-            v-for="(t, i) in themePresets"
-            :key="i"
-            class="swatch"
-            :class="{ active: isThemeActive(i) }"
-            :style="{ background: t.body }"
-            @click="store.setThemeIndex(i)"
-          >
-            <svg v-if="isThemeActive(i)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5" /></svg>
-          </button>
-        </div>
-      </div>
-
-      <!-- 自定义阅读配色 -->
-      <div class="setting-block">
-        <div class="setting-block-head">
-          <label>阅读配色</label>
-          <button
-            v-if="config.readerBackgroundColor || config.fontColor"
-            class="link-btn"
-            @click="resetReaderColors"
-          >还原默认</button>
-        </div>
-        <div class="color-grid">
-          <div class="color-card" :class="{ customized: config.readerBackgroundColor }">
-            <span class="color-card-label">背景</span>
-            <label class="color-swatch" :style="{ background: config.readerBackgroundColor || theme.body }">
-              <input
-                class="color-input"
-                type="color"
-                :value="config.readerBackgroundColor || theme.body"
-                @input="store.updateConfig('readerBackgroundColor', ($event.target as HTMLInputElement).value)"
+      <!-- ── 主题与外观 ── -->
+      <div class="group">
+        <div class="group-head"><h3>主题与外观</h3></div>
+        <div class="group-card">
+          <div class="setting-row">
+            <label>阅读主题</label>
+            <div class="swatch-row">
+              <button
+                v-for="(t, i) in themePresets"
+                :key="i"
+                class="swatch"
+                :class="{ active: isThemeActive(i) }"
+                :style="{ background: t.body }"
+                :title="t.name"
+                :aria-label="t.name"
+                @click="store.setThemeIndex(i)"
               >
-            </label>
-            <span class="color-card-value">{{ config.readerBackgroundColor || '跟随主题' }}</span>
-            <button
-              v-if="config.readerBackgroundColor"
-              class="icon-btn"
-              title="还原为跟随主题"
-              @click="store.updateConfig('readerBackgroundColor', '')"
-            >×</button>
+                <svg v-if="isThemeActive(i)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5" /></svg>
+              </button>
+            </div>
           </div>
-          <div class="color-card" :class="{ customized: config.fontColor }">
-            <span class="color-card-label">文字</span>
-            <label class="color-swatch" :style="{ background: config.fontColor || theme.fontColor }">
-              <input
-                class="color-input"
-                type="color"
-                :value="config.fontColor || theme.fontColor"
-                @input="store.updateConfig('fontColor', ($event.target as HTMLInputElement).value)"
+
+          <div class="setting-row setting-row-top">
+            <label>阅读配色</label>
+            <div class="color-grid">
+              <div class="color-card" :class="{ customized: config.readerBackgroundColor }">
+                <span class="color-card-label">背景</span>
+                <label class="color-swatch" :style="{ background: config.readerBackgroundColor || readerTheme.body }">
+                  <input
+                    class="color-input"
+                    type="color"
+                    :value="config.readerBackgroundColor || readerTheme.body"
+                    @input="store.updateConfig('readerBackgroundColor', ($event.target as HTMLInputElement).value)"
+                  >
+                </label>
+                <span class="color-card-value">{{ config.readerBackgroundColor || '跟随主题' }}</span>
+                <button
+                  v-if="config.readerBackgroundColor"
+                  class="icon-btn"
+                  title="还原为跟随主题"
+                  @click="store.updateConfig('readerBackgroundColor', '')"
+                >×</button>
+              </div>
+              <div class="color-card" :class="{ customized: config.fontColor }">
+                <span class="color-card-label">文字</span>
+                <label class="color-swatch" :style="{ background: config.fontColor || readerTheme.fontColor }">
+                  <input
+                    class="color-input"
+                    type="color"
+                    :value="config.fontColor || readerTheme.fontColor"
+                    @input="store.updateConfig('fontColor', ($event.target as HTMLInputElement).value)"
+                  >
+                </label>
+                <span class="color-card-value">{{ config.fontColor || '跟随主题' }}</span>
+                <button
+                  v-if="config.fontColor"
+                  class="icon-btn"
+                  title="还原为跟随主题"
+                  @click="store.updateConfig('fontColor', '')"
+                >×</button>
+              </div>
+            </div>
+            <button
+              v-if="config.readerBackgroundColor || config.fontColor"
+              class="link-btn color-reset"
+              @click="resetReaderColors"
+            >还原为跟随主题</button>
+          </div>
+
+          <!-- 背景图走 Tauri 上传通道，Web 端不显示（浏览器里没有等价路由）。 -->
+          <div v-if="!appStore.isWebMode" class="setting-row setting-row-top">
+            <label>阅读页背景图</label>
+            <div class="image-picker">
+              <button
+                class="image-thumb"
+                :class="{ empty: !config.readerBackgroundImage }"
+                type="button"
+                :disabled="processingReaderImage"
+                :style="config.readerBackgroundImage
+                  ? { backgroundImage: `url('${config.readerBackgroundImage}')` }
+                  : undefined"
+                @click="readerImageInputRef?.click()"
               >
-            </label>
-            <span class="color-card-value">{{ config.fontColor || '跟随主题' }}</span>
-            <button
-              v-if="config.fontColor"
-              class="icon-btn"
-              title="还原为跟随主题"
-              @click="store.updateConfig('fontColor', '')"
-            >×</button>
+                <span v-if="!config.readerBackgroundImage">选择图片</span>
+              </button>
+              <div class="image-picker-meta">
+                <div class="image-picker-actions">
+                  <button class="opt-btn" type="button" :disabled="processingReaderImage" @click="readerImageInputRef?.click()">
+                    {{ processingReaderImage ? '正在处理…' : (config.readerBackgroundImage ? '更换图片' : '选择图片') }}
+                  </button>
+                  <button
+                    v-if="config.readerBackgroundImage"
+                    class="link-btn danger"
+                    type="button"
+                    @click="removeReaderBackgroundImage"
+                  >移除</button>
+                </div>
+                <span class="image-picker-note">仅用于阅读页，与桌面背景图互不影响</span>
+              </div>
+              <input
+                ref="readerImageInputRef"
+                class="hidden-input"
+                type="file"
+                accept="image/jpeg,image/png,image/webp,image/bmp"
+                hidden
+                @change="handleReaderImageChange"
+              >
+            </div>
+          </div>
+
+          <div v-if="!appStore.isWebMode && config.readerBackgroundImage" class="setting-row">
+            <label>图片透明度</label>
+            <div class="range-field">
+              <div class="range-track" :style="{ '--fill': readerImageOpacityPercent + '%' }">
+                <input
+                  class="settings-slider"
+                  type="range"
+                  min="0"
+                  max="1"
+                  :step="READER_BACKGROUND_OPACITY_STEP"
+                  :value="config.readerImageOpacity"
+                  @input="store.updateConfig('readerImageOpacity', Number(($event.target as HTMLInputElement).value))"
+                >
+              </div>
+              <label class="range-value">
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="1"
+                  :value="readerOpacityToPercent(config.readerImageOpacity)"
+                  @change="applyReaderOpacityPercent(($event.target as HTMLInputElement).value, $event.target as HTMLInputElement)"
+                >
+                <span>%</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <label>面板不透明度</label>
+            <div class="range-field">
+              <!-- 滑块只在有效区间里跑：最左 = 下限(50%)，填充为空；往右到 100% 填满。
+                   这样「拖柄位置 = 填充比例 = 右侧数字在区间里的位置」三者永远一致，
+                   也不会出现「最左端还留着一截实体进度」的错觉。 -->
+              <div
+                class="range-track"
+                :style="{ '--fill': panelOpacityPercent + '%' }"
+                :title="`最低 ${panelOpacityFloorPercent}%，再低抽屉里的文字会透出正文`"
+              >
+                <input
+                  class="settings-slider"
+                  type="range"
+                  :min="panelOpacityFloorPercent"
+                  max="100"
+                  step="1"
+                  aria-label="面板不透明度"
+                  :value="readerOpacityToPercent(config.panelOpacity)"
+                  @input="updatePanelOpacityPercent(($event.target as HTMLInputElement).value)"
+                >
+              </div>
+              <label class="range-value">
+                <input
+                  type="number"
+                  :min="panelOpacityFloorPercent"
+                  max="100"
+                  step="1"
+                  :value="readerOpacityToPercent(config.panelOpacity)"
+                  @change="applyPanelOpacityPercent(($event.target as HTMLInputElement).value, $event.target as HTMLInputElement)"
+                >
+                <span>%</span>
+              </label>
+              <!-- 常驻而非 v-if：半透明时才出现的按钮会把滑块挤短一截，
+                   拖动过程中数值跨过 100% 时轨道宽度跳变，看起来就是"进度条长短在闪"。 -->
+              <button
+                class="link-btn reset-solid"
+                :disabled="config.panelOpacity >= 1"
+                title="把面板恢复为实色（100%）"
+                @click="resetPanelOpacity"
+              >实色</button>
+            </div>
           </div>
         </div>
       </div>
 
-      <!-- 阅读页背景图 -->
-      <!--
-        Web 端隐藏: 选图后要 `uploadBackgroundImage` 把文件落到应用目录,
-        那是 Tauri 的 octet-stream 上传命令, 浏览器里没有等价路由
-        (http.ts 的 upload 只认三种本地书)。留着按钮只会让人选完图报错。
-      -->
-      <div v-if="!appStore.isWebMode" class="setting-block">
-        <div class="setting-block-head">
-          <label>阅读页背景图</label>
-          <button
-            v-if="config.readerBackgroundImage"
-            class="link-btn danger"
-            @click="removeReaderBackgroundImage"
-          >移除</button>
-        </div>
-        <div class="image-picker-row">
-          <button
-            class="image-thumb"
-            :class="{ empty: !config.readerBackgroundImage }"
-            type="button"
-            :disabled="processingReaderImage"
-            :style="config.readerBackgroundImage
-              ? { backgroundImage: `url('${config.readerBackgroundImage}')` }
-              : undefined"
-            @click="readerImageInputRef?.click()"
-          >
-            <span v-if="!config.readerBackgroundImage">点击选择图片</span>
-          </button>
-          <div class="image-picker-meta">
-            <button class="opt-btn" type="button" :disabled="processingReaderImage" @click="readerImageInputRef?.click()">
-              {{ processingReaderImage ? '正在处理…' : (config.readerBackgroundImage ? '更换图片' : '选择图片') }}
-            </button>
-            <span class="image-picker-note">仅用于阅读页，与桌面背景图互不影响</span>
+      <!-- ── 排版 ── -->
+      <div class="group">
+        <div class="group-head"><h3>排版</h3></div>
+        <div class="group-card">
+          <div class="setting-row setting-row-top">
+            <label>正文字体</label>
+            <div class="font-picker">
+              <div class="font-grid">
+                <button
+                  v-for="f in fontPresets"
+                  :key="f.value"
+                  class="font-chip"
+                  :class="{ active: config.fontFamily === f.value }"
+                  :style="{ fontFamily: f.family || 'inherit' }"
+                  @click="store.updateConfig('fontFamily', f.value)"
+                >{{ f.label }}</button>
+                <button
+                  v-for="font in store.customFonts"
+                  :key="font.id"
+                  class="font-chip"
+                  :title="font.name"
+                  :style="{ fontFamily: `ReaderCustom_${font.id.replace(/[^a-zA-Z0-9_]/g, '')}` }"
+                  :class="{ active: config.fontFamily === `custom:${font.id}` }"
+                  @click="store.updateConfig('fontFamily', `custom:${font.id}`)"
+                >{{ font.name }}</button>
+              </div>
+              <div v-if="!appStore.isWebMode" class="font-actions">
+                <button class="link-btn" type="button" @click="fontInputRef?.click()">导入字体</button>
+                <button
+                  v-if="activeCustomFont"
+                  class="link-btn danger"
+                  type="button"
+                  @click="removeActiveCustomFont"
+                >删除当前字体</button>
+                <input
+                  ref="fontInputRef"
+                  type="file"
+                  accept=".ttf,.otf,.woff,.woff2,font/ttf,font/otf,font/woff,font/woff2"
+                  hidden
+                  @change="handleFontFile"
+                >
+              </div>
+            </div>
           </div>
-          <input
-            ref="readerImageInputRef"
-            class="hidden-input"
-            type="file"
-            accept="image/jpeg,image/png,image/webp,image/bmp"
-            hidden
-            @change="handleReaderImageChange"
-          >
-        </div>
-        <div v-if="config.readerBackgroundImage" class="inline-slider">
-          <label for="reader-image-opacity">透明度</label>
-          <input
-            id="reader-image-opacity"
-            class="settings-slider"
-            type="range"
-            min="0"
-            max="1"
-            :step="READER_BACKGROUND_OPACITY_STEP"
-            :value="config.readerImageOpacity"
-            @input="store.updateConfig('readerImageOpacity', Number(($event.target as HTMLInputElement).value))"
-          >
-          <label class="opacity-input-wrap" title="可直接输入 0-100 的数值">
-            <input
-              class="opacity-input"
-              type="number"
-              min="0"
-              max="100"
-              step="1"
-              :value="readerOpacityToPercent(config.readerImageOpacity)"
-              @change="applyReaderOpacityPercent(($event.target as HTMLInputElement).value, $event.target as HTMLInputElement)"
-            >
-            <span class="opacity-unit">%</span>
-          </label>
-        </div>
-      </div>
 
-      <!-- 面板不透明度: 目录/书签/设置抽屉与右键菜单的底板 -->
-      <div class="setting-block">
-        <div class="setting-block-head">
-          <label for="reader-panel-opacity">面板不透明度</label>
-          <button
-            v-if="config.panelOpacity < 1"
-            class="link-btn"
-            @click="resetPanelOpacity"
-          >还原实色</button>
-        </div>
-        <div class="inline-slider">
-          <input
-            id="reader-panel-opacity"
-            class="settings-slider"
-            type="range"
-            :min="READER_PANEL_OPACITY_MIN"
-            max="1"
-            :step="READER_BACKGROUND_OPACITY_STEP"
-            :value="config.panelOpacity"
-            @input="store.updateConfig('panelOpacity', Number(($event.target as HTMLInputElement).value))"
-          >
-          <label class="opacity-input-wrap" title="可直接输入百分比数值">
-            <input
-              class="opacity-input"
-              type="number"
-              :min="Math.round(READER_PANEL_OPACITY_MIN * 100)"
-              max="100"
-              step="1"
-              :value="readerOpacityToPercent(config.panelOpacity)"
-              @change="applyPanelOpacityPercent(($event.target as HTMLInputElement).value, $event.target as HTMLInputElement)"
-            >
-            <span class="opacity-unit">%</span>
-          </label>
-        </div>
-      </div>
-
-      <!-- 正文字体 -->
-      <div class="setting-row">
-        <label>正文字体</label>
-        <div class="font-picker">
-          <div class="btn-group">
-            <button
-              v-for="f in fontPresets"
-              :key="f.value"
-              class="opt-btn"
-              :class="{ active: config.fontFamily === f.value }"
-              @click="store.updateConfig('fontFamily', f.value)"
-            >{{ f.label }}</button>
-            <button
-              v-for="font in store.customFonts"
-              :key="font.id"
-              class="opt-btn custom-font-btn"
-              :title="font.name"
-              :class="{ active: config.fontFamily === `custom:${font.id}` }"
-              @click="store.updateConfig('fontFamily', `custom:${font.id}`)"
-            >{{ font.name }}</button>
+          <div class="setting-row">
+            <label>字体大小</label>
+            <div class="range-field">
+              <div class="range-track" :style="{ '--fill': fontSizePercent + '%' }">
+                <input
+                  type="range"
+                  class="settings-slider"
+                  :min="READER_FONT_SIZE_MIN"
+                  :max="READER_FONT_SIZE_MAX"
+                  step="1"
+                  :value="config.fontSize"
+                  @input="updateSlider('fontSize', $event)"
+                >
+              </div>
+              <label class="range-value">
+                <input
+                  type="number"
+                  :min="READER_FONT_SIZE_MIN"
+                  :max="READER_FONT_SIZE_MAX"
+                  :value="config.fontSize"
+                  @change="commitNumber('fontSize', $event, READER_FONT_SIZE_MIN, READER_FONT_SIZE_MAX)"
+                >
+                <span>px</span>
+              </label>
+            </div>
           </div>
-          <div class="font-actions">
-            <!-- 导入/删除字体走 Tauri 上传通道, Web 端没有 HTTP 路由 -->
-            <button v-if="!appStore.isWebMode" class="opt-btn" @click="fontInputRef?.click()">导入字体</button>
-            <button
-              v-if="activeCustomFont && !appStore.isWebMode"
-              class="opt-btn danger"
-              @click="removeActiveCustomFont"
-            >删除当前字体</button>
-            <input
-              ref="fontInputRef"
-              type="file"
-              accept=".ttf,.otf,.woff,.woff2,font/ttf,font/otf,font/woff,font/woff2"
-              hidden
-              @change="handleFontFile"
-            >
+
+          <div class="setting-row">
+            <label>字体粗细</label>
+            <div class="range-field">
+              <div class="range-track" :style="{ '--fill': fontWeightPercent + '%' }">
+                <input
+                  type="range"
+                  class="settings-slider"
+                  min="100"
+                  max="900"
+                  step="100"
+                  :value="config.fontWeight"
+                  @input="updateSlider('fontWeight', $event)"
+                >
+              </div>
+              <span class="range-value range-value--text">{{ config.fontWeight }}</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <label>段落行高</label>
+            <div class="stepper">
+              <button class="step-btn" @click="stepFloat('lineHeight', -0.1, 1.0, 3.0)">−</button>
+              <span class="step-val">{{ config.lineHeight.toFixed(1) }}</span>
+              <button class="step-btn" @click="stepFloat('lineHeight', 0.1, 1.0, 3.0)">＋</button>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <label>段落间距</label>
+            <div class="stepper">
+              <button class="step-btn" @click="stepFloat('paragraphSpacing', -0.1, 0, 2.0)">−</button>
+              <span class="step-val">{{ config.paragraphSpacing.toFixed(1) }}</span>
+              <button class="step-btn" @click="stepFloat('paragraphSpacing', 0.1, 0, 2.0)">＋</button>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <label>首行缩进</label>
+            <div class="switch-line">
+              <button
+                class="switch"
+                role="switch"
+                :aria-checked="config.firstLineIndent"
+                :class="{ on: config.firstLineIndent }"
+                @click="store.updateConfig('firstLineIndent', !config.firstLineIndent)"
+              ></button>
+              <span class="switch-note">段首空两字</span>
+            </div>
           </div>
         </div>
       </div>
 
-      <!-- 简繁转换 -->
-      <div class="setting-row">
-        <label>简繁转换</label>
-        <div class="btn-group">
-          <button class="opt-btn" :class="{ active: config.chineseMode === 'off' }" @click="store.updateConfig('chineseMode', 'off')">关闭</button>
-          <button class="opt-btn" :class="{ active: config.chineseMode === 'simplified' }" @click="store.updateConfig('chineseMode', 'simplified')">简体</button>
-          <button class="opt-btn" :class="{ active: config.chineseMode === 'traditional' }" @click="store.updateConfig('chineseMode', 'traditional')">繁体</button>
+      <!-- ── 页面 ── -->
+      <div class="group">
+        <div class="group-head">
+          <h3>页面</h3>
+          <span class="group-note">左右分页时生效</span>
+        </div>
+        <div class="group-card">
+          <div class="setting-row">
+            <label>页面宽度</label>
+            <div class="range-field">
+              <div class="range-track" :style="{ '--fill': pageWidthPercent + '%' }">
+                <input
+                  type="range"
+                  class="settings-slider"
+                  :min="READER_PAGE_WIDTH_MIN"
+                  :max="READER_PAGE_WIDTH_MAX"
+                  step="50"
+                  :value="config.pageWidth"
+                  @input="updateSlider('pageWidth', $event)"
+                >
+              </div>
+              <label class="range-value">
+                <input
+                  type="number"
+                  :min="READER_PAGE_WIDTH_MIN"
+                  :max="READER_PAGE_WIDTH_MAX"
+                  step="50"
+                  :value="config.pageWidth"
+                  @change="commitNumber('pageWidth', $event, READER_PAGE_WIDTH_MIN, READER_PAGE_WIDTH_MAX)"
+                >
+                <span>px</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <label>上下边距</label>
+            <div class="range-field">
+              <div class="range-track" :style="{ '--fill': pageVerticalPercent + '%' }">
+                <input
+                  type="range"
+                  class="settings-slider"
+                  min="0"
+                  :max="READER_PAGE_VERTICAL_PADDING_MAX"
+                  step="4"
+                  :value="config.pageVerticalPadding"
+                  @input="updateSlider('pageVerticalPadding', $event)"
+                >
+              </div>
+              <label class="range-value">
+                <input
+                  type="number"
+                  min="0"
+                  :max="READER_PAGE_VERTICAL_PADDING_MAX"
+                  step="4"
+                  :value="config.pageVerticalPadding"
+                  @change="commitNumber('pageVerticalPadding', $event, 0, READER_PAGE_VERTICAL_PADDING_MAX)"
+                >
+                <span>px</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <label>简繁转换</label>
+            <div class="segmented" role="group" aria-label="简繁转换">
+              <button
+                v-for="mode in chineseModes"
+                :key="mode.value"
+                :class="{ on: config.chineseMode === mode.value }"
+                @click="store.updateConfig('chineseMode', mode.value)"
+              >{{ mode.label }}</button>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <label>预加载</label>
+            <div class="switch-line">
+              <button
+                class="switch"
+                role="switch"
+                :aria-checked="config.enablePreload"
+                :class="{ on: config.enablePreload }"
+                @click="store.updateConfig('enablePreload', !config.enablePreload)"
+              ></button>
+              <span class="switch-note">提前取下一章</span>
+            </div>
+          </div>
         </div>
       </div>
 
-      <!-- 预加载 -->
-      <div class="setting-row">
-        <label>&#x9884;&#x52A0;&#x8F7D;</label>
-        <div class="btn-group">
-          <button class="opt-btn" :class="{ active: config.enablePreload }" @click="store.updateConfig('enablePreload', true)">&#x5F00;&#x542F;</button>
-          <button class="opt-btn" :class="{ active: !config.enablePreload }" @click="store.updateConfig('enablePreload', false)">&#x5173;&#x95ED;</button>
-        </div>
-      </div>
-      <!-- 字体大小 -->
-      <div class="setting-row slider-row">
-        <div class="slider-head">
-          <label>字体大小</label>
-          <span class="slider-value">{{ config.fontSize }}</span>
-        </div>
-        <input
-          type="range"
-          class="settings-slider"
-          :min="READER_FONT_SIZE_MIN"
-          :max="READER_FONT_SIZE_MAX"
-          step="1"
-          :value="config.fontSize"
-          @input="updateSlider('fontSize', $event)"
-        >
-      </div>
-
-      <!-- 字体粗细 -->
-      <div class="setting-row slider-row">
-        <div class="slider-head">
-          <label>字体粗细</label>
-          <span class="slider-value">{{ config.fontWeight }}</span>
-        </div>
-        <input
-          type="range"
-          class="settings-slider"
-          min="100"
-          max="900"
-          step="100"
-          :value="config.fontWeight"
-          @input="updateSlider('fontWeight', $event)"
-        >
-      </div>
-
-      <!-- 段落行高 -->
-      <div class="setting-row">
-        <label>段落行高</label>
-        <div class="stepper">
-          <button class="step-btn" @click="stepFloat('lineHeight', -0.1, 1.0, 3.0)">—</button>
-          <span class="step-val">{{ config.lineHeight.toFixed(1) }}</span>
-          <button class="step-btn" @click="stepFloat('lineHeight', 0.1, 1.0, 3.0)">+</button>
-        </div>
-      </div>
-
-      <!-- 段落间距 -->
-      <div class="setting-row">
-        <label>段落间距</label>
-        <div class="stepper">
-          <button class="step-btn" @click="stepFloat('paragraphSpacing', -0.1, 0, 2.0)">—</button>
-          <span class="step-val">{{ config.paragraphSpacing.toFixed(1) }}</span>
-          <button class="step-btn" @click="stepFloat('paragraphSpacing', 0.1, 0, 2.0)">+</button>
-        </div>
-      </div>
-
-      <div class="setting-row">
-        <label>首行缩进</label>
-        <div class="btn-group">
-          <button class="opt-btn" :class="{ active: config.firstLineIndent }" @click="store.updateConfig('firstLineIndent', true)">开启</button>
-          <button class="opt-btn" :class="{ active: !config.firstLineIndent }" @click="store.updateConfig('firstLineIndent', false)">关闭</button>
-        </div>
-      </div>
-
-      <!-- 页面宽度：左右分页时正文的行宽（窗口更宽时正文居中、两侧留白） -->
-      <div class="setting-row slider-row">
-        <div class="slider-head">
-          <label>页面宽度</label>
-          <span class="slider-value">{{ config.pageWidth }} px</span>
-        </div>
-        <input
-          type="range"
-          class="settings-slider"
-          :min="READER_PAGE_WIDTH_MIN"
-          :max="READER_PAGE_WIDTH_MAX"
-          step="50"
-          :value="config.pageWidth"
-          @input="updateSlider('pageWidth', $event)"
-        >
-      </div>
-
-      <!-- 左右分页时每页正文的上下留白 -->
-      <div class="setting-row slider-row">
-        <div class="slider-head">
-          <label>左右页上下边距</label>
-          <span class="slider-value">{{ config.pageVerticalPadding }} px</span>
-        </div>
-        <input
-          type="range"
-          class="settings-slider"
-          min="0"
-          :max="READER_PAGE_VERTICAL_PADDING_MAX"
-          step="4"
-          :value="config.pageVerticalPadding"
-          @input="updateSlider('pageVerticalPadding', $event)"
-        >
-      </div>
       </section>
 
       <section v-show="activeSettingsTab === 'paging'" class="settings-group">
+      <!-- ── 翻页方式 ── -->
+      <div class="group">
+        <div class="group-head"><h3>翻页方式</h3></div>
+        <div class="group-card">
+          <div class="setting-row">
+            <label>阅读模式</label>
+            <div class="segmented segmented--wrap" role="group" aria-label="翻页方式">
+              <button
+                v-for="mode in readMethods"
+                :key="mode.value"
+                :class="{ on: config.readMethod === mode.value }"
+                :title="mode.hint"
+                @click="store.updateConfig('readMethod', mode.value)"
+              >{{ mode.label }}</button>
+            </div>
+          </div>
 
-      <!-- 翻页方式 -->
-      <div class="setting-row">
-        <label>翻页方式</label>
-        <div class="btn-group">
-          <button class="opt-btn" :class="{ active: config.readMethod === '上下滑动' }" title="一次阅读一章内容，手动上下滚动" @click="store.updateConfig('readMethod', '上下滑动')">单章滚动</button>
-          <button class="opt-btn" :class="{ active: config.readMethod === '左右翻页' }" title="将一章内容分成多个页面，左右切换" @click="store.updateConfig('readMethod', '左右翻页')">左右分页</button>
-          <button class="opt-btn" :class="{ active: config.readMethod === '上下滚动' }" title="多章内容首尾相接，向下连续阅读" @click="store.updateConfig('readMethod', '上下滚动')">连续阅读</button>
-          <button class="opt-btn" :class="{ active: config.readMethod === '上下滚动2' }" title="连续阅读，并自动隐藏已经读过的章节" @click="store.updateConfig('readMethod', '上下滚动2')">隐藏已读</button>
+          <div class="setting-row">
+            <label>动画时长</label>
+            <div class="range-field">
+              <div class="range-track" :style="{ '--fill': animateDurationPercent + '%' }">
+                <input
+                  type="range"
+                  class="settings-slider"
+                  min="0"
+                  max="1000"
+                  step="50"
+                  :value="config.animateDuration"
+                  @input="updateSlider('animateDuration', $event)"
+                >
+              </div>
+              <span class="range-value range-value--text">
+                {{ config.animateDuration === 0 ? '关闭' : `${config.animateDuration} ms` }}
+              </span>
+            </div>
+          </div>
         </div>
       </div>
 
-      <!-- 动画时长 -->
-      <div class="setting-row slider-row">
-        <div class="slider-head">
-          <label>动画时长</label>
-          <span class="slider-value">{{ config.animateDuration === 0 ? '关闭' : `${config.animateDuration} ms` }}</span>
-        </div>
-        <input
-          type="range"
-          class="settings-slider"
-          min="0"
-          max="1000"
-          step="50"
-          :value="config.animateDuration"
-          @input="updateSlider('animateDuration', $event)"
-        >
-      </div>
+      <!-- ── 自动阅读 ── -->
+      <div class="group">
+        <div class="group-head"><h3>自动阅读</h3></div>
+        <div class="group-card">
+          <div class="setting-row">
+            <label>平滑滚动</label>
+            <div class="switch-line">
+              <button
+                class="switch"
+                role="switch"
+                :aria-checked="store.isAutoScrolling"
+                :class="{ on: store.isAutoScrolling }"
+                @click="store.isAutoScrolling = !store.isAutoScrolling"
+              ></button>
+              <span class="switch-note">{{ store.isAutoScrolling ? '滚动中，点此暂停' : '按设定速度向下滚动' }}</span>
+            </div>
+          </div>
 
-      <!-- 自动阅读 -->
-      <div class="setting-row">
-        <label>自动阅读</label>
-        <button
-          class="opt-btn wide"
-          :class="{ active: store.isAutoScrolling }"
-          @click="store.isAutoScrolling = !store.isAutoScrolling"
-        >
-          {{ store.isAutoScrolling ? '停止滚动' : '开启自动平滑滚动' }}
-        </button>
-      </div>
-
-      <!-- 滚动速度 -->
-      <div class="setting-row slider-row">
-        <div class="slider-head">
-          <label>滚动速度</label>
-          <span class="slider-value">{{ config.autoScrollSpeed }} px/秒</span>
-        </div>
-        <input
-          type="range"
-          class="settings-slider"
-          min="0"
-          max="100"
-          step="1"
-          :value="autoScrollSpeedSlider"
-          @input="updateAutoScrollSpeedSlider"
-        >
-      </div>
-
-      <!-- 点击翻页 (全屏热区) -->
-      <div class="setting-row">
-        <label>点击翻页</label>
-        <div class="btn-group">
-          <button class="opt-btn" :class="{ active: config.clickAction === 'auto' }" title="点击上方后退，点击下方前进，到章节边界时自动切换章节" @click="store.updateConfig('clickAction', 'auto')">自动翻页</button>
-          <button class="opt-btn" :class="{ active: config.clickAction === 'next' }" title="点击正文上方或下方，都只向后阅读" @click="store.updateConfig('clickAction', 'next')">仅下滚</button>
-          <button class="opt-btn" :class="{ active: config.clickAction === 'none' }" title="点击正文不执行翻页或滚动" @click="store.updateConfig('clickAction', 'none')">禁用</button>
+          <div class="setting-row">
+            <label>滚动速度</label>
+            <div class="range-field">
+              <div class="range-track" :style="{ '--fill': autoScrollSpeedSlider + '%' }">
+                <input
+                  type="range"
+                  class="settings-slider"
+                  min="0"
+                  max="100"
+                  step="1"
+                  :value="autoScrollSpeedSlider"
+                  @input="updateAutoScrollSpeedSlider"
+                >
+              </div>
+              <span class="range-value range-value--text">{{ config.autoScrollSpeed }} px/秒</span>
+            </div>
+          </div>
         </div>
       </div>
 
-      <!-- 选择文字 -->
-      <div class="setting-row">
-        <label>选择文字</label>
-        <div class="btn-group">
-          <button class="opt-btn" :class="{ active: config.selectAction === 'popup' }" @click="store.updateConfig('selectAction', 'popup')">操作弹窗</button>
-          <button class="opt-btn" :class="{ active: config.selectAction === 'ignore' }" @click="store.updateConfig('selectAction', 'ignore')">忽略</button>
+      <!-- ── 交互 ── -->
+      <div class="group">
+        <div class="group-head"><h3>交互</h3></div>
+        <div class="group-card">
+          <div class="setting-row">
+            <label>点击翻页</label>
+            <div class="segmented">
+              <button
+                :class="{ on: config.clickAction === 'auto' }"
+                title="点击上方后退，点击下方前进，到章节边界时自动切换章节"
+                @click="store.updateConfig('clickAction', 'auto')"
+              >自动</button>
+              <button
+                :class="{ on: config.clickAction === 'next' }"
+                title="点击正文上方或下方，都只向后阅读"
+                @click="store.updateConfig('clickAction', 'next')"
+              >仅下滚</button>
+              <button
+                :class="{ on: config.clickAction === 'none' }"
+                title="点击正文不执行翻页或滚动"
+                @click="store.updateConfig('clickAction', 'none')"
+              >禁用</button>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <label>选择文字</label>
+            <div class="segmented">
+              <button :class="{ on: config.selectAction === 'popup' }" @click="store.updateConfig('selectAction', 'popup')">弹窗操作</button>
+              <button :class="{ on: config.selectAction === 'ignore' }" @click="store.updateConfig('selectAction', 'ignore')">忽略</button>
+            </div>
+          </div>
         </div>
       </div>
       </section>
 
       <section v-show="activeSettingsTab === 'speech'" class="settings-group">
+
+      <!-- ── 朗读通道 ── -->
+      <div class="group">
+        <div class="group-head"><h3>朗读通道</h3></div>
+        <div class="group-card">
 
       <!-- 朗读引擎 -->
       <div class="setting-row">
@@ -499,6 +611,13 @@
       <p v-if="store.speechConfig.dualVoiceEnabled" class="setting-hint">
         对话指中文引号（“…” / 「…」 / 『…』）内的内容；引号未闭合时，其后一直按对话朗读。
       </p>
+        </div>
+      </div>
+
+      <!-- ── 音色与声音 ── -->
+      <div class="group">
+        <div class="group-head"><h3>音色与声音</h3></div>
+        <div class="group-card">
 
       <!-- 系统语音：整块包在 template 里，保证下面其它通道仍能与它组成
            v-if / v-else-if / v-else 链（中间插一个独立 v-if 会截断链，
@@ -1095,11 +1214,18 @@
         </div>
       </div>
 
+        </div>
+      </div>
+
+      <!-- ── 试听 ── -->
+      <div class="group">
+        <div class="group-head"><h3>试听</h3></div>
+        <div class="group-card speech-test-card">
+
       <!-- 语音测试：用当前通道 / 音色 / 参数试听一段可编辑文本。
            试听状态与书内朗读完全隔离（见 store.previewSpeech），绝不改 isSpeaking 等。 -->
       <div class="setting-block speech-test">
         <div class="setting-block-head">
-          <label>语音测试</label>
           <span class="block-tag">当前通道：{{ store.speechProviderLabel }}</span>
         </div>
         <textarea
@@ -1126,9 +1252,16 @@
           <span class="speech-test-note">试听会先停止书内朗读；用当前音色与参数合成。</span>
         </div>
       </div>
+      </div>
+      </div>
       </section>
 
       <section v-show="activeSettingsTab === 'more'" class="settings-group">
+
+      <!-- ── 鼠标与工具栏 ── -->
+      <div class="group">
+        <div class="group-head"><h3>鼠标与工具栏</h3></div>
+        <div class="group-card">
 
       <!-- 悬停呼出工具栏: 默认关闭。开启后鼠标移到阅读区边缘会自动弹出工具栏与悬浮钮,
            代价是边缘热区吃掉正文的点击(左右各 84px), 因此作为可选功能。 -->
@@ -1140,15 +1273,19 @@
         </div>
       </div>
 
-      <!-- 快捷键: 以「功能」为主轴, 一个功能可绑多个按键 -->
-      <div class="setting-block">
-        <div class="setting-block-head">
-          <label>快捷键</label>
+        </div>
+      </div>
+
+      <!-- ── 快捷键 ── -->
+      <div class="group">
+        <div class="group-head">
+          <h3>快捷键</h3>
           <div class="hotkey-head-actions">
             <span class="block-tag">{{ store.hotkeysAreDefault ? '默认方案' : '自定义' }}</span>
             <button class="link-btn" type="button" @click="store.resetHotkeyBindings()">恢复默认</button>
           </div>
         </div>
+        <div class="group-card hotkey-card">
         <div class="function-list">
           <div v-for="action in bindableActions" :key="action.id" class="function-item">
             <div class="function-name">
@@ -1196,7 +1333,14 @@
             在{{ notice.mode }}模式下只会执行「{{ notice.winner }}」，「{{ notice.ignored }}」不会触发
           </div>
         </div>
+
+        </div>
       </div>
+
+      <!-- ── 数据与内容 ── -->
+      <div class="group">
+        <div class="group-head"><h3>数据与内容</h3></div>
+        <div class="group-card">
 
       <!-- 更多操作 -->
       <div class="setting-row">
@@ -1207,6 +1351,8 @@
       <div class="setting-row">
         <label>内容净化</label>
         <button class="opt-btn wide" @click="store.openPanel('rule', 'settings')">管理净化规则</button>
+      </div>
+      </div>
       </div>
       </section>
     </div>
@@ -1337,8 +1483,73 @@ async function removeActiveCustomFont() {
 }
 const config = computed(() => store.config)
 const theme = computed(() => store.chromeTheme)
+/** 主题与外观区块用的配色: 与阅读页正文完全同源(自定义配色优先于主题预设)。 */
+const readerTheme = computed(() => store.readerTheme)
 const isDarkSettings = computed(() => store.isNight || theme.value.name === '暗灰')
 const selectedSpeechApiFormat = computed(() => getSpeechApiFormatOption(store.speechConfig.apiFormat))
+
+/* ─── 滑块的已填充比例 ───
+ * 原生 range 只能画一条灰轨道; 用 CSS 变量把"已选中的一段"涂成主色,
+ * 用户一眼就能看出当前值在区间里的位置。 */
+function rangePercent(value: number, min: number, max: number) {
+  if (!Number.isFinite(value) || max <= min) return 0
+  return Math.max(0, Math.min(100, ((value - min) / (max - min)) * 100))
+}
+
+const fontSizePercent = computed(() => rangePercent(config.value.fontSize, READER_FONT_SIZE_MIN, READER_FONT_SIZE_MAX))
+const fontWeightPercent = computed(() => rangePercent(config.value.fontWeight, 100, 900))
+const pageWidthPercent = computed(() => rangePercent(config.value.pageWidth, READER_PAGE_WIDTH_MIN, READER_PAGE_WIDTH_MAX))
+const pageVerticalPercent = computed(() => rangePercent(config.value.pageVerticalPadding, 0, READER_PAGE_VERTICAL_PADDING_MAX))
+const animateDurationPercent = computed(() => rangePercent(config.value.animateDuration, 0, 1000))
+const readerImageOpacityPercent = computed(() => readerOpacityToPercent(config.value.readerImageOpacity))
+/** 面板不透明度的有效下限（百分比整数），滑块的 min 就是它。 */
+const panelOpacityFloorPercent = computed(() => Math.round(READER_PANEL_OPACITY_MIN * 100))
+
+/** 滑块区间是 [下限, 100]，填充也按这个区间归一：
+ *  最左端填充为 0，最右端填满。用 0-100 归一的话，最低档会显示成"填了一半"。 */
+const panelOpacityPercent = computed(() => rangePercent(
+  readerOpacityToPercent(config.value.panelOpacity),
+  panelOpacityFloorPercent.value,
+  100,
+))
+
+/** 拖动面板不透明度：滑块给的是区间内的百分比整数，换算回 0-1 存储。 */
+function updatePanelOpacityPercent(raw: string) {
+  const percent = Number(raw)
+  if (!Number.isFinite(percent)) return
+  store.updateConfig('panelOpacity', normalizeReaderPanelOpacity(percent / 100))
+}
+
+/** 数字框直接输入: 越界夹到区间内, 非数字回退原值。 */
+function commitNumber(
+  key: 'fontSize' | 'pageWidth' | 'pageVerticalPadding',
+  event: Event,
+  min: number,
+  max: number,
+) {
+  const input = event.target as HTMLInputElement
+  const raw = Number(input.value)
+  if (!Number.isFinite(raw)) {
+    input.value = String(config.value[key])
+    return
+  }
+  const next = Math.max(min, Math.min(max, Math.round(raw)))
+  store.updateConfig(key, next)
+  input.value = String(next)
+}
+
+const chineseModes = [
+  { value: 'off', label: '关闭' },
+  { value: 'simplified', label: '简体' },
+  { value: 'traditional', label: '繁体' },
+] as const
+
+const readMethods = [
+  { value: '上下滑动', label: '单章滚动', hint: '一次阅读一章内容，手动上下滚动' },
+  { value: '左右翻页', label: '左右分页', hint: '将一章内容分成多个页面，左右切换' },
+  { value: '上下滚动', label: '连续阅读', hint: '多章内容首尾相接，向下连续阅读' },
+  { value: '上下滚动2', label: '隐藏已读', hint: '连续阅读，并自动隐藏已经读过的章节' },
+] as const
 
 /* ─── 阅读页背景图 ─── */
 const readerImageInputRef = ref<HTMLInputElement | null>(null)
@@ -1965,72 +2176,87 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+/* ══════════════════════════════════════════════════════════════
+ * 阅读设置面板
+ *
+ * 结构：分组标题 → 一张卡（group-card）→ 若干「标签 + 控件」行。
+ * 只保留一层容器，靠底色与 1px 描边区分层次；不再给每个控件加外框，
+ * 于是 20 个设置项不会变成 20 个互相竞争的胶囊。
+ *
+ * 颜色一律从 --settings-font（阅读主题文字色）用 color-mix 派生：
+ * 本面板跟随 9 套阅读主题，写死 rgba(0,0,0,x) 在暗色主题下会消失。
+ * 主色只用于「当前值」：选中的芯片、滑块已填充段、开关。
+ * ══════════════════════════════════════════════════════════════ */
 .read-settings {
-  --settings-field-bg: rgba(255, 255, 255, 0.58);
-  --settings-field-bg-hover: rgba(255, 255, 255, 0.78);
-  --settings-field-border: rgba(55, 42, 31, 0.14);
-  --settings-field-placeholder: rgba(55, 42, 31, 0.46);
+  --settings-field-bg: color-mix(in srgb, var(--settings-font, currentColor) 5%, transparent);
+  --settings-field-bg-hover: color-mix(in srgb, var(--settings-font, currentColor) 9%, transparent);
+  --settings-field-border: color-mix(in srgb, var(--settings-font, currentColor) 13%, transparent);
+  --settings-field-placeholder: color-mix(in srgb, var(--settings-font, currentColor) 42%, transparent);
+  --sk-line: color-mix(in srgb, var(--settings-font, currentColor) 9%, transparent);
+  --sk-line-strong: color-mix(in srgb, var(--settings-font, currentColor) 20%, transparent);
+  --sk-card-bg: color-mix(in srgb, var(--settings-font, currentColor) 3.2%, transparent);
+  --sk-card-border: color-mix(in srgb, var(--settings-font, currentColor) 7%, transparent);
+  --sk-muted: color-mix(in srgb, var(--settings-font, currentColor) 46%, transparent);
+  --sk-label: color-mix(in srgb, var(--settings-font, currentColor) 70%, transparent);
+  /* 抬升面（选中页签/选中分段/滑块 thumb）：必须在浅色与暗色主题下都比
+   * 面板底色更「亮」或更「实」，否则选中项会像凹进去的洞。 */
+  --sk-raised: color-mix(in srgb, #fff 26%, var(--settings-popup, #fff));
+  /* 滑块圆点/开关滑块：始终是浅色实体，暗色主题下也不能变成深色圆点。 */
+  --sk-thumb: color-mix(in srgb, #fff 88%, var(--settings-popup, #fff));
+  --sk-accent: var(--color-primary, #c97f3a);
+  --sk-accent-fill: color-mix(in srgb, var(--sk-accent) 13%, transparent);
+  --sk-accent-line: color-mix(in srgb, var(--sk-accent) 46%, transparent);
+  --sk-radius: 14px;
+  --sk-radius-ctl: 9px;
+
   width: 100%;
   height: 100%;
   /* 必须 border-box: width:100% + padding 若按 content-box 计算, 面板会比
-   * 抽屉宽出两倍 padding(原先 48px), 右侧内容(滑块数值等)被挤出可视区。 */
+   * 抽屉宽出两倍 padding, 右侧内容(滑块数值等)被挤出可视区。 */
   box-sizing: border-box;
   overflow-y: auto;
-  padding: 24px;
+  padding: 22px 24px 32px;
   transition: background 0.3s, color 0.3s;
   -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
-.read-settings.is-dark {
-  --settings-field-bg: rgba(255, 255, 255, 0.055);
-  --settings-field-bg-hover: rgba(255, 255, 255, 0.085);
-  --settings-field-border: rgba(255, 255, 255, 0.15);
-  --settings-field-placeholder: rgba(255, 255, 255, 0.38);
-}
-
+/* ─── 顶栏 ─── */
 .settings-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
+  gap: 12px;
+  margin-bottom: 14px;
 }
 
 .settings-title {
-  font-size: 20px;
-  font-weight: 700;
-}
-
-.settings-sep {
-  height: 1px;
-  background: currentColor;
-  opacity: 0.08;
-  margin: 16px 0;
-  width: 60px;
-}
-
-.settings-sep:first-of-type {
-  background: var(--color-primary, #c97f3a);
-  opacity: 1;
-  height: 3px;
-  border-radius: 2px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 .reset-btn {
-  padding: 6px 16px;
-  border-radius: 20px;
-  /* 描边保留主色以示"重置"语义, 文字改跟随阅读主题: 主色文字压在阅读主题的
-   * 浅色底上只有 2.6~2.8:1, 不达标。 */
-  border: 1px solid color-mix(in srgb, var(--color-primary) 34%, transparent);
-  color: var(--settings-font, currentColor);
-  font-size: 13px;
-  font-weight: 500;
-  transition: all 0.2s;
+  flex: 0 0 auto;
+  padding: 7px 12px;
+  border-radius: var(--sk-radius-ctl);
+  border: 1px solid var(--settings-field-border);
   background: transparent;
+  color: var(--sk-label);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  transition: color 0.16s, border-color 0.16s, background 0.16s;
 }
 
 .reset-btn:hover {
-  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
-  border-color: var(--color-primary);
+  color: var(--settings-font, currentColor);
+  border-color: var(--sk-line-strong);
+  background: var(--settings-field-bg);
+}
+
+.reset-btn:active {
+  transform: scale(0.98);
 }
 
 .settings-body {
@@ -2038,74 +2264,105 @@ onMounted(async () => {
   flex-direction: column;
 }
 
+/* ─── 页签：内凹槽 + 白色滑块，比一排描边胶囊更像导航 ─── */
 .reader-settings-tabs {
   position: sticky;
-  top: -24px;
-  z-index: 2;
+  top: -22px;
+  z-index: 3;
   display: grid;
   /* 列数跟随页签数量, 加/减页签时不会被压扁。 */
   grid-template-columns: repeat(auto-fit, minmax(0, 1fr));
-  gap: 3px;
-  margin-bottom: 20px;
+  gap: 2px;
+  margin: 0 -2px 18px;
   padding: 3px;
-  border-radius: 14px;
-  background: color-mix(in srgb, var(--settings-popup) 90%, transparent);
-  backdrop-filter: blur(12px);
+  border-radius: 12px;
+  background: var(--settings-field-bg);
+  /* sticky 时需要盖住滚上来的内容，给一层与面板同色的底 */
+  box-shadow: 0 0 0 6px var(--settings-popup, transparent);
 }
 
 .reader-settings-tabs button {
-  min-height: 38px;
-  border-radius: 11px;
-  color: inherit;
+  min-height: 32px;
+  /* 显式清掉 UA 边框与底色: 组件也可能在没有全局 reset 的环境里渲染。 */
+  border: 0;
+  background: transparent;
+  border-radius: var(--sk-radius-ctl);
+  color: var(--sk-label);
   font-size: 13px;
-  font-weight: 600;
-  opacity: 0.62;
-  transition: background 0.18s, opacity 0.18s, box-shadow 0.18s, transform 0.18s;
+  font-weight: 500;
+  transition: background 0.16s, color 0.16s, box-shadow 0.16s;
 }
 
 .reader-settings-tabs button:hover:not(.active) {
-  background: color-mix(in srgb, var(--settings-font) 7%, transparent);
-  opacity: 0.82;
+  color: var(--settings-font, currentColor);
+  background: var(--settings-field-bg-hover);
 }
 
 .reader-settings-tabs button:active {
-  transform: scale(0.98);
+  transform: scale(0.985);
 }
 
 .reader-settings-tabs button.active {
-  background: var(--settings-field-bg-hover);
-  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.12);
-  opacity: 1;
+  background: var(--sk-raised);
+  color: var(--settings-font, currentColor);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(20, 25, 30, 0.18);
 }
 
 .settings-group {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 22px;
 }
 
-.shortcut-hint {
-  margin-top: -8px;
+/* ─── 分组 ─── */
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-/* ─── 行布局：所有「标签 + 控件」行共用同一套栅格 ───
- *
- * 两套布局并存是「没对齐」的根源：普通行是 flex（label min-width 70px）、
- * 滑块行是 grid（label 96px、右对齐、滑块固定 240px）。于是同一屏里标签右缘、
- * 控件左缘都各走各的。
- *
- * 现在统一成一条栅格：`104px` 标签列 + 剩余宽度控件列，标签**左对齐**。
- * 选左对齐而不是右对齐，是因为面板里还有 `.setting-block-head` 的块标题
- *（「阅读配色」「阅读页背景图」）——那些天然是左对齐的块级文字。只有让行标签
- * 也左对齐，整块面板才会只剩**一条**文本竖线，视觉上才是齐的。
- * 104px 是「左右页上下边距」（7 个汉字，14px 字号）不换行的最小宽度。
- */
+.group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 3px;
+}
+
+.group-head h3 {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--sk-muted);
+}
+
+.group-note {
+  font-size: 11px;
+  color: var(--sk-muted);
+  letter-spacing: 0.02em;
+}
+
+.group-card {
+  padding: 3px 14px;
+  border-radius: var(--sk-radius);
+  background: var(--sk-card-bg);
+  border: 1px solid var(--sk-card-border);
+}
+
+/* ─── 行：96px 标签列 + 控件列，全面板只有一条文本竖线 ─── */
 .setting-row {
   display: grid;
-  grid-template-columns: 104px minmax(0, 1fr);
+  grid-template-columns: 96px minmax(0, 1fr);
   align-items: center;
   column-gap: 14px;
-  row-gap: 4px;
+  row-gap: 8px;
+  min-height: 46px;
+  padding: 6px 0;
+}
+
+.setting-row + .setting-row {
+  border-top: 1px solid var(--sk-line);
 }
 
 .setting-row-top {
@@ -2116,175 +2373,365 @@ onMounted(async () => {
 .setting-row .slider-head > label {
   grid-column: 1;
   min-width: 0;
-  font-size: 14px;
-  font-weight: 500;
-  opacity: 0.7;
-  text-align: left;
-  line-height: 1.5;
-  /* 极长标签允许换行，但不要在任何位置硬断（中文标签不该被拆成两行）。 */
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--sk-label);
+  line-height: 1.45;
   overflow-wrap: break-word;
 }
 
-/* 控件列：从第 2 列开始铺到行尾。 */
 .setting-row > .btn-group,
 .setting-row > .stepper,
 .setting-row > .font-picker,
 .setting-row > .voice-select,
 .setting-row > .opt-btn.wide,
-.setting-row > .image-picker-row,
+.setting-row > .image-picker,
 .setting-row > .inline-slider,
-.setting-row > .theme-swatches {
+.setting-row > .swatch-row,
+.setting-row > .color-grid,
+.setting-row > .segmented,
+.setting-row > .range-field,
+.setting-row > .switch-line {
   grid-column: 2 / -1;
   min-width: 0;
   justify-self: start;
 }
 
-/* 按钮组/步进器/色板按内容宽度排列，不要被拉伸成整行。 */
-.setting-row > .btn-group,
-.setting-row > .stepper,
-.setting-row > .theme-swatches {
-  justify-self: start;
-}
-
-/* 整行宽按钮（缓存/净化入口）才铺满控件列。 */
-.setting-row > .opt-btn.wide {
+.setting-row > .voice-select,
+.setting-row > .opt-btn.wide,
+.setting-row > .range-field,
+.setting-row > .image-picker {
   justify-self: stretch;
 }
 
-/* 下拉框铺满控件列，但绝不超出。 */
-.setting-row > .voice-select {
-  justify-self: stretch;
-}
-
-/* ─── 阅读配色 / 背景图 ─── */
-/* 整行块: label 独占一行, 内容不再被挤在固定宽度的右侧列里。 */
-.setting-block {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-/* 旁白/对话两个独立分区：带边框与浅底，避免两行音色挤在一起。 */
-.voice-partition {
-  padding: 12px 14px;
-  border: 1px solid color-mix(in srgb, var(--settings-font, currentColor) 14%, transparent);
-  border-radius: 14px;
-  background: color-mix(in srgb, var(--settings-font, currentColor) 3.5%, transparent);
-}
-
-.voice-partition .setting-block-head label {
-  font-weight: 600;
-  opacity: 0.82;
-}
-
-.setting-block-head {
+/* ─── 滑块行：轨道 + 已填充段 + 右侧数值 ─── */
+.range-field {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
+  min-width: 0;
 }
 
-.setting-block-head label {
-  font-size: 14px;
-  font-weight: 500;
-  opacity: 0.7;
+.range-track {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 20px;
+  display: flex;
+  align-items: center;
 }
 
-/* ─── 语音测试 ─── */
-.speech-test-input {
+/* 轨道用 background 画：左段主色、右段中性。原生 range 的 track 保持透明，
+ * 这样已填充段在任何阅读主题下都与主色一致。 */
+.range-track::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 4px;
+  border-radius: 999px;
+  background:
+    linear-gradient(to right,
+      var(--sk-accent) 0 var(--fill, 0%),
+      color-mix(in srgb, var(--settings-font, currentColor) 17%, transparent) var(--fill, 0%) 100%);
+  pointer-events: none;
+}
+
+.range-track .settings-slider {
+  position: relative;
+  z-index: 1;
   width: 100%;
-  box-sizing: border-box;
-  min-height: 56px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  border: 1px solid var(--settings-field-border);
-  background: var(--settings-field-bg);
-  color: inherit;
+  height: 20px;
+}
+
+.range-value {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  flex: 0 0 auto;
+  min-width: 62px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--sk-label);
+}
+
+.range-value input {
+  width: 40px;
+  padding: 4px 3px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--settings-font, currentColor);
   font: inherit;
-  line-height: 1.6;
-  resize: vertical;
+  text-align: right;
+  -moz-appearance: textfield;
+  appearance: textfield;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.range-value input:hover {
+  background: var(--settings-field-bg);
+}
+
+.range-value input:focus {
   outline: none;
-  transition: background 0.18s, border-color 0.18s, box-shadow 0.18s;
-}
-
-.speech-test-input:focus {
+  border-color: var(--sk-accent-line);
   background: var(--settings-field-bg-hover);
-  border-color: var(--color-primary, #c97f3a);
-  box-shadow: 0 0 0 3px rgba(201, 127, 58, 0.16);
 }
 
-.speech-test-input::placeholder {
-  color: var(--settings-field-placeholder);
+.range-value input::-webkit-outer-spin-button,
+.range-value input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
-.speech-test-actions {
+.range-value span {
+  font-size: 11px;
+  color: var(--sk-muted);
+}
+
+.range-value--text {
+  min-width: 76px;
+  white-space: nowrap;
+}
+
+/* ─── 分段控件（简繁 / 翻页方式 / 点击行为） ─── */
+.segmented {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--sk-radius-ctl);
+  background: var(--settings-field-bg);
+  max-width: 100%;
+}
+
+.segmented--wrap {
+  flex-wrap: wrap;
+}
+
+.segmented button {
+  min-height: 28px;
+  padding: 0 14px;
+  border: 0;
+  background: transparent;
+  border-radius: 7px;
+  color: var(--sk-label);
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+}
+
+.segmented button:hover:not(.on) {
+  color: var(--settings-font, currentColor);
+  background: var(--settings-field-bg-hover);
+}
+
+.segmented button.on {
+  background: var(--sk-raised);
+  color: var(--settings-font, currentColor);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(20, 25, 30, 0.18);
+}
+
+.segmented button:active {
+  transform: scale(0.985);
+}
+
+/* ─── 开关 ─── */
+.switch-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 26px;
+}
+
+.switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--settings-font, currentColor) 18%, transparent);
+  transition: background 0.18s;
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--sk-thumb);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.32);
+  transition: transform 0.18s;
+}
+
+.switch.on {
+  background: var(--sk-accent);
+}
+
+.switch.on::after {
+  transform: translateX(16px);
+}
+
+.switch:hover {
+  background: color-mix(in srgb, var(--settings-font, currentColor) 26%, transparent);
+}
+
+.switch.on:hover {
+  background: color-mix(in srgb, var(--sk-accent) 86%, var(--settings-font, currentColor));
+}
+
+.switch-note {
+  font-size: 12px;
+  color: var(--sk-muted);
+  line-height: 1.45;
+}
+
+/* ─── 字体 ─── */
+.font-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.font-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.font-chip {
+  min-height: 32px;
+  padding: 4px 13px;
+  border-radius: var(--sk-radius-ctl);
+  border: 1px solid var(--settings-field-border);
+  background: transparent;
+  color: var(--sk-label);
+  font-size: 13px;
+  line-height: 1.3;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+
+.font-chip:hover {
+  border-color: var(--sk-line-strong);
+  color: var(--settings-font, currentColor);
+}
+
+.font-chip.active {
+  background: var(--sk-accent-fill);
+  border-color: var(--sk-accent-line);
+  color: var(--settings-font, currentColor);
+  font-weight: 600;
+}
+
+.font-chip:active {
+  transform: scale(0.985);
+}
+
+.font-actions {
   display: flex;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
 }
 
-.speech-test-note {
-  font-size: 12px;
-  line-height: 1.5;
-  opacity: 0.6;
+.custom-font-btn {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.link-btn {
-  padding: 2px 8px;
-  border: none;
-  background: transparent;
-  color: var(--color-primary, #c97f3a);
-  font-size: 12px;
-  cursor: pointer;
-  border-radius: 6px;
+/* ─── 主题色板 ─── */
+.swatch-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  padding: 3px 0;
 }
 
-.link-btn:hover {
-  background: color-mix(in srgb, var(--color-primary, #c97f3a) 12%, transparent);
+.swatch {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  padding: 0;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+  transition: transform 0.16s;
 }
 
-.link-btn.danger {
-  color: #c43f3a;
+.swatch::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border-radius: 50%;
+  border: 1.5px solid transparent;
+  transition: border-color 0.16s;
 }
 
-.link-btn.danger:hover {
-  background: color-mix(in srgb, #d14b45 12%, transparent);
+.swatch:hover {
+  transform: scale(1.08);
 }
 
+.swatch.active::after {
+  border-color: var(--sk-accent);
+}
+
+.swatch svg {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 14px;
+  height: 14px;
+  color: #fff;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.4));
+}
+
+/* ─── 阅读配色 ─── */
 .color-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 10px;
+  gap: 8px;
+  width: 100%;
 }
 
 .color-card {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
-  border-radius: 12px;
-  border: 1px solid rgba(0, 0, 0, 0.1);
+  padding: 6px 9px;
+  border-radius: var(--sk-radius-ctl);
+  border: 1px solid var(--settings-field-border);
+  background: color-mix(in srgb, var(--settings-popup, #fff) 55%, transparent);
   min-width: 0;
+  transition: border-color 0.16s;
 }
 
 .color-card.customized {
-  border-color: var(--color-primary, #c97f3a);
+  border-color: var(--sk-accent-line);
 }
 
 .color-card-label {
-  font-size: 13px;
-  opacity: 0.7;
+  font-size: 12px;
+  color: var(--sk-label);
   flex-shrink: 0;
 }
 
 /* 色块本身是 label, 点击即打开系统取色器; 原生 color input 藏在其中。 */
 .color-swatch {
   position: relative;
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  border: 1px solid rgba(0, 0, 0, 0.18);
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.16);
   cursor: pointer;
   flex-shrink: 0;
   overflow: hidden;
@@ -2302,8 +2749,8 @@ onMounted(async () => {
 }
 
 .color-card-value {
-  font-size: 12px;
-  opacity: 0.65;
+  font-size: 11.5px;
+  color: var(--sk-muted);
   font-variant-numeric: tabular-nums;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2312,13 +2759,18 @@ onMounted(async () => {
   min-width: 0;
 }
 
+.color-reset {
+  justify-self: start;
+  margin-top: 2px;
+}
+
 .icon-btn {
   width: 20px;
   height: 20px;
   border-radius: 50%;
   border: none;
-  background: rgba(0, 0, 0, 0.06);
-  color: inherit;
+  background: var(--settings-field-bg);
+  color: var(--sk-label);
   font-size: 13px;
   line-height: 1;
   cursor: pointer;
@@ -2326,28 +2778,35 @@ onMounted(async () => {
 }
 
 .icon-btn:hover {
-  background: rgba(0, 0, 0, 0.12);
+  background: var(--settings-field-bg-hover);
+  color: var(--settings-font, currentColor);
 }
 
-.image-picker-row {
+/* ─── 背景图 ─── */
+.image-picker {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
 }
 
 .image-thumb {
-  width: 84px;
-  height: 56px;
-  border-radius: 10px;
-  border: 1px dashed rgba(0, 0, 0, 0.2);
+  width: 76px;
+  height: 50px;
+  border-radius: var(--sk-radius-ctl);
+  border: 1px dashed var(--sk-line-strong);
   background-color: transparent;
   background-size: cover;
   background-position: center;
-  color: inherit;
+  color: var(--sk-muted);
   font-size: 11px;
-  opacity: 0.85;
-  cursor: pointer;
   flex-shrink: 0;
+  transition: border-color 0.16s, color 0.16s;
+}
+
+.image-thumb:hover {
+  border-color: var(--sk-accent-line);
+  color: var(--sk-label);
 }
 
 .image-thumb.empty {
@@ -2363,24 +2822,34 @@ onMounted(async () => {
   min-width: 0;
 }
 
+.image-picker-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .image-picker-note {
   font-size: 11px;
-  opacity: 0.55;
+  color: var(--sk-muted);
+  line-height: 1.45;
 }
 
 .hidden-input {
   display: none;
 }
 
+/* ─── 内联滑块（朗读/背景图旧结构，保留兼容） ─── */
 .inline-slider {
   display: flex;
   align-items: center;
   gap: 10px;
   font-size: 13px;
+  min-width: 0;
 }
 
 .inline-slider label {
-  opacity: 0.7;
+  color: var(--sk-label);
   flex-shrink: 0;
 }
 
@@ -2390,7 +2859,7 @@ onMounted(async () => {
 }
 
 /* 注意选择器要带上 .inline-slider: 上面那条 `.inline-slider label` 是 (0,1,1),
- * 单写 `.opacity-input-wrap` 只有 (0,1,0), 会被它的 opacity: 0.7 压回去。 */
+ * 单写 `.opacity-input-wrap` 只有 (0,1,0), 会被它的颜色压回去。 */
 .inline-slider .opacity-input-wrap {
   display: inline-flex;
   align-items: center;
@@ -2401,19 +2870,17 @@ onMounted(async () => {
   /* 透明边框占位: 悬停/聚焦只换颜色, 不会冒出 1px 的布局抖动。 */
   border: 1px solid transparent;
   cursor: text;
-  /* 覆盖 .inline-slider label 的 0.7 —— 那是对说明文字的弱化; 输入控件保持正常
-   * 对比度, 否则数字看上去像禁用态。 */
-  opacity: 1;
+  color: var(--settings-font, currentColor);
   transition: background 0.16s ease, border-color 0.16s ease;
 }
 
 .inline-slider .opacity-input-wrap:hover {
-  background: color-mix(in srgb, var(--settings-font, currentColor) 6%, transparent);
+  background: var(--settings-field-bg);
 }
 
 .inline-slider .opacity-input-wrap:focus-within {
-  background: color-mix(in srgb, var(--settings-font, currentColor) 10%, transparent);
-  border-color: color-mix(in srgb, var(--settings-font, currentColor) 24%, transparent);
+  background: var(--settings-field-bg-hover);
+  border-color: var(--sk-line-strong);
 }
 
 .opacity-input {
@@ -2427,14 +2894,12 @@ onMounted(async () => {
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   text-align: right;
-  opacity: 0.85;
   -moz-appearance: textfield;
   appearance: textfield;
 }
 
 .opacity-input:focus {
   outline: none;
-  opacity: 1;
 }
 
 /* number 输入的上下箭头在这么小的框里只会挤掉数字本身。 */
@@ -2446,20 +2911,411 @@ onMounted(async () => {
 
 .opacity-unit {
   font-size: 12px;
-  opacity: 0.6;
+  color: var(--sk-muted);
 }
 
-/* ─── 快捷键: 以功能为主轴 ───
- * 这个面板跟随**阅读主题**(不是应用主题), 所以颜色一律走本组件的 --settings-*
- * 令牌与 --settings-font 的 color-mix。早先这里写死了 rgba(0,0,0,.05) 这类
- * 绝对黑与兜底橙 #c97f3a: 在暗色阅读主题下, 绝对黑的分隔线/label 几乎不可见,
- * 而兜底橙又与面板主色对不上, 整块区域像是从别处搬来的。 */
+/* ─── 整行块（旁白/对话、快捷键、语音测试） ─── */
+.setting-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 6px 0;
+}
+
+.setting-block + .setting-block,
+.setting-row + .setting-block,
+.setting-block + .setting-row {
+  border-top: 1px solid var(--sk-line);
+}
+
+/* 旁白/对话两个独立分区：带边框与浅底，避免两行音色挤在一起。 */
+.voice-partition {
+  padding: 12px 14px;
+  border: 1px solid var(--sk-card-border);
+  border-radius: var(--sk-radius);
+  background: var(--sk-card-bg);
+}
+
+.voice-partition .setting-block-head label {
+  font-weight: 600;
+  color: var(--settings-font, currentColor);
+}
+
+.setting-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.setting-block-head label {
+  font-size: 13px;
+  color: var(--sk-label);
+}
+
+/* ─── 朗读页签的旧滑块行：列宽自适应，不再固定 240px 溢出 ─── */
+.slider-row {
+  display: grid;
+  grid-template-columns: 96px minmax(120px, 1fr) auto auto;
+  align-items: center;
+  column-gap: 10px;
+  row-gap: 4px;
+}
+
+.slider-head {
+  display: contents;
+}
+
+.slider-row .slider-head > label {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.slider-row > .settings-slider {
+  grid-column: 2;
+  grid-row: 1;
+  width: 100%;
+}
+
+.slider-row .slider-head > .slider-value {
+  grid-column: 3;
+  grid-row: 1;
+  /* 定宽 + 右对齐：数值位数变化时滑块不会左右抖动。 */
+  min-width: 54px;
+  text-align: right;
+  justify-self: end;
+  white-space: nowrap;
+}
+
+.slider-row .slider-head > .link-btn {
+  grid-column: 4;
+  grid-row: 1;
+  justify-self: end;
+}
+
+.slider-value {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--sk-label);
+}
+
+/* ─── 原生 range：轨道透明，由容器画，thumb 统一成白芯 + 主色环 ─── */
+.settings-slider {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 20px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.settings-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  /* 独立使用时（朗读页签）退化为中性轨道 */
+  background: color-mix(in srgb, var(--settings-font, currentColor) 17%, transparent);
+}
+
+.range-track .settings-slider::-webkit-slider-runnable-track {
+  background: transparent;
+}
+
+.settings-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  margin-top: -5.5px;
+  border-radius: 50%;
+  border: 1.5px solid var(--sk-accent);
+  background: var(--sk-thumb);
+  box-shadow: 0 1px 4px rgba(20, 25, 30, 0.26);
+  transition: transform 0.12s;
+}
+
+.settings-slider:active::-webkit-slider-thumb {
+  transform: scale(1.12);
+}
+
+.settings-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--settings-font, currentColor) 17%, transparent);
+}
+
+.range-track .settings-slider::-moz-range-track {
+  background: transparent;
+}
+
+.settings-slider::-moz-range-thumb {
+  width: 15px;
+  height: 15px;
+  border: 1.5px solid var(--sk-accent);
+  border-radius: 50%;
+  background: var(--sk-thumb);
+  box-shadow: 0 1px 4px rgba(20, 25, 30, 0.26);
+}
+
+.settings-slider:focus-visible {
+  outline: 2px solid var(--sk-accent);
+  outline-offset: 4px;
+  border-radius: 999px;
+}
+
+/* ─── 步进器 ─── */
+.stepper {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  border-radius: var(--sk-radius-ctl);
+  border: 1px solid var(--settings-field-border);
+  background: color-mix(in srgb, var(--settings-popup, #fff) 55%, transparent);
+  overflow: hidden;
+  width: fit-content;
+}
+
+.step-btn {
+  width: 30px;
+  height: 100%;
+  border: none;
+  background: transparent;
+  color: var(--sk-label);
+  font-size: 13px;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s;
+}
+
+.step-btn:hover {
+  background: var(--settings-field-bg-hover);
+  color: var(--settings-font, currentColor);
+}
+
+.step-btn:active {
+  background: var(--settings-field-bg);
+}
+
+.step-val {
+  min-width: 44px;
+  text-align: center;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--settings-font, currentColor);
+  border-left: 1px solid var(--sk-line);
+  border-right: 1px solid var(--sk-line);
+  line-height: 28px;
+}
+
+/* ─── 文字按钮 ─── */
+.link-btn {
+  padding: 3px 6px;
+  border: none;
+  background: transparent;
+  color: var(--sk-accent);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+
+.link-btn:hover:not(:disabled) {
+  background: var(--sk-accent-fill);
+}
+
+/* 「实色」常驻按钮：不显示时用 visibility 占位，宽度不变。
+ * 用 v-if 摘掉它会让滑块跟着变宽/变窄 —— 拖动跨过 100% 时轨道宽度跳变，
+ * 观感就是"进度条长短在闪"。 */
+.link-btn.reset-solid {
+  /* 两字 + 左右 padding，与出现时完全同宽 */
+  min-width: 36px;
+  text-align: center;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+.link-btn.reset-solid:disabled {
+  visibility: hidden;
+  cursor: default;
+}
+
+.link-btn.danger {
+  color: #c43f3a;
+}
+
+.link-btn.danger:hover {
+  background: color-mix(in srgb, #d14b45 12%, transparent);
+}
+
+/* ─── 胶囊按钮（朗读页签仍在使用） ─── */
+.btn-group {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.opt-btn {
+  min-height: 32px;
+  padding: 5px 14px;
+  border-radius: var(--sk-radius-ctl);
+  font-size: 12.5px;
+  font-weight: 500;
+  border: 1px solid var(--settings-field-border);
+  background: transparent;
+  color: var(--sk-label);
+  cursor: pointer;
+  transition: background 0.16s, color 0.16s, border-color 0.16s;
+  white-space: nowrap;
+}
+
+.opt-btn:hover:not(:disabled) {
+  border-color: var(--sk-line-strong);
+  color: var(--settings-font, currentColor);
+}
+
+.opt-btn:active:not(:disabled) {
+  transform: scale(0.985);
+}
+
+.opt-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+/* 选中态：淡主色底 + 主色描边，文字仍用阅读主题文字色。
+ * 主色 #c97f3a 与浅色主题底亮度接近（默认主题约 2.4:1），主色文字不达标。 */
+.opt-btn.active {
+  background: var(--sk-accent-fill);
+  color: var(--settings-font, currentColor);
+  border-color: var(--sk-accent-line);
+  font-weight: 600;
+}
+
+.opt-btn.active:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--sk-accent) 19%, transparent);
+}
+
+.opt-btn.wide {
+  width: 100%;
+  justify-content: center;
+}
+
+.opt-btn.danger {
+  border-color: color-mix(in srgb, #d14b45 45%, transparent);
+  color: #c43f3a;
+}
+
+/* ─── 下拉与输入 ─── */
+.voice-select {
+  flex: 1;
+  /* 长音色名（「Microsoft Yunxi Online (Natural) - Chinese (Mainland)」）在
+     flex 项里会被 min-width:auto 顶到内容宽度，把设置面板顶出横向滚动条。
+     这三条一起才能兜住：允许收缩 / 不超出父容器 / 溢出用省略号。 */
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  text-overflow: ellipsis;
+  padding: 8px 11px;
+  border-radius: var(--sk-radius-ctl);
+  border: 1px solid var(--settings-field-border);
+  outline: none;
+  background: var(--settings-field-bg);
+  color: inherit;
+  font-size: 13px;
+  caret-color: var(--sk-accent);
+  transition: background 0.18s, border-color 0.18s, box-shadow 0.18s;
+}
+
+.voice-select:hover {
+  background: var(--settings-field-bg-hover);
+  border-color: var(--sk-line-strong);
+}
+
+.voice-select:focus {
+  background: var(--settings-field-bg-hover);
+  border-color: var(--sk-accent);
+  box-shadow: 0 0 0 3px var(--sk-accent-fill);
+}
+
+.voice-select::placeholder {
+  color: var(--settings-field-placeholder);
+}
+
+.voice-select option {
+  background: var(--settings-popup);
+  color: var(--settings-font);
+}
+
+.read-settings.is-dark .voice-select {
+  color-scheme: dark;
+}
+
+.http-tts-picker,
+.edge-voice-picker {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.setting-hint {
+  padding: 0 2px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--sk-muted);
+}
+
+.shortcut-hint {
+  margin-top: -8px;
+}
+
+/* ─── 语音测试 ─── */
+.speech-test-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 56px;
+  padding: 10px 12px;
+  border-radius: var(--sk-radius-ctl);
+  border: 1px solid var(--settings-field-border);
+  background: var(--settings-field-bg);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+  transition: background 0.18s, border-color 0.18s, box-shadow 0.18s;
+}
+
+.speech-test-input:focus {
+  background: var(--settings-field-bg-hover);
+  border-color: var(--sk-accent);
+  box-shadow: 0 0 0 3px var(--sk-accent-fill);
+}
+
+.speech-test-input::placeholder {
+  color: var(--settings-field-placeholder);
+}
+
+.speech-test-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.speech-test-note {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--sk-muted);
+}
+
+/* ─── 快捷键 ─── */
 .block-tag {
-  padding: 2px 8px;
-  border-radius: 8px;
+  padding: 2px 7px;
+  border-radius: 6px;
   font-size: 11px;
-  background: color-mix(in srgb, var(--settings-font, currentColor) 8%, transparent);
-  opacity: 0.75;
+  color: var(--sk-muted);
+  background: var(--settings-field-bg);
 }
 
 .hotkey-head-actions {
@@ -2477,17 +3333,16 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 4px 6px;
+  padding: 5px 6px;
   margin: 0 -6px;
   border-radius: 8px;
   transition: background 0.16s;
 }
 
-/* 用悬停底色区分行, 而不是给每一行都画一条分隔线 —— 分隔线 + 常驻按钮
-   会把这块变成一张表格。 */
+/* 用悬停底色区分行, 而不是给每一行都画一条分隔线。 */
 .function-item:hover,
 .function-item:focus-within {
-  background: color-mix(in srgb, var(--settings-font, currentColor) 6%, transparent);
+  background: var(--settings-field-bg);
 }
 
 .function-name {
@@ -2495,7 +3350,7 @@ onMounted(async () => {
   align-items: center;
   gap: 5px;
   min-width: 78px;
-  font-size: 13px;
+  font-size: 12.5px;
   flex-shrink: 0;
 }
 
@@ -2503,8 +3358,8 @@ onMounted(async () => {
   padding: 0 4px;
   border-radius: 4px;
   font-size: 10px;
-  opacity: 0.6;
-  background: color-mix(in srgb, var(--settings-font, currentColor) 10%, transparent);
+  color: var(--sk-muted);
+  background: var(--settings-field-bg);
 }
 
 .function-keys {
@@ -2518,11 +3373,11 @@ onMounted(async () => {
 
 .function-empty {
   font-size: 12px;
-  opacity: 0.35;
+  color: var(--sk-muted);
+  opacity: 0.7;
 }
 
-/* 键位胶囊: 用中性描边承载, 主色留给真正的选中/告警状态。
-   十来个胶囊全用主色描边会连成一片橙色, 反而看不出哪个键有冲突。 */
+/* 键位胶囊: 中性描边承载, 主色留给真正的冲突告警。 */
 .key-chip {
   display: inline-flex;
   align-items: center;
@@ -2589,13 +3444,11 @@ onMounted(async () => {
 .conflict-key {
   padding: 0 4px;
   border-radius: 4px;
-  background: color-mix(in srgb, var(--settings-font, currentColor) 12%, transparent);
+  background: var(--settings-field-bg-hover);
   font-weight: 600;
 }
 
-/* 录入按键: 点开后按任意键即可绑定。
-   始终可见 —— 未绑定的功能全靠它作为入口, 藏起来会让那些行变成死角;
-   但默认不画虚线框、只用低透明度, 因此不会像十四个虚线框那样连成噪音。 */
+/* 录入按键: 点开后按任意键即可绑定。始终可见, 但默认只用低透明度。 */
 .key-capture {
   display: inline-flex;
   align-items: center;
@@ -2623,8 +3476,8 @@ onMounted(async () => {
 .key-capture:hover,
 .key-capture:focus-visible {
   opacity: 1;
-  border-color: color-mix(in srgb, var(--color-primary, #c97f3a) 50%, transparent);
-  background: color-mix(in srgb, var(--color-primary, #c97f3a) 10%, transparent);
+  border-color: var(--sk-accent-line);
+  background: var(--sk-accent-fill);
 }
 
 .key-capturing {
@@ -2633,8 +3486,8 @@ onMounted(async () => {
   gap: 6px;
   padding: 3px 8px;
   border-radius: 7px;
-  border: 1px solid color-mix(in srgb, var(--color-primary, #c97f3a) 55%, transparent);
-  background: color-mix(in srgb, var(--color-primary, #c97f3a) 12%, transparent);
+  border: 1px solid var(--sk-accent-line);
+  background: var(--sk-accent-fill);
   font-size: 12px;
   animation: capture-pulse 1.4s ease-in-out infinite;
 }
@@ -2659,358 +3512,47 @@ onMounted(async () => {
   opacity: 1;
 }
 
-.voice-select {
-  flex: 1;
-  /* 长音色名（「Microsoft Yunxi Online (Natural) - Chinese (Mainland)」）在
-     flex 项里会被 min-width:auto 顶到内容宽度，把设置面板顶出横向滚动条。
-     这三条一起才能兜住：允许收缩 / 不超出父容器 / 溢出用省略号。 */
-  min-width: 0;
-  max-width: 100%;
-  box-sizing: border-box;
-  text-overflow: ellipsis;
-  padding: 10px 12px;
-  border-radius: 12px;
-  border: 1px solid var(--settings-field-border);
-  outline: none;
-  background: var(--settings-field-bg);
-  color: inherit;
-  caret-color: var(--color-primary, #c97f3a);
-  transition: background 0.18s, border-color 0.18s, box-shadow 0.18s;
+@media (prefers-reduced-motion: reduce) {
+  .read-settings *,
+  .read-settings *::before,
+  .read-settings *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
 }
 
-.voice-select:hover {
-  background: var(--settings-field-bg-hover);
-  border-color: color-mix(in srgb, var(--settings-font) 28%, transparent);
-}
-
-.voice-select:focus {
-  background: var(--settings-field-bg-hover);
-  border-color: var(--color-primary, #c97f3a);
-  box-shadow: 0 0 0 3px rgba(201, 127, 58, 0.16);
-}
-
-.voice-select::placeholder {
-  color: var(--settings-field-placeholder);
-}
-
-.voice-select option {
-  background: var(--settings-popup);
-  color: var(--settings-font);
-}
-
-.read-settings.is-dark .voice-select {
-  color-scheme: dark;
-}
-
-/* 在线朗读引擎 / Edge：下拉占满剩余宽度，右侧按钮靠右同排 */
-.http-tts-picker,
-.edge-voice-picker {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.setting-hint {
-  margin-top: -8px;
-  padding-left: 90px;
-  font-size: 12px;
-  line-height: 1.5;
-  opacity: 0.65;
-}
-
-/* Theme swatches */
-.theme-swatches {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.swatch {
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  border: 2px solid transparent;
-  cursor: pointer;
-  transition: all 0.2s;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.12);
-}
-
-.swatch:hover {
-  transform: scale(1.1);
-}
-
-.swatch.active {
-  border-color: var(--color-primary, #c97f3a);
-}
-
-.swatch svg {
-  width: 16px;
-  height: 16px;
-  color: var(--color-primary, #c97f3a);
-}
-
-/* Button groups */
-.btn-group {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.font-picker {
-  display: grid;
-  flex: 1;
-  min-width: 0;
-  gap: 10px;
-}
-
-.font-actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.custom-font-btn {
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.opt-btn.danger {
-  border-color: color-mix(in srgb, #d14b45 55%, transparent);
-  color: #c43f3a;
-}
-
-.opt-btn {
-  min-height: 36px;
-  padding: 6px 16px;
-  border-radius: 20px;
-  font-size: 13px;
-  font-weight: 500;
-  border: 1px solid rgba(0,0,0,0.12);
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  transition: all 0.2s;
-  white-space: nowrap;
-}
-
-.opt-btn:hover {
-  border-color: var(--color-primary, #c97f3a);
-}
-
-.opt-btn:active:not(:disabled) {
-  transform: scale(0.97);
-}
-
-.opt-btn:disabled {
-  cursor: not-allowed;
-  opacity: 0.45;
-}
-
-/* 选中态用淡主色底 + 主色文字与描边, 而不是整块纯橙 —— 纯色块在设置面板
-   里一屏会出现十来处, 连成一片非常刺眼, 也压掉了文字的层次。 */
-.opt-btn.active {
-  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
-  /* 文字必须用 --settings-font(本组件跟随阅读主题的 fontColor), 不能写主色:
-   * 主色 #c97f3a 与阅读主题的浅色底亮度太接近, 默认主题只有 2.4:1、暗灰主题
-   * 更是 1.2:1, 字与底几乎同亮。改成跟随文字色后升到 6.4~10.9:1。 */
-  color: var(--settings-font, currentColor);
-  border-color: color-mix(in srgb, var(--color-primary) 34%, transparent);
-  font-weight: 600;
-}
-
-.opt-btn.active:hover {
-  background: color-mix(in srgb, var(--color-primary) 20%, transparent);
-}
-
-/* Steppers */
-.stepper {
-  display: flex;
-  align-items: center;
-  border-radius: 20px;
-  border: 1px solid rgba(0,0,0,0.12);
-  overflow: hidden;
-  /* 段落行高/间距、朗读语速等都是「按内容的窄胶囊」。
-     .setting-row 是 flex 行，不写这两条时 stepper 会被拉伸成整行宽的空框
-     （表现就是「+ 按钮拉得老长」）。 */
-  flex: 0 0 auto;
-  width: fit-content;
-}
-
-/* Sliders
- *
- * 行结构是「.slider-head(标签 + 数值 + 可选回正按钮) + input[range]」，用 grid
- * 排成一行：标签 / 滑块 / 数值 / 回正，整组居中。
- * `display: contents` 把 .slider-head 拆掉，label、value、回正直接成为 grid item。
- *
- * **必须给每项写死 `grid-row: 1`**：grid 的自动放置是「稀疏」的 —— 按 DOM 顺序
- * 排完 label(列1)、value(列3)、回正(列4) 后，光标已停在第 1 行末尾，此时再给
- * 滑块指定 `grid-column: 2` 只会从光标后开始找，于是它被挤到**第 2 行**，
- * 表现为「标签和数值一行、滑块单独一行」。写死行号后四项才真正同排。
- */
-.slider-row {
-  display: grid;
-  /* 第 1 列与 .setting-row 完全一致（104px）+ 同样的 14px 列间距，
-     滑块左端才能和上面的按钮组、下拉框严丝合缝地对齐。 */
-  grid-template-columns: 104px minmax(120px, 240px) 56px 64px;
-  align-items: center;
-  justify-content: start;
-  column-gap: 14px;
-  row-gap: 4px;
-}
-
-.slider-head {
-  display: contents;
-}
-
-.slider-row .slider-head > label {
-  grid-column: 1;
-  grid-row: 1;
-  /* 与普通行一致：左对齐，保证面板内只有一条文本竖线。 */
-  text-align: left;
-}
-
-.slider-row > .settings-slider {
-  grid-column: 2;
-  grid-row: 1;
-  width: 100%;
-}
-
-.slider-row .slider-head > .slider-value {
-  grid-column: 3;
-  grid-row: 1;
-  /* 定宽 + 右对齐：数值位数变化时滑块不会左右抖动。 */
-  min-width: 52px;
-  text-align: right;
-  justify-self: start;
-}
-
-.slider-row .slider-head > .link-btn {
-  grid-column: 4;
-  grid-row: 1;
-  justify-self: start;
-}
-
-.slider-value {
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-  opacity: 0.75;
-}
-
-.settings-slider {
-  /* 宽面板上 100% 会拉到整行、拖动手感差；统一收窄到 240px（窄屏仍可缩）。
-     数值由上面的 grid 紧跟滑块右侧，不再靠整行 right。 */
-  width: min(240px, 100%);
-  appearance: none;
-  -webkit-appearance: none;
-  height: 18px;
-  margin: 0;
-  background: transparent;
-  cursor: pointer;
-}
-
-.settings-slider::-webkit-slider-runnable-track {
-  height: 4px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--settings-font, currentColor) 20%, transparent);
-}
-
-.settings-slider::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 14px;
-  height: 14px;
-  margin-top: -5px;
-  border-radius: 50%;
-  background: var(--settings-font, currentColor);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-}
-
-.settings-slider::-moz-range-track {
-  height: 4px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--settings-font, currentColor) 20%, transparent);
-}
-
-.settings-slider::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
-  border: none;
-  border-radius: 50%;
-  background: var(--settings-font, currentColor);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-}
-
-.step-btn {
-  padding: 6px 14px;
-  font-size: 13px;
-  font-weight: 600;
-  color: inherit;
-  background: transparent;
-  cursor: pointer;
-  transition: background 0.15s;
-  border: none;
-  min-width: 40px;
-}
-
-.step-btn:hover {
-  background: rgba(0,0,0,0.06);
-}
-
-.step-btn:active {
-  background: rgba(0,0,0,0.1);
-}
-
-.step-val {
-  min-width: 50px;
-  text-align: center;
-  font-size: 14px;
-  font-variant-numeric: tabular-nums;
-  border-left: 1px solid rgba(0,0,0,0.08);
-  border-right: 1px solid rgba(0,0,0,0.08);
-  padding: 6px 0;
-}
-
+/* ─── 窄屏：标签独占一行，控件整行铺开 ─── */
 @media (max-width: 420px) {
   .read-settings {
-    padding: 16px;
+    padding: 16px 16px 28px;
   }
 
   .reader-settings-tabs {
     top: -16px;
   }
 
-  .settings-header {
-    align-items: center;
-    gap: 8px;
-  }
-
   .settings-title {
-    font-size: 18px;
+    font-size: 15px;
   }
 
   .reset-btn {
-    padding: 6px 12px;
-    font-size: 12px;
+    padding: 6px 10px;
+    font-size: 11.5px;
   }
 
-  /* 窄屏：标签独占一行、控件整行铺开（88px + 控件在 360px 屏上太挤）。 */
   .setting-row,
   .slider-row {
     grid-template-columns: minmax(0, 1fr);
     row-gap: 8px;
+    min-height: 0;
+    padding: 10px 0;
   }
 
   .setting-row > label,
-  .setting-row .slider-head > label {
+  .setting-row .slider-head > label,
+  .slider-row .slider-head > label {
     grid-column: 1 / -1;
-    text-align: left;
-    font-size: 13px;
+    font-size: 12.5px;
   }
 
   .setting-row > .btn-group,
@@ -3018,47 +3560,44 @@ onMounted(async () => {
   .setting-row > .font-picker,
   .setting-row > .voice-select,
   .setting-row > .opt-btn.wide,
-  .setting-row > .image-picker-row,
+  .setting-row > .image-picker,
   .setting-row > .inline-slider,
-  .setting-row > .theme-swatches {
+  .setting-row > .swatch-row,
+  .setting-row > .color-grid,
+  .setting-row > .segmented,
+  .setting-row > .range-field,
+  .setting-row > .switch-line {
     grid-column: 1 / -1;
   }
 
-  .btn-group {
-    gap: 6px;
-    flex: 0 1 auto;
+  .slider-row > .settings-slider {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 
-  .stepper,
-  .voice-select,
-  .theme-swatches {
-    flex: 0 1 auto;
-    min-width: 0;
-    max-width: 100%;
+  .slider-row .slider-head > .slider-value,
+  .slider-row .slider-head > .link-btn {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    justify-self: start;
+    text-align: left;
   }
 
-  .stepper {
-    width: auto;
-    display: inline-flex;
+  .range-value {
+    min-width: 56px;
   }
 
-  .opt-btn {
-    padding: 6px 12px;
-    font-size: 12px;
+  .segmented {
+    width: 100%;
   }
 
-  .step-btn {
-    min-width: 36px;
-    padding: 6px 10px;
+  .segmented button {
+    flex: 1;
+    padding: 0 8px;
   }
 
-  .step-val {
-    min-width: 42px;
-    font-size: 13px;
-  }
-
-  .voice-select {
-    width: auto;
+  .group-card {
+    padding: 2px 12px;
   }
 
   .http-tts-picker,
@@ -3067,8 +3606,12 @@ onMounted(async () => {
   }
 
   .setting-hint {
-    padding-left: 0;
-    margin-top: -12px;
+    margin-top: -4px;
   }
 }
 </style>
+
+
+
+
+

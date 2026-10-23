@@ -461,7 +461,7 @@ import ReaderMobileControls from '../components/reader/ReaderMobileControls.vue'
 import SourceBrowserPanel from '../components/SourceBrowserPanel.vue'
 import { useReaderSearch, type SearchLocateOptions } from '../composables/useReaderSearch'
 import { useReaderSelection } from '../composables/useReaderSelection'
-import { useHorizontalPaging } from '../composables/useHorizontalPaging'
+import { useHorizontalPaging, rememberDecodedImageSize } from '../composables/useHorizontalPaging'
 import { useContinuousReading } from '../composables/useContinuousReading'
 import { useReaderAutoPlayback } from '../composables/useReaderAutoPlayback'
 import { useSourceImport } from '../composables/useSourceImport'
@@ -1011,6 +1011,9 @@ function queueLoadedImagePagination(image: unknown) {
   if (!mounted || !isHorizontalPageMode.value || !(image instanceof HTMLImageElement) || !image.naturalWidth) return
   const src = image.currentSrc || image.src
   const size = `${image.naturalWidth}x${image.naturalHeight}`
+  // 把解码后的真实尺寸登记给分页器: 重建分页时 DOM 是全新的, 新 img 还没解码,
+  // naturalWidth 读不到, 没有这份缓存就只能按"没有尺寸"约束。
+  rememberDecodedImageSize(src, image.naturalWidth, image.naturalHeight)
   if (loadedReaderImageSizes.get(src) === size) return
   // New page DOM fires load again even when its image is cached. Rebuild only
   // once per intrinsic size in this chapter, after the browser knows its width.
