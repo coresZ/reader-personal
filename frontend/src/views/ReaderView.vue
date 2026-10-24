@@ -3109,8 +3109,8 @@ const readingModeKind = computed<'paged' | 'scroll'>(() => (
  *
  *  浏览器里(开发调试)没有 Tauri API, 回退到 HTML5 全屏。
  *
- *  「最大化状态下进全屏会露出任务栏高度的黑边」由 **tao 的 vendor 补丁**根治:
- *  见 Cargo.toml 的 [patch.crates-io]/tao 与 vendor/tao 里的 VENDOR PATCH 注释。
+ *  「最大化状态下进全屏会露出任务栏高度的黑边」由 tao 修好(tauri-apps/tao#1353,
+ *  tao 0.37.2 起包含; 早期用 vendor 副本, 现已改回官方版本)。
  *
  *  这里刻意**不再**用「进全屏前先 unmaximize、退出后再 maximize」的变通。那虽
  *  也能绕开黑边, 但 unmaximize/maximize 各对应一次 ShowWindow(SW_RESTORE) /
