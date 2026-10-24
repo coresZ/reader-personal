@@ -59,7 +59,12 @@ import { normalizeAudioContentType, synthesizeHttpTts } from '../api/httpTts'
 import { synthesizeEdgeTts, type EdgeTtsFormat } from '../api/edgeTts'
 import { synthesizeMsTts, type MsTtsFormat } from '../api/msTts'
 import { splitSpeechSegments, type SpeechSegment, type SpeechSegmentType } from '../utils/speechSegments'
-import { readSavedReadingPosition } from '../utils/readingPosition'
+import {
+  readSavedReadingPosition,
+  resolveReadingPosition,
+  toMillis,
+  type ReadingPositionSnapshot,
+} from '../utils/readingPosition'
 import { compileReplaceRule, toSandboxRuleStep } from '../utils/replaceRuleRegex'
 
 const READER_SESSION_KEY = 'reader-last-session'
@@ -717,6 +722,10 @@ export const useReaderStore = defineStore('reader', () => {
   const readChapterKeys = ref<Set<string>>(new Set())
   const progressDirty = ref(false)
   const lastServerProgressKey = ref('')
+  /** 正在路上的 keepalive 写入: 同一份 payload 不重复发送, 但**成功才**置
+   *  `lastServerProgressKey`(见 flushProgressToServerKeepalive 的说明)。 */
+  let keepaliveInFlightKey = ''
+  let keepaliveInFlight: Promise<void> | null = null
   const pendingLegadoProgress = ref<{ index: number; position: number } | null>(null)
   const legadoPositionRestore = ref<{
     index: number
@@ -3359,9 +3368,34 @@ export const useReaderStore = defineStore('reader', () => {
     appStore.markBookOpened(b.bookUrl)
     currentIndex.value = b.durChapterIndex || 0
     const localPosition = readSavedReadingPosition(b.bookUrl)
-    chapterScrollProgress.value = localPosition?.chapterIndex === currentIndex.value
-      ? localPosition.progress
-      : decodeServerProgress(b.durChapterPos)
+    // 书架记录与 localStorage 段落快照经常互相矛盾: 书架那条由 10 秒自动保存 /
+    // 换章 / 退出时各写一次, 既有落后的副本, 也有抢先写下的「新章 0」。
+    // 统一交给 resolveReadingPosition 判: **章号相同用本地**(逐页写入, 带段落锚点),
+    // **章号不同用书架**(只有主动跳章才会出现这种组合)。早先只按「章节号一致就用
+    // 本地, 否则用书架进度」判断, 于是换章后重开会落到该章第一页。
+    const shelfPosition: ReadingPositionSnapshot = {
+      chapterIndex: b.durChapterIndex || 0,
+      progress: decodeServerProgress(b.durChapterPos),
+      updatedAt: toMillis(b.durChapterTime),
+    }
+    const resumed = resolveReadingPosition(localPosition, shelfPosition)
+    if (resumed) {
+      currentIndex.value = resumed.chapterIndex
+      chapterScrollProgress.value = Math.max(0, Math.min(1, resumed.progress || 0))
+      // 让 loadChapter 的 `isOpeningSavedChapter` 判定与恢复后的位置一致:
+      // 它拿 book.durChapterIndex 当作"上次保存的章", 不一致就会把初始进度当 0。
+      if (book.value) {
+        book.value.durChapterIndex = resumed.chapterIndex
+        book.value.durChapterPos = encodeServerProgress(resumed.progress)
+      }
+      const shelfBook = shelfStore.books.find((item) => item.bookUrl === b.bookUrl)
+      if (shelfBook) {
+        shelfBook.durChapterIndex = resumed.chapterIndex
+        shelfBook.durChapterPos = encodeServerProgress(resumed.progress)
+      }
+    } else {
+      chapterScrollProgress.value = 0
+    }
     loadReadChapterHistory(b)
     progressDirty.value = false
     lastServerProgressKey.value = ''
@@ -3489,12 +3523,31 @@ export const useReaderStore = defineStore('reader', () => {
     if (!payload) return Promise.resolve()
     const nextKey = `${payload.bookUrl}::${payload.index}::${payload.position}`
     if (!force && !progressDirty.value && lastServerProgressKey.value === nextKey) return Promise.resolve()
+    // 同一份 payload 已经在路上时不重复发。
+    if (keepaliveInFlightKey === nextKey) return keepaliveInFlight ?? Promise.resolve()
 
-    progressDirty.value = false
-    lastServerProgressKey.value = nextKey
-    return invokeRaw('save_book_progress', { req: payload })
-      .then(() => undefined)
+    // 关键: **不能在 IPC 返回之前**把进度标记为"已保存"。旧实现先清
+    // `progressDirty` 再发 IPC, 且把错误吞掉 —— 一旦这次写入失败(书不在书架、
+    // 磁盘忙、进程正在退出), 内存里却认为已经落盘, 后面所有自动保存都会被
+    // `lastServerProgressKey === nextKey` 跳过, 书架永久停在更旧的位置。
+    // 用户看到的就是"每次重开都回到上上次退出的地方"。
+    const task = invokeRaw('save_book_progress', { req: payload })
+      .then(() => {
+        if (lastServerProgressKey.value !== nextKey) {
+          progressDirty.value = false
+          lastServerProgressKey.value = nextKey
+        }
+      })
       .catch(() => undefined)
+      .finally(() => {
+        if (keepaliveInFlightKey === nextKey) {
+          keepaliveInFlightKey = ''
+          keepaliveInFlight = null
+        }
+      })
+    keepaliveInFlightKey = nextKey
+    keepaliveInFlight = task
+    return task
   }
 
   /**
