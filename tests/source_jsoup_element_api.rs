@@ -169,6 +169,46 @@ fn cloned_element_removes_selected_children() {
     assert!(!out.contains("var ad=1"), "脚本要删掉: {out}");
 }
 
+/// 元素用普通数组交出时必须仍是**扁平快照**。
+///
+/// 书源 `bookList` / 目录脚本常写 `var out = []; out.push(li); return out;`,
+/// 宿主拿到的是 `JSON.stringify(out)`。元素若没有 `toJSON`(或内部字段可枚举),
+/// 每项会变成 `{"__snapshot":{…}}` 包装, 宿主既认不出快照、字段规则也取不到值,
+/// 表现就是「发现页/搜索页 0 条」。`Elements` 集合有 `elementsApi.toJSON` 兜底,
+/// 裸数组只能靠元素自己的 `toJSON`。
+#[test]
+fn elements_pushed_into_plain_array_serialize_flat() {
+    let html = r#"<ul class="list"><li><span class="s2"><a href="/book/1.html">书名</a></span></li></ul>"#;
+    let out = eval_js(
+        r#"
+        var doc = org.jsoup.Jsoup.parse(String(result || ''));
+        var lis = doc.select('ul.list li');
+        var out = [];
+        for (var i = 0; i < lis.size(); i++) out.push(lis.get(i));
+        JSON.stringify(out);
+        "#,
+        html,
+        "https://m.example.test/",
+    )
+    .expect("eval");
+    let items: Vec<serde_json::Value> = serde_json::from_str(&out).expect("json array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert!(
+        item.get("__snapshot").is_none(),
+        "不能序列化成 __snapshot 包装: {item}"
+    );
+    assert_eq!(item["tag"], "li");
+    assert!(
+        item["outerHtml"].as_str().unwrap_or_default().contains("书名"),
+        "快照要带 outerHtml: {item}"
+    );
+    assert!(
+        item["attrs"].is_object(),
+        "快照要带 attrs: {item}"
+    );
+}
+
 /// 原文档在 `clone()` + `remove()` 之后不应被改动(JSoup 的 clone 是深拷贝)。
 #[test]
 fn clone_removal_does_not_touch_the_original_document() {

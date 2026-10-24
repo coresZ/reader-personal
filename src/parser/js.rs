@@ -1253,11 +1253,28 @@ const JS_PRELUDE: &str = r#"(function (g) {
       // `empty()`: 清空子节点(部分源用它重置容器)。
       empty: function () { s.innerHtml = ''; refreshSnapshot(el); return el; },
       toString: function () { return S(s.outerHtml); },
+      // 元素序列化时必须**直接交出快照**, 不能带一层包装。
+      //
+      // 脚本用普通数组攒列表(`var out = []; out.push(li); return out;`)时,
+      // 宿主拿到的是 `JSON.stringify(out)` 的结果 —— 没有 `toJSON` 的话每项会
+      // 变成 `{"__snapshot":{…},"__owner":null,"__prevOuter":"…"}`, 宿主既认不出
+      // 这是元素快照(缺顶层 `outerHtml`), 又会把 `__snapshot` 当普通 JSON 字段,
+      // 字段规则 `span.s2 a@text` 因此全部取空 —— 发现页/搜索页 0 条。
+      // 用 `Elements` 集合时靠 `elementsApi` 的 `toJSON` 兜住, 裸数组就只能靠这里。
+      toJSON: function () { return s; },
       // 保留原始快照: JSoup 桥需要在元素间复制/合并时重建包装对象。
       __snapshot: s,
       __owner: owner || null,
       __prevOuter: S(s.outerHtml)
     };
+    // 内部字段必须**不可枚举**: `JSON.stringify` / `for..in` / `Object.assign`
+    // 只该看到元素本身的方法与外层快照, 否则会把宿主关系与快照副本一起序列化
+    // (上面 `toJSON` 之外的第二道保险: `toJSON` 缺失或被绕过时不至于串味)。
+    try {
+      Object.defineProperty(el, '__snapshot', { value: s, enumerable: false, writable: true, configurable: true });
+      Object.defineProperty(el, '__owner', { value: owner || null, enumerable: false, writable: true, configurable: true });
+      Object.defineProperty(el, '__prevOuter', { value: S(s.outerHtml), enumerable: false, writable: true, configurable: true });
+    } catch (_e) { /* 冻结对象保持原样 */ }
     return el;
   }
   // 宿主把"元素快照"注入为字段规则的 `result` 时要用同一套包装(见
