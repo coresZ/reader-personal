@@ -1,17 +1,71 @@
-import { nextTick, watch, type ComputedRef, type Ref } from 'vue'
+import { getCurrentScope, nextTick, onScopeDispose, watch, type ComputedRef, type Ref } from 'vue'
 import type { useReaderStore } from '../stores/reader'
 import { useAppStore } from '../stores/app'
 import { cancelPageScrollAnimation } from '../utils/readerPaging'
-import { splitSpeechSegments } from '../utils/speechSegments'
-import { hasSpeakableContent } from '../utils/speakableText'
+import { buildSpeechChunkPieces, buildSpeechChunksFromText } from '../utils/speechChunks'
 import { SpeechStream, type SpeechChunk, type SpeechChunkType } from '../utils/speechStream'
 
 type ReaderStore = ReturnType<typeof useReaderStore>
-const OPENAI_SPEECH_CHUNK_CHAR_LIMIT = 70
 const OPENAI_PRELOAD_CHUNK_LIMIT = 5
 const OPENAI_MERGED_SEGMENT_CHAR_LIMIT = 260
 /** 手动输入暂停自动滚动后, 静止多久恢复滚动。 */
 const AUTO_SCROLL_MANUAL_RESUME_MS = 1200
+/** 用户手动跳章后等多久再跟随：连续拖进度条会连续改索引，只跟随最后一次。 */
+const CHAPTER_JUMP_FOLLOW_DEBOUNCE_MS = 320
+/**
+ * 换章后等正文渲染出来的轮询预算：换章要等书源返回正文，慢的时候十几秒都正常，
+ * 所以按 ~30 秒给足（150 × 200ms），期间用户停止/再跳章会让这次跟随失效。
+ */
+const CHAPTER_JUMP_FOLLOW_RETRY = 150
+const CHAPTER_JUMP_FOLLOW_RETRY_INTERVAL_MS = 200
+/**
+ * TTS 自己滚动正文后的保护窗口。
+ *
+ * 连续阅读模式下正文是一整条，滚动到章边界会让 `currentIndex` 跟着变；TTS 推进
+ * 段落时也会滚动，所以刚滚过的那一下不能当成「用户跳章」，否则朗读会被自己的
+ * 自动滚动反复重启。窗口要覆盖平滑滚动的整段（几百毫秒），只在「这次索引变化
+ * 由滚动事件反推出来」时才生效 —— 目录/上下一章/进度条这类显式跳章不看它。
+ */
+const SPEECH_SELF_SCROLL_GUARD_MS = 1500
+
+/**
+ * 这次 `currentIndex` 变化是不是 TTS 自己滚出来的。
+ *
+ * 三个条件同时成立才算：索引变化来自滚动事件反推（`scrollDriven`）、距 TTS 上次
+ * 自己滚动还在保护窗口内、且这期间用户没有新的滚动/按键输入。只看时间窗口会把
+ * 用户在朗读推进后 1.5 秒内的真实跳章一起吞掉 —— 那正是「连续阅读里刚滚两下就
+ * 点下一章，朗读不跟」的原因。
+ */
+export function isSpeechSelfScroll(state: {
+  scrollDriven: boolean
+  now: number
+  lastSpeechScrollAt: number
+  lastUserInputAt: number
+}): boolean {
+  if (!state.scrollDriven) return false
+  if (state.now - state.lastSpeechScrollAt >= SPEECH_SELF_SCROLL_GUARD_MS) return false
+  return state.lastUserInputAt <= state.lastSpeechScrollAt
+}
+
+/**
+ * 用户手动跳章时要不要让朗读跟随（抽成纯函数便于单测）。
+ *
+ * 不跟随的情况：变化本来就是 TTS 自己发起的；当前没有朗读会话；正在切段/
+ * 切章的过渡里（再来一次会互相打架）；以及这次索引变化是 TTS 自动滚动反推的
+ * （见 `isSpeechSelfScroll`）。
+ */
+export function shouldFollowChapterJump(state: {
+  speechDriven: boolean
+  hasSpeechSession: boolean
+  transitioning: boolean
+  selfScroll: boolean
+}): boolean {
+  if (state.speechDriven) return false
+  if (!state.hasSpeechSession) return false
+  if (state.transitioning) return false
+  if (state.selfScroll) return false
+  return true
+}
 
 interface AutoPlaybackConfig {
   clickAction: string
@@ -76,6 +130,18 @@ export function useReaderAutoPlayback(
   let currentSpeechParagraph: HTMLElement | null = null
   let currentSpeechSegments: SpeechSegment[] = []
   let currentSpeechSegmentIndex = 0
+  /** 当前这次 `currentIndex` 变化是 TTS 自己发起的（见 `runSpeechDrivenChapterChange`）。 */
+  let speechDrivenChapterChange = false
+  /** 当前这次 `currentIndex` 变化是「滚动反推」出来的（连续阅读 / 自动滚动）。 */
+  let scrollDrivenChapterChange = false
+  /** TTS 自己滚动正文的时刻：连续模式下滚动到章边界也会改 `currentIndex`。 */
+  let lastSpeechOwnScrollAt = 0
+  /** 用户最后一次手动输入（滚轮/触摸/按键/点击）的时刻，用于区分自滚与用户滚动。 */
+  let lastUserInputAt = 0
+  /** 用户跳章后的跟随定时器（连续拖动进度条时不断重置）。 */
+  let chapterJumpFollowTimer: number | null = null
+  /** 跳章跟随的序号：用户停止/再次跳章时递增，让挂起的「等正文」循环失效。 */
+  let chapterFollowSeq = 0
 
   function isSafariSpeechDelayBrowser() {
     if (typeof navigator === 'undefined') return false
@@ -166,70 +232,6 @@ export function useReaderAutoPlayback(
     const index = current ? list.indexOf(current) : -1
     if (index >= 0 && index < list.length - 1) return list[index + 1]
     return null
-  }
-
-  function splitLongSentence(sentence: string) {
-    const chunks: string[] = []
-    let remaining = sentence.trim()
-    while (remaining.length > OPENAI_SPEECH_CHUNK_CHAR_LIMIT) {
-      let splitIndex = Math.max(
-        remaining.lastIndexOf('，', OPENAI_SPEECH_CHUNK_CHAR_LIMIT),
-        remaining.lastIndexOf('、', OPENAI_SPEECH_CHUNK_CHAR_LIMIT),
-        remaining.lastIndexOf(',', OPENAI_SPEECH_CHUNK_CHAR_LIMIT),
-        remaining.lastIndexOf(' ', OPENAI_SPEECH_CHUNK_CHAR_LIMIT),
-      )
-      if (splitIndex <= 0) {
-        splitIndex = OPENAI_SPEECH_CHUNK_CHAR_LIMIT
-      }
-      chunks.push(remaining.slice(0, splitIndex).trim())
-      remaining = remaining.slice(splitIndex).trim()
-    }
-    if (remaining) chunks.push(remaining)
-    return chunks
-  }
-
-  /**
-   * 把一段正文按句号切成适合一次合成的短块（openai 通道的 70 字限制）。
-   *
-   * 拆成接受纯文本而不是 HTMLElement：缓冲流还要为**尚未渲染到 DOM 的下一章**
-   * 预切块（跨章预取），那些文本只能从 store 的正文里来。
-   */
-  function buildSpeechChunksFromText(rawText: string) {
-    const text = rawText.trim()
-    if (!text) return [] as string[]
-
-    const sentences = text
-      .replace(/\n+/g, '\n')
-      .split(/(?<=[。！？!?；;])/)
-      .map((item) => item.trim())
-      .filter(Boolean)
-
-    const chunks: string[] = []
-    let current = ''
-
-    const pushCurrent = () => {
-      const normalized = current.trim()
-      if (normalized) chunks.push(normalized)
-      current = ''
-    }
-
-    for (const sentence of (sentences.length ? sentences : [text])) {
-      if (sentence.length > OPENAI_SPEECH_CHUNK_CHAR_LIMIT) {
-        pushCurrent()
-        chunks.push(...splitLongSentence(sentence))
-        continue
-      }
-      const next = current ? `${current}${sentence}` : sentence
-      if (next.length > OPENAI_SPEECH_CHUNK_CHAR_LIMIT) {
-        pushCurrent()
-        current = sentence
-      } else {
-        current = next
-      }
-    }
-
-    pushCurrent()
-    return chunks.length ? chunks : [text]
   }
 
   function buildParagraphSpeechChunks(paragraph: HTMLElement | null) {
@@ -370,6 +372,10 @@ export function useReaderAutoPlayback(
   function showParagraph(paragraph: HTMLElement | null, smooth = true) {
     const container = scrollContainerRef.value
     if (!container || !paragraph) return
+
+    // 记下「这次滚动是 TTS 自己发起的」：连续阅读模式下滚动到章边界会改
+    // `currentIndex`，跟随 watcher 不能把它当成用户跳章（见 `lastSpeechOwnScrollAt`）。
+    lastSpeechOwnScrollAt = Date.now()
 
     // 左右分页模式: 正文被切成 horizontalPages 逐页渲染, 容器是 overflow-y: hidden,
     // 纵向滚不动。翻页靠页索引 + transform, 所以这里必须改走翻页而不是 scrollTo。
@@ -552,8 +558,20 @@ export function useReaderAutoPlayback(
       .filter(Boolean)
   }
 
-  /** 一段文本 → 缓冲流的块（含双音色按引号标注旁白/对话）。 */
-  function buildChunkPieces(text: string): Array<{ text: string; type: SpeechChunkType }> {
+  /**
+   * 一段文本 → 缓冲流的块（含双音色按引号 / 说话人冒号标注旁白/对话）。
+   *
+   * 必须**先切旁白/对话段、再按长度切块**（见 `buildSpeechChunkPieces` 的说明）：
+   * 反过来先按句号切块再逐块认引号，一段长对话的后续小块会丢掉引号上下文，
+   * 于是前半句用对话音色、后半句突然变旁白。
+   *
+   * `openCloser` / 返回值里的 `openCloser` 用于跨段对话：上一段只有开引号时，
+   * 下一段要从对话中续读。
+   */
+  function buildChunkPieces(
+    text: string,
+    openCloser: string | null = null,
+  ): { pieces: Array<{ text: string; type: SpeechChunkType }>; openCloser: string | null } {
     // openai / edge / msdemo 都是「一次网络合成一段音频」：按句切成 ≤70 字的块，
     // 首播只需等第一小块；http 引擎的请求按整段模板展开，切碎反而增加请求数，故不切。
     const sentenceChunked = store.speechConfig.provider === 'openai'
@@ -561,16 +579,12 @@ export function useReaderAutoPlayback(
       || store.speechConfig.provider === 'msdemo'
     // 纯标点的块（`……`、只剩引号的 `“……”`）在线服务不会返回音频，发给后端只会
     // 换来错误并可能打断整段朗读，这里直接丢弃；整段都被丢弃时上层会跳过该段。
-    const pieces = (sentenceChunked ? buildSpeechChunksFromText(text) : [text.trim()])
-      .filter((piece) => hasSpeakableContent(piece))
-    if (!store.speechConfig.dualVoiceEnabled) {
-      return pieces.map((piece) => ({ text: piece, type: 'narration' as const }))
-    }
-    return pieces.flatMap((piece) => (
-      splitSpeechSegments(piece)
-        .filter((segment) => hasSpeakableContent(segment.text))
-        .map((segment) => ({ text: segment.text, type: segment.type }))
-    ))
+    const { pieces, openCloser: nextOpenCloser } = buildSpeechChunkPieces(text, {
+      dualVoice: store.speechConfig.dualVoiceEnabled,
+      sentenceChunked,
+      openCloser,
+    })
+    return { pieces, openCloser: nextOpenCloser }
   }
 
   /** 段落属于哪一章：连续阅读模式下本章之外还有别的章节 DOM。 */
@@ -594,6 +608,8 @@ export function useReaderAutoPlayback(
     const startIndex = Math.max(0, list.indexOf(startParagraph))
     const domParagraphs: HTMLElement[] = []
     const units: SpeechStreamUnit[] = []
+    // 跨段对话：上一段结束时还在引号里，下一段开头就仍算对话。
+    let openCloser: string | null = null
     for (let index = startIndex; index < list.length; index += 1) {
       const paragraph = list[index]
       if (paragraphChapterIndex(paragraph) !== chapterIndex) break
@@ -601,7 +617,9 @@ export function useReaderAutoPlayback(
       if (!text) continue
       const paragraphIndex = domParagraphs.length
       domParagraphs.push(paragraph)
-      for (const piece of buildChunkPieces(text)) {
+      const built = buildChunkPieces(text, openCloser)
+      openCloser = built.openCloser
+      for (const piece of built.pieces) {
         units.push({ ...piece, chapterIndex, paragraphIndex })
       }
     }
@@ -624,8 +642,12 @@ export function useReaderAutoPlayback(
     const paragraphs = splitChapterContentIntoParagraphs(processed)
     if (!paragraphs.length) return []
     const units: SpeechStreamUnit[] = []
+    // 跨段对话状态只在同一章内传递：换章时对话本来就会被章节切开。
+    let openCloser: string | null = null
     paragraphs.forEach((paragraphText, paragraphIndex) => {
-      for (const piece of buildChunkPieces(paragraphText)) {
+      const built = buildChunkPieces(paragraphText, openCloser)
+      openCloser = built.openCloser
+      for (const piece of built.pieces) {
         units.push({ ...piece, chapterIndex: nextChapter, paragraphIndex })
       }
     })
@@ -674,6 +696,92 @@ export function useReaderAutoPlayback(
       activeSpeechStream = null
     }
     store.attachSpeechStreamControls(null)
+  }
+
+  /**
+   * TTS 自己发起的切章：期间的 `currentIndex` 变化不能被当成「用户跳章」。
+   *
+   * 朗读跨章要调 `nextChapter()`，它和用户按「下一章」走的是同一条路 —— 不包这一层
+   * 的话，跟随 watcher 会把 TTS 自己的推进当成用户操作，反复重启朗读。
+   */
+  async function runSpeechDrivenChapterChange<T>(action: () => T | Promise<T>): Promise<T> {
+    speechDrivenChapterChange = true
+    try {
+      return await action()
+    } finally {
+      speechDrivenChapterChange = false
+    }
+  }
+
+  /**
+   * 取消「跳章跟随」：既清掉防抖定时器，也让已经进入「等正文」循环的那一次失效。
+   *
+   * 用递增序号而不是布尔量：用户可能连续拖进度条（多次跟随）或中途按停止，
+   * 序号一变，之前挂起的等待就会自行退出，不会在几秒后突然开始朗读。
+   */
+  function cancelChapterJumpFollow() {
+    chapterFollowSeq += 1
+    if (chapterJumpFollowTimer !== null) {
+      clearTimeout(chapterJumpFollowTimer)
+      chapterJumpFollowTimer = null
+    }
+  }
+
+  /**
+   * 用户手动换了章节（目录 / 上下一章 / 拖进度条）而朗读还在进行时，朗读跟着换到
+   * 新章开头。
+   *
+   * 不做这件事的后果：缓冲流继续播旧章的音频，高亮因为找不到对应 DOM 而静默不动，
+   * 直到旧章剩余块播完、流想跨章时才发现索引不符而停止 —— 用户体感是「朗读卡在
+   * 原地不跟」。
+   */
+  function followUserChapterJump() {
+    cancelChapterJumpFollow()
+    const seq = chapterFollowSeq
+    chapterJumpFollowTimer = window.setTimeout(() => {
+      chapterJumpFollowTimer = null
+      if (speechDrivenChapterChange || seq !== chapterFollowSeq) return
+      // 暂停状态要在防抖之后再读：用户可能在这 320ms 里按了暂停/继续。
+      const wasPaused = store.isPaused
+      // 先把旧流彻底停掉（在途合成 + 两个 <audio> + objectURL 都释放）。
+      cancelSpeechTransition()
+      stopSpeechStream()
+      store.stopTTS(false)
+      resetSpeechChunkState()
+      clearReadingClass()
+      // 暂停中跳章：只丢掉旧位置，不自动出声；下次点播放从新章开头开始。
+      if (wasPaused) return
+      void startSpeechAtChapterStart(seq)
+    }, CHAPTER_JUMP_FOLLOW_DEBOUNCE_MS)
+  }
+
+  /**
+   * 等新章正文渲染出来后，从第一段开始朗读。
+   *
+   * 预算按「网络章节」给足：换章要等书源返回正文，慢的时候好几秒。等待期间用户
+   * 按停止/又跳了别的章会让序号变化（见 `cancelChapterJumpFollow`），这里立即放弃。
+   *
+   * 起点必须是**目标章**的第一段：连续阅读的 DOM 里同时挂着上一章/下一章，直接取
+   * `getFilteredParagraphs()[0]` 会从上一章开头读起（`collectDomSpeechUnits` 只收
+   * 当前章，于是立刻返回空、掉进逐段跳过的慢路径，新章迟迟不开始）。
+   */
+  async function startSpeechAtChapterStart(seq: number) {
+    const targetChapter = store.currentIndex
+    for (let attempt = 0; attempt < CHAPTER_JUMP_FOLLOW_RETRY; attempt += 1) {
+      if (seq !== chapterFollowSeq) return
+      await nextTick()
+      if (seq !== chapterFollowSeq) return
+      if (store.currentIndex !== targetChapter) return
+      if (!store.loading) {
+        const first = getFilteredParagraphs()
+          .find((paragraph) => paragraphChapterIndex(paragraph) === targetChapter) || null
+        if (first?.isConnected && first.innerText.trim()) {
+          startSpeech(first, true)
+          return
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, CHAPTER_JUMP_FOLLOW_RETRY_INTERVAL_MS))
+    }
   }
 
   function startBufferedSpeech(paragraph: HTMLElement, interruptCurrent: boolean) {
@@ -737,7 +845,7 @@ export function useReaderAutoPlayback(
             stopSpeechStream()
             return
           }
-          await nextChapter()
+          await runSpeechDrivenChapterChange(() => nextChapter())
           if (session.stopped) return
         }
         if (store.currentIndex !== nextChapterIndex) {
@@ -891,7 +999,7 @@ export function useReaderAutoPlayback(
     if (resetChunks) {
       resetSpeechChunkState()
     }
-    Promise.resolve(nextChapter())
+    Promise.resolve(runSpeechDrivenChapterChange(() => nextChapter()))
       .then(() => {
         speechRestartTimer = window.setTimeout(() => {
           if (store.isPaused) {
@@ -905,6 +1013,22 @@ export function useReaderAutoPlayback(
       .catch(() => {
         isSpeechTransitioning = false
       })
+  }
+
+  /**
+   * 标记「这次 `currentIndex` 变化是滚动反推出来的」。
+   *
+   * 连续阅读模式下 `handleScroll` 按视口位置反推当前章，改索引的有可能是 TTS 自己
+   * 的自动滚动（滚到章边界），也有可能是用户滚动。只靠时间窗口分不开，所以由
+   * 滚动方显式标记来源，watcher 消费一次即复位（见 `isSpeechSelfScroll`）。
+   */
+  function markChapterChangeFromScroll() {
+    scrollDrivenChapterChange = true
+  }
+
+  /** 用户手动输入（滚轮/触摸/按键/点击）：此后的滚动不再算 TTS 自动滚动。 */
+  function markManualReadingInput() {
+    lastUserInputAt = Date.now()
   }
 
   function startSpeech(paragraph?: HTMLElement | null, interruptCurrent = true) {
@@ -1003,7 +1127,7 @@ export function useReaderAutoPlayback(
       return
     }
     store.stopTTS(false)
-    Promise.resolve(prevChapter()).then(() => {
+    Promise.resolve(runSpeechDrivenChapterChange(() => prevChapter())).then(() => {
       window.setTimeout(() => {
         const list = getFilteredParagraphs()
         restartSpeechTarget(list[list.length - 1] || null)
@@ -1032,7 +1156,7 @@ export function useReaderAutoPlayback(
     if (interruptCurrent) {
       store.stopTTS(false)
     }
-    Promise.resolve(nextChapter()).then(() => {
+    Promise.resolve(runSpeechDrivenChapterChange(() => nextChapter())).then(() => {
       window.setTimeout(() => {
         restartSpeechTarget(getFilteredParagraphs()[0] || null)
       }, 120)
@@ -1071,6 +1195,7 @@ export function useReaderAutoPlayback(
 
   function disposeAutoPlayback() {
     cancelSpeechTransition()
+    cancelChapterJumpFollow()
     stopAutoScroll()
     // 组件卸载（离开阅读页）时必须把缓冲流停掉：它持有 audio 与在途请求，
     // 不清理会继续出声，而用户已经没有任何入口关掉它。
@@ -1079,7 +1204,52 @@ export function useReaderAutoPlayback(
 
   // 换书/关闭书籍时文本与 DOM 都变了，仍在跑的流（含跨章预取）必须终止。
   watch(() => store.book?.bookUrl, (bookUrl, previous) => {
-    if (previous && bookUrl !== previous) stopSpeechStream()
+    if (previous && bookUrl !== previous) {
+      cancelChapterJumpFollow()
+      stopSpeechStream()
+    }
+  })
+
+  // 任何「真正停止朗读」的入口（面板停止按钮 / 快捷键 / 定时停止 / 关闭听书面板）
+  // 都要取消还没落地的跳章跟随：那条跟随会在正文加载完之后自己开始朗读，
+  // 用户按了停止却过几秒又出声，是明显的行为倒退。
+  const removeSpeechStopListener = store.addSpeechStopListener(() => {
+    cancelChapterJumpFollow()
+  })
+  // 组件卸载时摘掉监听：store 是全局单例，不摘会一直持有已销毁组件的闭包。
+  if (getCurrentScope()) onScopeDispose(removeSpeechStopListener)
+
+  /**
+   * 朗读进行中用户手动换章 → 让朗读跟到新章开头。
+   *
+   * 覆盖所有会改 `currentIndex` 的用户入口（目录、上一章/下一章、进度条拖拽、
+   * 连续阅读里滚过章边界）：它们最终都只改索引，不经过朗读 —— 所以盯索引是唯一
+   * 不漏的做法。
+   */
+  watch(() => store.currentIndex, (next, previous) => {
+    if (next === previous) return
+    // 暂停时流还在（只是没在出声），同样要停掉旧位置，否则恢复播放会接着播旧章。
+    const hasSpeechSession = !!speechStreamSession
+      || !!activeSpeechStream
+      || store.isSpeaking
+      || store.isPaused
+    // 「TTS 自己滚动会改索引」只发生在连续阅读模式：其它模式里 TTS 滚动正文不会
+    // 动 currentIndex，不必让这个保护窗口把用户的真实跳章也挡掉。
+    const selfScroll = isContinuousMode.value && isSpeechSelfScroll({
+      scrollDriven: scrollDrivenChapterChange,
+      now: Date.now(),
+      lastSpeechScrollAt: lastSpeechOwnScrollAt,
+      lastUserInputAt,
+    })
+    // 来源标记是一次性的：无论这次跟不跟，都别留在下一次索引变化上。
+    scrollDrivenChapterChange = false
+    if (!shouldFollowChapterJump({
+      speechDriven: speechDrivenChapterChange,
+      hasSpeechSession,
+      transitioning: isSpeechTransitioning,
+      selfScroll,
+    })) return
+    followUserChapterJump()
   })
 
   return {
@@ -1093,6 +1263,11 @@ export function useReaderAutoPlayback(
     speechNext,
     restartSpeechFromCurrentParagraph,
     cancelSpeechTransition,
+    /** 用户按停止/关闭听书时调用：取消还没落地的跳章跟随，避免几秒后自己开始朗读。 */
+    cancelPendingChapterFollow: cancelChapterJumpFollow,
+    /** 供 ReaderView 的滚动处理标记「这次索引变化来自滚动」与用户手动输入。 */
+    markChapterChangeFromScroll,
+    markManualReadingInput,
     disposeAutoPlayback,
   }
 }
