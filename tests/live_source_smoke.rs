@@ -192,7 +192,6 @@ fn is_live_smoke_candidate(value: &Value) -> bool {
         "H动漫",
         "91",
         "Porna",
-        "cool18",
         "漫画",
         "听书",
         "订阅源",

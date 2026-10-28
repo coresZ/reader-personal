@@ -1133,7 +1133,7 @@ function formatChapterHtml(rawText: string) {
       paragraph.style.marginBottom = `${config.value.paragraphSpacing}em`
       paragraph.classList.toggle('reader-indent', config.value.firstLineIndent)
     })
-    // 章节里「有 <p>」不代表整章都成段: 番茄系书源只在插图下方给署名加一个
+    // 章节里「有 <p>」不代表整章都成段: 一类书源只在插图下方给署名加一个
     // `<p>`, 正文主体仍是裸文本行。旧实现以 paragraphs.length 作二选一条件,
     // 于是只要出现任何一个 <p>, 剩余几十上百行裸文本就完全跳过分段处理,
     // 整章塌成一大段(issue #17 的截图正是这种章节)。
@@ -4497,7 +4497,7 @@ watch(
  *
  * 两条都必须写:
  *  1. `max-width: 100%` —— 不溢出正文列。
- *  2. `height: auto` —— 书源图片自带 `width`/`height` 属性(番茄源每张都有),
+ *  2. `height: auto` —— 书源图片自带 `width`/`height` 属性(一类源每张都有),
  *     只限宽不限高时, 浏览器会把**属性里的绝对高度**当最终高度: 一张
  *     1024x576 的图在 380px 宽的列里会被拉成 380x576, 严重变形。
  *

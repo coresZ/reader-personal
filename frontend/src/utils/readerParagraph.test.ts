@@ -46,7 +46,7 @@ describe('splitParagraphs', () => {
     expect(splitParagraphs('<br><br>', options)).toBe('')
   })
 
-  // 裸换行是番茄系书源唯一的分段信号: 整章没有 <p>、没有 <br>,
+  // 裸换行是这类书源唯一的分段信号: 整章没有 <p>、没有 <br>,
   // 段尾只追加行内段评气泡 <img>。此时必须按 \n 分段, 否则整章连成一段。
   describe('bare newlines', () => {
     it('splits on \\n so chapters without <br> still get paragraphs', () => {
@@ -174,7 +174,7 @@ describe('splitParagraphs', () => {
 })
 
 describe('splitParagraphsAroundExisting', () => {
-  // issue #17: 番茄源正文是裸文本行, 只在插图下方给署名加一个 <p>。
+  // issue #17: 该源正文是裸文本行, 只在插图下方给署名加一个 <p>。
   // 旧实现「有 <p> 就整章跳过重组」, 导致其余上百行塌成一段。
   it('reflows bare lines even when the chapter already has a <p>', () => {
     const chapter = [

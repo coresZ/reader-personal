@@ -590,47 +590,64 @@ fn percent_encode_query_bytes(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// 编码表单型 POST 正文（legado 的 `AnalyzeUrl.analyzeFields`）。
+///
+/// **`charset` 必须参与编码**：legado 的 `encodeParams(fieldsTxt, charset, false)`
+/// 会把每个键值按声明字符集 `URLEncoder.encode` —— 书源写 `"charset": "GBK"`
+/// 时正文发的是 GBK 百分号编码。此前不论 `charset` 一律按 UTF-8 编码，站点按
+/// GBK 解码就成了乱码关键词，搜索稳定返回「无结果」（发现页正常，因为走 GET）。
 fn encode_post_body(body: &str, charset: Option<&str>, has_content_type: bool) -> String {
     let trimmed = body.trim_start();
     if has_content_type
         || trimmed.starts_with('{')
         || trimmed.starts_with('[')
         || trimmed.starts_with('<')
-        || body.contains('%')
     {
         return body.to_string();
     }
-    if charset
-        .map(|value| value.eq_ignore_ascii_case("escape"))
-        .unwrap_or(false)
-    {
-        return body
-            .split('&')
-            .map(|part| encode_form_part(part, true))
-            .collect::<Vec<_>>()
-            .join("&");
-    }
     body.split('&')
-        .map(|part| encode_form_part(part, false))
+        .map(|part| encode_form_part(part, charset))
         .collect::<Vec<_>>()
         .join("&")
 }
 
-fn encode_form_part(part: &str, escape: bool) -> String {
+fn encode_form_part(part: &str, charset: Option<&str>) -> String {
     let mut pieces = part.splitn(2, '=');
     let key = pieces.next().unwrap_or_default();
     let value = pieces.next();
-    let enc = |input: &str| {
-        if escape {
-            escape_encode(input)
-        } else {
-            urlencoding::encode(input).into_owned()
-        }
-    };
     match value {
-        Some(value) => format!("{}={}", enc(key), enc(value)),
-        None => enc(key),
+        Some(value) => format!(
+            "{}={}",
+            encode_form_value(key, charset),
+            encode_form_value(value, charset)
+        ),
+        None => encode_form_value(key, charset),
     }
+}
+
+/// 单个表单键/值的编码。
+///
+/// 已带 `%` 的片段视为调用方自己编好了，原样保留 —— 与 legado 的
+/// `NetworkUtils.encodedForm(value)` 快速路径一致（它只在未声明 charset
+/// 时启用；声明了 charset 的源本就该由这里统一编码）。
+fn encode_form_value(input: &str, charset: Option<&str>) -> String {
+    if input.is_empty() || input.contains('%') {
+        return input.to_string();
+    }
+    let Some(charset) = charset.map(str::trim).filter(|value| !value.is_empty()) else {
+        return urlencoding::encode(input).into_owned();
+    };
+    if charset.eq_ignore_ascii_case("escape") {
+        return escape_encode(input);
+    }
+    if charset.eq_ignore_ascii_case("utf-8") || charset.eq_ignore_ascii_case("utf8") {
+        return urlencoding::encode(input).into_owned();
+    }
+    let Some(encoding) = Encoding::for_label(charset.as_bytes()) else {
+        return urlencoding::encode(input).into_owned();
+    };
+    let (bytes, _, _) = encoding.encode(input);
+    percent_encode_query_bytes(&bytes)
 }
 
 fn escape_encode(input: &str) -> String {
@@ -818,5 +835,46 @@ mod tests {
         let options = parse_url_options(r#"{"method":"GET","retry":2,}"#);
         // 严格 JSON 拒绝尾逗号，JS 引擎接受 —— 两者之一成功即可。
         assert!(options.is_ok(), "尾逗号选项应当可解析");
+    }
+
+    /// POST 表单正文必须按书源声明的 `charset` 编码。
+    ///
+    /// 书源把 `"charset": "GBK"` 写在搜索 URL 的选项里，站点按 GBK 解码关键词。
+    /// 早先正文一律按 UTF-8 编码，站点拿到的是一串乱码，于是「搜索永远无结果，
+    /// 但发现页正常」（发现页走 GET，编码路径是另一条）。
+    #[test]
+    fn post_body_uses_declared_charset() {
+        let body = encode_post_body("submit=&type=articlename&s=我的", Some("GBK"), false);
+        assert_eq!(body, "submit=&type=articlename&s=%CE%D2%B5%C4");
+        // 英文/ASCII 部分不受影响。
+        assert!(body.starts_with("submit=&type=articlename&s="));
+    }
+
+    /// 声明 UTF-8（或不声明）时仍走 UTF-8 百分号编码。
+    #[test]
+    fn post_body_defaults_to_utf8() {
+        for charset in [None, Some("UTF-8"), Some("utf8")] {
+            let body = encode_post_body("s=我的", charset, false);
+            assert_eq!(body, "s=%E6%88%91%E7%9A%84", "charset={charset:?}");
+        }
+    }
+
+    /// 已带 `%xx` 的片段原样保留，避免二次编码。
+    #[test]
+    fn post_body_keeps_preexisting_percent_escapes() {
+        let body = encode_post_body("s=%E6%88%91&x=1", Some("UTF-8"), false);
+        assert_eq!(body, "s=%E6%88%91&x=1");
+    }
+
+    /// 调用方自带 `Content-Type`（例如 JSON）时不得改动正文。
+    #[test]
+    fn post_body_untouched_when_content_type_given() {
+        let raw = r#"{"key":"我的"}"#;
+        assert_eq!(encode_post_body(raw, Some("GBK"), true), raw);
+        // 结构体正文（JSON/XML）也不编码。
+        assert_eq!(
+            encode_post_body(r#"{"key":"我的"}"#, Some("GBK"), false),
+            r#"{"key":"我的"}"#
+        );
     }
 }

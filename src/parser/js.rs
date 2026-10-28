@@ -468,6 +468,23 @@ pub fn element_binding(value: &serde_json::Value) -> JsonValue {
     ))
 }
 
+/// 构造 `Elements`（元素集合）语义的绑定值。
+///
+/// 与 [`element_binding`] 的区别：legado 在**列表规则**的 JS 段里把 `result`
+/// 绑定成整个 `Elements`（可以 `toArray()` / `size()` / 索引），而不是单个元素。
+/// 书源据此做批量过滤：
+///   `list = result.toArray(); for (i in list) { re.test(list[i]) ? html += list[i] : '' }`
+/// 只绑单个元素或纯 JSON 数组时 `toArray()` 不存在，脚本第二行就中断。
+pub const ELEMENTS_BINDING_PREFIX: &str = "@elements:";
+
+/// 构造元素集合绑定值（快照数组 + 标记前缀）。
+pub fn elements_binding(values: &[serde_json::Value]) -> JsonValue {
+    JsonValue::String(format!(
+        "{ELEMENTS_BINDING_PREFIX}{}",
+        serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
+    ))
+}
+
 pub fn eval_js_with_bindings(
     script: &str,
     input: &str,
@@ -1011,6 +1028,72 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.logType = function (m) { g.__log('log', typeof m); };
   J.toast = function (m) { g.__log('toast', S(m)); };
   J.longToast = J.toast;
+
+  // ── `java.webView(html, url, js[, cacheFirst])` ──
+  // legado 里它把 HTML 交给后台 WebView 渲染（执行页面脚本）后再取内容，
+  // 书源用它应付「正文由 JS 动态注入」的站点。
+  //
+  // 桌面端没有可用的隐藏 WebView 通道（渲染层在 WebView2，规则在 Rust 侧的
+  // rquickjs 沙盒里跑，两边不能同步往返），因此这里做**降级等价实现**：
+  //   1. 有 html 时直接当文档用 —— 绝大多数书源传进来的就是已经抓到的响应，
+  //      而 HTML 本身已含正文（脚本只是把它们显示出来），静态 DOM 一样能选到；
+  //   2. html 为空或按 js 取不到内容时，用 url 重新抓一次页面再解析。
+  // 关键点是**不能抛错**：`java.webView` 缺失时脚本第一行就 "not a function"，
+  // 整条正文规则中断，界面表现成「正文永远加载不出来」。
+  //
+  // 语义对齐 `BackstageWebView`：`js` 为空 → 返回 `document.documentElement.outerHTML`；
+  // 给了 `js` → 返回该表达式的结果。
+  function webViewEvalDocument(html, js) {
+    var doc = Jsoup.parse(S(html));
+    var script = S(js).trim();
+    if (!script) return S(html);
+    try {
+      // 脚本在文档作用域里跑：把常用宿主对象喂进闭包。
+      var fn = new Function('document', 'window', 'java', 'result', 'return (' + script + '\n);');
+      var value = fn(doc, { document: doc }, J, S(html));
+      return value === undefined || value === null ? '' : S(value);
+    } catch (_e) {
+      try {
+        var fn2 = new Function('document', 'window', 'java', 'result', script);
+        var value2 = fn2(doc, { document: doc }, J, S(html));
+        return value2 === undefined || value2 === null ? '' : S(value2);
+      } catch (_e2) {
+        return '';
+      }
+    }
+  }
+  J.webView = function (html, url, js, cacheFirst) {
+    var text = html === undefined || html === null ? '' : S(html);
+    if (text) {
+      var rendered = webViewEvalDocument(text, js);
+      if (S(rendered).trim()) return rendered;
+    }
+    var target = url === undefined || url === null ? '' : S(url).trim();
+    if (!target) return text;
+    try {
+      var fresh = S(Resp(g.__http('GET', target, '', requestHeaders(), true)).body);
+      if (!fresh) return text;
+      return webViewEvalDocument(fresh, js) || fresh;
+    } catch (_e) {
+      return text;
+    }
+  };
+  // `webViewGetSource*` / `webViewGetOverrideUrl*`: 取资源地址/跳转地址的变体。
+  // 桌面端不做嗅探，直接按同样的降级路径求值；取不到就返回空串（legado 的
+  // 这些方法在超时/无匹配时也返回空，书源据此走 `||` 兜底分支）。
+  J.webViewGetSource = function (html, url, js, sourceRegex, cacheFirst) {
+    var rendered = J.webView(html, url, js, cacheFirst);
+    var pattern = S(sourceRegex);
+    if (!pattern) return rendered;
+    try {
+      var match = S(rendered).match(new RegExp(pattern));
+      return match ? S(match[0]) : '';
+    } catch (_e) {
+      return '';
+    }
+  };
+  J.webViewGetOverrideUrl = J.webViewGetSource;
+
   J.showBrowser = function (u, html, preloadJs, options) {
     g.__show_browser(S(u), html === undefined || html === null ? '' : S(html),
                      preloadJs === undefined || preloadJs === null ? '' : S(preloadJs),
@@ -1289,6 +1372,19 @@ const JS_PRELUDE: &str = r#"(function (g) {
     for (var i = 0; i < list.length; i++) out.push(wrapElement(list[i], owner));
     return out;
   }
+  // 宿主注入 `@elements:` 绑定时要拿到带 JSoup 方法的集合, 而不只是裸数组。
+  // 入参既可能是 JSON 文本, 也可能已经是数组(宿主先 `JSON.parse` 过一次) ——
+  // 后者若再 `JSON.parse` 会得到空集合, 书源里的 `result.size()` 恒为 0。
+  g.__wrapElements = function (value) {
+    var list = value;
+    if (typeof list === 'string') {
+      try { list = JSON.parse(list); } catch (e) { return elementsApi([]); }
+    }
+    if (!list || typeof list.length !== 'number') return elementsApi([]);
+    var out = [];
+    for (var i = 0; i < list.length; i++) out.push(wrapElement(list[i], null));
+    return elementsApi(out);
+  };
   // legado 的 `java.getElements` 返回 `Elements`(JSoup), 书源按 Java 方法调用:
   // `list.size()` / `list.get(i)` / `list.isEmpty()`。只返回普通数组时这些
   // 调用会抛 "not a function", 整条 chapterList 脚本报错 → 目录 0 章。
@@ -1374,6 +1470,22 @@ const JS_PRELUDE: &str = r#"(function (g) {
         out.push(list[i] && typeof list[i].clone === 'function' ? list[i].clone() : list[i]);
       }
       return elementsApi(out);
+    });
+    // `Elements.toArray()`：JSoup 返回 `Element[]`（Java 数组）。书源会拿它
+    // 做**逐条文本过滤**再重新拼 HTML，例如
+    //   `list = result.toArray(); re = new RegExp(key);`
+    //   `for (i in list) { re.test(list[i]) ? html += list[i] : '' }`
+    // 少这个方法时脚本在第二行就抛 "not a function"，整条 bookList 中断 ——
+    // 症状是搜索**恒为 0 条**，而发现页（不走这段脚本）正常。
+    // 传了数组参数时按 JSoup 语义填充该数组并返回它。
+    def('toArray', function (target) {
+      var out = [];
+      for (var i = 0; i < list.length; i++) out.push(list[i]);
+      if (target && typeof target.length === 'number') {
+        for (var j = 0; j < out.length && j < target.length; j++) target[j] = out[j];
+        return target;
+      }
+      return out;
     });
     def('eq', function (index) {
       return list[index] === undefined ? elementsApi([]) : elementsApi([list[index]]);
@@ -1680,6 +1792,14 @@ const JS_PRELUDE: &str = r#"(function (g) {
     list.outerHtml = function () { return list.length ? list[0].outerHtml() : ''; };
     list.select = function (rule) { return jsoupElementsFromElements(list, rule); };
     list.toString = function () { return list.map(function (el) { return el.outerHtml(); }).join(''); };
+    // `Elements.toArray()`：书源用它逐条过滤后再拼回 HTML（见 `elementsApi`
+    // 里同名方法的注释）。`jsoupElements` 与 `elementsApi` 是两套包装，方法要
+    // 各自补齐，否则 `doc.select(...).toArray()` 仍会抛 "not a function"。
+    list.toArray = function () {
+      var out = [];
+      for (var i = 0; i < list.length; i++) out.push(list[i]);
+      return out;
+    };
     // 关键: 规则以 `els` 结尾返回时, 宿主需要**元素快照数组**才能继续按
     // name/author/bookUrl 等字段规则取值。没有 toJSON 时会被序列化成
     // "[object Object],[object Object]" 而解析出 0 本(这是常见症状)。
@@ -2383,7 +2503,7 @@ fn eval_js_inner_with_source(
         .is_some_and(|value| !value.trim().is_empty());
     if !has_book_url {
         // 只取解析期登记的书籍 URL；绝不回退成书源地址，否则 `book.bookUrl`
-        // 会被污染成 `https://s.chuangke.tv` 这类书源地址。
+        // 会被污染成 `https://source.example` 这种书源地址。
         let fallback = ACTIVE_BOOK_URL.with(|cell| cell.borrow().clone());
         if let Some(value) = fallback.filter(|value| !value.trim().is_empty()) {
             book_ctx.book["bookUrl"] = json!(value);
@@ -3046,6 +3166,25 @@ fn eval_js_inner_with_source(
                     globals.set(key.as_str(), js_value)?;
                     continue;
                 }
+                // `@elements:` 前缀: 值是**元素快照数组**, 按 JSoup `Elements`
+                // 语义包装 —— 列表规则的 JS 段里 `result` 就是这个类型
+                // (`result.toArray()` / `result.size()` / `result[i]`)。
+                if let Some(raw) = value
+                    .as_str()
+                    .filter(|raw| raw.starts_with(ELEMENTS_BINDING_PREFIX))
+                {
+                    // 前缀里承载的是一段 **JSON 文本**（数组）：先解成数组对象，
+                    // 再交给 `__wrapElements` 逐项包装成 JSoup 元素。
+                    let literal =
+                        serde_json::to_string(raw.trim_start_matches(ELEMENTS_BINDING_PREFIX))
+                            .unwrap_or_else(|_| "\"[]\"".to_string());
+                    let js_value = eval_script(
+                        ctx.clone(),
+                        &format!("__wrapElements(JSON.parse({literal}))"),
+                    )?;
+                    globals.set(key.as_str(), js_value)?;
+                    continue;
+                }
                 // `@element:` 前缀: 值是**元素快照**, 必须按 JSoup Element 语义
                 // 包装, 书源才能对它调用 select()/html()/text()/attr()。
                 if let Some(raw) = value
@@ -3101,7 +3240,31 @@ fn eval_js_inner_with_source(
 
         // Block scope lets consecutive rules redeclare let/const, while var
         // bindings such as `var result = result || {}` retain the host value.
+        //
+        // `__inputSnapshot` 用来判断脚本有没有改写 `result`（见下）。
+        eval_script(ctx.clone(), "globalThis.__inputSnapshot = result; undefined")?;
         let v = eval_script(ctx.clone(), &format!("{{\n{script}\n}}"))?;
+        // Rhino（legado 手机端）的脚本求值返回**最后一条有值的语句**的结果，
+        // 而不是 ECMAScript 的「完成值」。差别只在「末尾是空完成语句」时暴露：
+        //
+        //   var raw = texts.join('\n\n');
+        //   result = decodeText(raw);                    // ← 有值
+        //   if (result.length < 500) { result += "…"; }  // ← 条件为假，空完成
+        //
+        // QuickJS 按规范把最后那条**空完成**当作脚本值（`undefined`），于是
+        // 前面算好的正文被整个丢掉 —— 症状是正文恒空、日志里没有任何异常。
+        //
+        // 回退到「脚本改写过 `result` 就用它」：书源脚本的通用契约就是
+        // 「输入 `result` → 输出 `result`」，赋值后的值才是它想交出的结果。
+        // 脚本没碰过 `result` 时保持 `undefined`，不把输入原文当输出。
+        let v = if v.is_undefined() || v.is_null() {
+            eval_script(
+                ctx.clone(),
+                "result !== globalThis.__inputSnapshot ? result : undefined",
+            )?
+        } else {
+            v
+        };
         globals.set("__result", v)?;
         // String 包装对象 / java.get 响应对象按 legado 语义转成字符串
         // String 包装对象按 legado 语义转成字符串。
@@ -3352,7 +3515,7 @@ fn latin1_string(bytes: &[u8]) -> String {
 /// 在 QuickJS 里求值一段脚本。
 ///
 /// Rhino(legado 手机端用的引擎)允许箭头函数的解构形参省掉圆括号, 书源里就有这种写法
-/// (小小阅读(+++)的 exploreUrl):
+/// (某聚合源的 exploreUrl 就是这种写法):
 ///     rows.map([a, b] => ...)   /   rows.map({a} => ...)
 /// 正式语法(ES2015)要求写成 ([a, b]) / ({a}), QuickJS 按正式语法解析, 直接报
 /// "Unexpected token '=>'", 整个书海报废 —— 而这些源在手机上显示正常。
@@ -5459,7 +5622,7 @@ mod tests {
     fn source_get_key_returns_book_source_url() {
         let source = BookSource {
             book_source_name: "getKey".to_string(),
-            book_source_url: "https://s.chuangke.tv".to_string(),
+            book_source_url: "https://s.book-source.example".to_string(),
             ..Default::default()
         };
         let out = with_source(&source, || {
@@ -5472,7 +5635,7 @@ mod tests {
         });
         assert_eq!(
             out,
-            "https://s.chuangke.tv|https://s.chuangke.tv|https://chapter.chuangke.tv"
+            "https://s.book-source.example|https://s.book-source.example|https://chapter.book-source.example"
         );
     }
 
@@ -5529,11 +5692,11 @@ mod tests {
     fn book_url_stays_distinct_from_source_get_key() {
         let source = BookSource {
             book_source_name: "拆分".to_string(),
-            book_source_url: "https://s.chuangke.tv".to_string(),
+            book_source_url: "https://s.book-source.example".to_string(),
             ..Default::default()
         };
         let ctx = JsBookContext {
-            book: json!({ "name": "捞尸人", "bookUrl": "https://d.chuangke.tv/book/details/v4/1276/1276639.html" }),
+            book: json!({ "name": "示例书籍", "bookUrl": "https://d.book-source.example/book/details/v4/1276/1276639.html" }),
             chapter: json!({}),
         };
         let out = with_book_context(Some(ctx), || {
@@ -5543,7 +5706,7 @@ mod tests {
         });
         assert_eq!(
             out,
-            "https://s.chuangke.tv||https://d.chuangke.tv/book/details/v4/1276/1276639.html"
+            "https://s.book-source.example||https://d.book-source.example/book/details/v4/1276/1276639.html"
         );
     }
 
@@ -5614,7 +5777,7 @@ mod tests {
         assert_eq!(request.html.as_deref(), Some("\u{1F600}"));
     }
     /// Rhino(legado 手机端)允许箭头函数解构形参省掉圆括号, 正式语法不允许。
-    /// 小小阅读(+++)的 exploreUrl 写成 rows.map([title, gender, list] => {...}),
+    /// 一类聚合源的 exploreUrl 写成 rows.map([title, gender, list] => {...}),
     /// QuickJS 直接报 "Unexpected token '=>'" 让整个书海报废 —— 手机上却正常。
     /// 解析失败后必须能补上括号重试, 把手机端能跑的脚本救回来。
     #[test]

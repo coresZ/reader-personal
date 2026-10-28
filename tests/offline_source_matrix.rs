@@ -1,4 +1,4 @@
-// 源仓库批量离线兼容性探测（tmp_probe/yck-*.json 由本地脚本下载，不入库）。
+// 源仓库批量离线兼容性探测（tmp_probe/source-*.json 由本地脚本下载，不入库）。
 // 覆盖：反序列化、jsLib 在 rquickjs 沙盒加载、loginUi 解析、loginUrl 各形态识别、
 // 搜索/详情/目录/正文四段规则的字符串提取与 JS 规则语法编译。
 // 不发任何网络请求；jsLib 顶层加载不含 IO 副作用（已逐个人工核对顶层语句）。
@@ -16,7 +16,7 @@ fn load_sources() -> Vec<(String, BookSource)> {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("yck-") || !name.ends_with(".json") {
+        if !name.starts_with("source-") || !name.ends_with(".json") {
             continue;
         }
         let raw = match std::fs::read_to_string(entry.path()) {
@@ -58,9 +58,9 @@ fn load_sources() -> Vec<(String, BookSource)> {
 }
 
 #[test]
-fn yckceo_sources_deserialize_and_load_jslib() {
+fn offline_sources_deserialize_and_load_jslib() {
     let sources = load_sources();
-    assert!(!sources.is_empty(), "tmp_probe/yck-*.json 样本不存在");
+    assert!(!sources.is_empty(), "tmp_probe/source-*.json 样本不存在");
     eprintln!("共 {} 个书源样本", sources.len());
 
     let mut results: Vec<String> = Vec::new();
@@ -101,7 +101,7 @@ fn yckceo_sources_deserialize_and_load_jslib() {
 }
 
 #[test]
-fn yckceo_sources_login_ui_parses() {
+fn offline_sources_login_ui_parses() {
     let sources = load_sources();
     let mut lenient_needed: Vec<String> = Vec::new();
     for (name, source) in &sources {
@@ -125,7 +125,7 @@ fn yckceo_sources_login_ui_parses() {
 }
 
 #[test]
-fn yckceo_sources_rule_strings_compile() {
+fn offline_sources_rule_strings_compile() {
     let sources = load_sources();
     let engine = reader_rust::parser::rule_engine::RuleEngine::new().unwrap();
     for (name, source) in &sources {
@@ -145,17 +145,17 @@ fn yckceo_sources_rule_strings_compile() {
 }
 
 /// 在线 smoke：对 js/登录重度源跑真实「搜索→详情→目录→正文」管线。
-/// 运行：cargo test --test yckceo_source_matrix yckceo_heavy_sources_live_smoke -- --ignored --nocapture
+/// 运行：cargo test --test offline_source_matrix offline_heavy_sources_live_smoke -- --ignored --nocapture
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "hits public book sites live"]
-async fn yckceo_heavy_sources_live_smoke() {
+async fn offline_heavy_sources_live_smoke() {
     use reader_rust::crawler::http_client::HttpClient;
     use reader_rust::parser::rule_engine::RuleEngine;
     use reader_rust::service::book_service::BookService;
     use reader_rust::storage::cache::file_cache::FileCache;
 
     // 挑选覆盖面: 重度依赖 JS 的源 + 带登录页的源 + 结构简单的源作对照
-    let wanted = ["yck-7897.json", "yck-7895.json", "yck-7813.json", "yck-7930.json", "yck-7929.json", "yck-7928.json"];
+    let wanted = ["source-1.json", "source-2.json", "source-3.json", "source-4.json", "source-5.json", "source-6.json"];
     let sources: Vec<(String, BookSource)> = load_sources()
         .into_iter()
         .filter(|(name, _)| wanted.contains(&name.as_str()))

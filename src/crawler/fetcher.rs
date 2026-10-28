@@ -306,8 +306,8 @@ pub(crate) fn decode_body(bytes: &[u8], charset: Option<&str>, content_type: Opt
 
 /// 去掉响应体开头的 BOM。
 ///
-/// 站点偶尔会在 JSON 前面带一个 `\u{FEFF}`（实测 `catalog.chuangke.tv` 的
-/// 目录接口就是）。`serde_json` / JSONPath 会把 BOM 当非法字符，整段解析失败，
+/// 站点偶尔会在 JSON 前面带一个 `\u{FEFF}`（实测某站的目录接口就是）。
+/// `serde_json` / JSONPath 会把 BOM 当非法字符，整段解析失败，
 /// 于是目录和搜索都变成 0 条 —— 阅读页表现为「打开书一直转圈、目录空白」，
 /// 用户只能反复换源。
 ///

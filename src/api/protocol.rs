@@ -605,7 +605,7 @@ async fn fetch_source_panel_page(
     // 下面那条「查书源 → 用书源规则」的路径。它对应手机端 `ReadRssActivity` 的
     // 那个 WebView: `handleCommonSchemes` 对 http/https 返回 false, 也就是
     // 「在原地打开」, 不限制域名。源仓库的二级页面正是跨域跳转
-    // (yckceo.vip → yckceo.com / yck2026.fun), 若沿用书源的同域校验只会得到
+    // (旧域名 → 新域名 / 镜像站), 若沿用书源的同域校验只会得到
     // 「panel target is outside the page domain」。
     if entry.book_source_url.is_empty() {
         return fetch_rss_panel_page(panel_id, entry, &target, request).await;
@@ -1539,12 +1539,31 @@ async fn forward_book_source_request(
         // baseURL `/api`)会被插坏, 变成 `/api/__login/.../site/info`。
         let text = rewrite_login_html_resource_attrs(&text, login_session);
         let harvest = build_cookie_harvest_script(&source.book_source_url, login_session);
-        let injected = if text.contains("</head>") {
-            text.replace("</head>", &format!("{harvest}</head>"))
-        } else if text.contains("</body>") {
-            text.replace("</body>", &format!("{harvest}</body>"))
-        } else {
-            format!("{harvest}{text}")
+        // 文档路径只覆盖首屏; 单页应用后续发的**绝对路径接口请求**(axios 的
+        // baseURL `/api`)与写死域名的接口地址都不带会话段, 拿不到会话就只能
+        // 404 —— 见 `build_login_request_rewrite_script`。脚本必须排在页面
+        // **自己的脚本之前**(要改的就是它们发出去的请求), 因此插在 `<head>`
+        // 标签之后, 而不是 `</head>` 之前 —— 打包产物的主脚本就在 `<head>` 里。
+        let upstream_origin = Url::parse(&source.book_source_url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default();
+        let rewrites = format!(
+            "{}{}",
+            build_login_request_rewrite_script(login_session, &upstream_origin),
+            harvest
+        );
+        let injected = match find_head_end_tag(&text) {
+            Some(end) => {
+                let (head, tail) = text.split_at(end);
+                format!("{head}{rewrites}{tail}")
+            }
+            None => match text.find("</body>") {
+                Some(end) => {
+                    let (body, tail) = text.split_at(end);
+                    format!("{body}{rewrites}{tail}")
+                }
+                None => format!("{rewrites}{text}"),
+            },
         };
         injected.into_bytes()
     } else if is_script_response(content_type.as_deref(), &bytes) {
@@ -2277,6 +2296,99 @@ window.addEventListener("message", function (event) {{
   }};
 }})();
 </script>"#
+    )
+}
+
+/// 找 `<head ...>` 结束位置(标签之后), 用于把注入脚本排在页面脚本之前。
+///
+/// 直接冲 `</head>` 插会排到页面自己的 `<script>` **后面** —— 打包产物的主脚本
+/// 就在 `<head>` 里, 那时 fetch/XHR 的包装已经来不及生效。
+fn find_head_end_tag(html: &str) -> Option<usize> {
+    let lowered = html.to_ascii_lowercase();
+    let start = lowered.find("<head")?;
+    let close = lowered[start..].find('>')?;
+    Some(start + close + 1)
+}
+
+/// 登录页里的**运行时**请求改写脚本（绝对路径请求补会话段）。
+///
+/// 登录 iframe 挂在 `/__login/<session>/<上游路径>` 下，但只有**文档路径**带
+/// 会话段。单页应用里的接口请求用的是绝对路径（axios 把 `baseURL` 设成
+/// `"/api"`），运行时拼出来的是 `http://reader.localhost/api/...` —— 那里没有
+/// 会话段，兜底路由既拿不到会话（WebView2 对自定义协议请求不带 Cookie/Referer），
+/// 也无法还原上游地址，只能 404。
+///
+/// 这正是「单页应用型登录页报 404」的根因：`/user/me` 之类的页面本身能打开
+///（HTML 里的资源属性已补会话段），但页面一取 `/api/user/info` 就 404，
+/// 界面显示成登录失败。
+///
+/// 不能在脚本文本里改：`"/api"` 是 axios 的 baseURL，字符串替换既认不出哪些
+/// 字面量是接口前缀，也会把正则/提示文案里的路径一起改坏。运行时拦截
+/// `fetch` / `XMLHttpRequest` / `sendBeacon` 才能精确处理「真正要发出的请求」。
+fn build_login_request_rewrite_script(login_session: &str, upstream_origin: &str) -> String {
+    let session_json = serde_json::to_string(login_session).unwrap_or_else(|_| "\"\"".to_string());
+    let origin_json = serde_json::to_string(upstream_origin).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"<script>
+(function () {{
+  var session = {session_json};
+  if (!session) return;
+  var upstreamOrigin = {origin_json};
+  var prefix = "/__login/" + encodeURIComponent(session) + "/";
+  var here = location.origin;
+  // 上游文档路径: 当前地址剥掉会话段后的部分。相对路径必须相对**它**解析
+  // (`/__login/<s>/user/me` 里的 `api/x` 是上游的 `/user/api/x`)。
+  var upstreamPath = location.pathname;
+  if (upstreamPath.lastIndexOf(prefix, 0) === 0) upstreamPath = upstreamPath.slice(prefix.length - 1);
+  if (!upstreamPath) upstreamPath = "/";
+  var base = here + upstreamPath;
+  function toSession(url) {{
+    return prefix + url.pathname.replace(/^\//, "") + url.search + url.hash;
+  }}
+  function fix(url) {{
+    try {{
+      if (typeof url !== "string" || !url) return url;
+      // data:/blob:/javascript: 等非 http(s) 协议交给浏览器自己处理。
+      if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url) && !/^https?:/i.test(url)) return url;
+      if (url.lastIndexOf("/__login/", 0) === 0 || url.indexOf(prefix) === 0) return url;
+      var parsed = new URL(url, base);
+      if (parsed.pathname.lastIndexOf(prefix, 0) === 0) return url;
+      // 本站(**reader origin**)与上游域名的请求都要收回代理: 前者是 axios 的
+      // `baseURL` 拼出的绝对路径, 后者是写死域名的接口地址。跨域直连会被
+      // CORS 拦掉, 站点 Cookie 也不在浏览器侧。
+      if (parsed.origin === here) return toSession(parsed);
+      if (upstreamOrigin && parsed.origin === upstreamOrigin) return toSession(parsed);
+      return url;
+    }} catch (_e) {{ return url; }}
+  }}
+  var rawFetch = window.fetch;
+  if (typeof rawFetch === "function") {{
+    window.fetch = function (input, init) {{
+      try {{
+        if (typeof input === "string") {{ input = fix(input); }}
+        else if (input && typeof input.url === "string") {{
+          var fixed = fix(input.url);
+          if (fixed !== input.url) {{ input = new Request(fixed, input); }}
+        }}
+      }} catch (_e) {{}}
+      return rawFetch.call(this, input, init);
+    }};
+  }}
+  var rawOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {{
+    var args = Array.prototype.slice.call(arguments);
+    args[1] = fix(url);
+    return rawOpen.apply(this, args);
+  }};
+  if (navigator.sendBeacon) {{
+    var rawBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) {{ return rawBeacon(fix(url), data); }};
+  }}
+}})();
+</script>
+"#,
+        session_json = session_json,
+        origin_json = origin_json,
     )
 }
 
@@ -3097,6 +3209,43 @@ mod tests {
         assert!(!script.contains("/bookSourceProxy"));
     }
 
+    /// 登录页里单页应用的**绝对路径请求**必须补上会话段。
+    ///
+    /// 登录 iframe 的文档路径带 `/__login/<session>/`, 但 axios 的 `baseURL`
+    /// 是 `"/api"`, 运行时拼出的是 `http://reader.localhost/api/...` —— 没有
+    /// 会话段, 兜底路由认不出会话, 只能 404。「登录报 404」就是这个形态。
+    #[test]
+    fn login_request_rewrite_targets_absolute_paths_only() {
+        let script = build_login_request_rewrite_script("session-a", "https://m.example.site");
+        // 三条拦截都在。
+        assert!(script.contains("window.fetch ="));
+        assert!(script.contains("XMLHttpRequest.prototype.open"));
+        assert!(script.contains("navigator.sendBeacon"));
+        // 只改本站绝对路径: 相对路径与跨域地址保持原样, 已带会话段的不重复加。
+        assert!(script.contains(r#"url.lastIndexOf("/__login/", 0) === 0"#));
+        assert!(script.contains("parsed.origin === here"));
+        // 上游同域的绝对地址也要收回代理(写死域名的接口请求)。
+        assert!(script.contains("parsed.origin === upstreamOrigin"));
+        // 不加 Cookie: 站点 Cookie 只留在后端按书源隔离的 jar 里。
+        assert!(!script.contains("document.cookie"));
+        assert!(!script.contains("/bookSourceProxy"));
+    }
+
+    /// 注入脚本必须排在页面的 `<script>` **之前** 才拦得到请求。
+    #[test]
+    fn login_injection_sits_before_page_scripts() {
+        let html = r#"<html><head><script src="/user/assets/index.js"></script></head><body></body></html>"#;
+        let end = find_head_end_tag(html).expect("<head> 结束位置");
+        assert_eq!(&html[..end], "<html><head>");
+        assert!(html[end..].starts_with(r#"<script src="/user/assets/index.js">"#));
+        assert!(find_head_end_tag("<html><body>x</body></html>").is_none());
+        // 大小写与属性都要认。
+        assert_eq!(
+            find_head_end_tag("<HTML><Head id='a'><script>"),
+            Some("<HTML><Head id='a'>".len())
+        );
+    }
+
     /// HTML 改写只代理同域资源。
     ///
     /// 跨域资源一律保持原样, 由 WebView 自己去取 —— 见 `rewrite_source_panel_html`
@@ -3107,17 +3256,17 @@ mod tests {
         let html = r#"<html><head>
           <link rel="stylesheet" href="https://cdn.other.example/a.css">
           <script src="/static/app.js"></script>
-          <a href="https://yckceo.com/detail/1">跨域详情</a>
+          <a href="https://repo.other.example/detail/1">跨域详情</a>
           <a href="javascript:void(0)">脚本</a>
         </head></html>"#;
-        let page_url = "https://yckceo.vip/";
-        let allowed = "https://yckceo.vip/";
+        let page_url = "https://panel.example.vip/";
+        let allowed = "https://panel.example.vip/";
 
         let output = rewrite_source_panel_html(html, page_url, allowed, "panel-1");
 
         // 同域资源被代回代理。
         assert!(
-            output.contains("__readerPanelUrl=https%3A%2F%2Fyckceo.vip%2Fstatic%2Fapp.js"),
+            output.contains("__readerPanelUrl=https%3A%2F%2Fpanel.example.vip%2Fstatic%2Fapp.js"),
             "同域资源应代回代理: {output}"
         );
         // 跨域资源保持原样, 不经过本进程。
@@ -3129,7 +3278,7 @@ mod tests {
             !output.contains("__readerPanelUrl=https%3A%2F%2Fcdn.other.example"),
             "跨域资源不能被收进代理"
         );
-        assert!(output.contains("https://yckceo.com/detail/1"));
+        assert!(output.contains("https://repo.other.example/detail/1"));
         // 非 http(s) 不改写。
         assert!(output.contains(r#"<a href="javascript:void(0)">"#));
     }
@@ -3139,16 +3288,16 @@ mod tests {
     #[test]
     fn rewrite_source_panel_uses_current_page_domain() {
         let html = r#"<a href="/detail/2">同域</a>"#;
-        // 页面已经从 yckceo.vip 跳到 yckceo.com, 订阅源原始地址仍是 .vip。
+        // 页面已经跳到新域名, 订阅源原始地址仍是旧域名。
         let output = rewrite_source_panel_html(
             html,
-            "https://yckceo.com/",
-            "https://yckceo.vip/",
+            "https://repo.example.com/",
+            "https://repo.example.vip/",
             "panel-1",
         );
 
         assert!(
-            output.contains("__readerPanelUrl=https%3A%2F%2Fyckceo.com%2Fdetail%2F2"),
+            output.contains("__readerPanelUrl=https%3A%2F%2Frepo.example.com%2Fdetail%2F2"),
             "应基于当前页面域改写: {output}"
         );
     }

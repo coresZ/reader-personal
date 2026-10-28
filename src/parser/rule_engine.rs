@@ -186,6 +186,23 @@ impl RuleEngine {
             }
         }
 
+        // 规则里**夹着** `<js>…</js>`（例如 `class.book_cell<js>…</js>a`）：legado 的
+        // `splitSourceRule` 会把它切成「CSS → JS → CSS」三段串联求值，上一段的
+        // 输出是下一段的输入。桌面端早先只认「开头是 js」的形态，这种中间夹 JS
+        // 的规则被整条丢给 CSS 引擎解析 —— 选择器里带 `<js>` 必然选不到，
+        // 症状是**搜索恒为 0 条**（发现页不走这段脚本，所以正常）。
+        if split_rule_segments(list_rule)
+            .iter()
+            .any(|segment| matches!(segment, RuleSegment::Script(_)))
+        {
+            return match eval_list_rule_chain(list_rule, body, base_url) {
+                Some(output) => {
+                    self.collect_search_books_from_html(source, &output, base_url, rule)
+                }
+                None => Vec::new(),
+            };
+        }
+
         match self.detect_mode(list_rule, body) {
             ParseMode::JsonPath => self.search_books_json(source, body, base_url, rule, list_rule),
             ParseMode::XPath => self.search_books_xpath(source, body, base_url, rule, list_rule),
@@ -193,6 +210,22 @@ impl RuleEngine {
             ParseMode::Regex => self.search_books_regex(source, body, base_url, rule, list_rule),
             ParseMode::Css => self.search_books_html(source, body, base_url, rule, list_rule),
         }
+    }
+
+    /// 在一页 HTML 上按 `ruleSearch` 的字段规则收集书籍（HTML 模式）。
+    ///
+    /// 用于「列表规则里夹了 JS」的情形：JS 段已经算好一份 HTML，接下来的 CSS 段
+    /// 是**逐项选择器**，直接作用在这份 HTML 的顶层元素上。
+    fn collect_search_books_from_html(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        rule: &SearchRule,
+    ) -> Vec<SearchBook> {
+        let doc = html::parse_document(body);
+        let items = html::document_top_elements(&doc);
+        self.build_search_books_from_items(source, base_url, rule, items)
     }
 
     /// 测试用入口: 在给定 item 上求值一条搜索字段规则。
@@ -653,7 +686,16 @@ impl RuleEngine {
         let (combinable, replace_part) = split_legado_regex(content_rule);
         let combo = split_top_level(&combinable, &["&&", "||", "%%"]);
         let Some(operator) = combo.delimiter.as_deref() else {
-            return self.extract_content_single(content_rule, content_body);
+            // 没有组合符：只拿 `##` **之前**的规则主体求值，再把替换套上去。
+            //
+            // 早先这里传的是**整个** content_rule，`##` 后面的替换正则被当成
+            // 提取器的一部分（`…p@text##广告行.*` 里的 `text##…` 不是合法
+            // 提取器），选择器结果取不出来 —— 症状是「正文解析为空」。
+            let value = self.extract_content_single(&combinable, content_body);
+            return match replace_part {
+                Some(reg) => apply_legado_regex(&value, reg),
+                None => value,
+            };
         };
         // 段本身可能带 `@css:` / `@json:` 前缀，各段独立判定。
         let values: Vec<String> = combo
@@ -1143,6 +1185,17 @@ impl RuleEngine {
         }
         let doc = html::parse_document(body);
         let items = html::select_list(&doc, self.strip_mode_prefix(list_sel));
+        self.build_search_books_from_items(source, base_url, rule, items)
+    }
+
+    /// 把一批列表元素按 `ruleSearch` 的字段规则逐条转成 [`SearchBook`]。
+    fn build_search_books_from_items<'a>(
+        &self,
+        source: &BookSource,
+        base_url: &str,
+        rule: &SearchRule,
+        items: Vec<scraper::ElementRef<'a>>,
+    ) -> Vec<SearchBook> {
         let mut out = Vec::with_capacity(items.len());
 
         for el in items {
@@ -1742,8 +1795,7 @@ fn parse_chapter_list_xpath(
 
 /// 解析 JSON 响应体，容忍 UTF-8 BOM。
 ///
-/// 部分站点（例如 `catalog.chuangke.tv` 的目录接口）会在 JSON 前面带一个
-/// `\u{FEFF}`。`serde_json` 视其为非法字符而直接报 "expected value"，
+/// 部分站点的目录接口会在 JSON 前面带一个 `\u{FEFF}`。`serde_json` 视其为非法字符而直接报 "expected value"，
 /// 目录/搜索就会被静默解析成 0 条 —— 阅读页表现为「打开书一直转圈、
 /// 目录空白」。legado 侧用 Gson 解析，同样不容忍 BOM，但它的 HTTP 层
 /// 已按 charset 解码并剥离 BOM，所以这里补上等价处理。
@@ -2332,6 +2384,188 @@ fn extract_js(rule: &str) -> (&str, Option<&str>) {
     (rule, None)
 }
 
+/// 规则链里的一段（legado `AnalyzeRule.splitSourceRule` 的等价物）。
+#[derive(Debug, PartialEq)]
+enum RuleSegment<'a> {
+    /// 普通规则段（CSS / XPath / JSONPath / 正则），按当前内容求值。
+    Rule(&'a str),
+    /// `<js>…</js>` / `@js:…` 段，返回值就是下一段的输入。
+    Script(&'a str),
+}
+
+/// 把一条规则按 `<js>…</js>` / `@js:…` 切成交替的「规则段 / 脚本段」。
+///
+/// 书源大量使用**中间夹 JS** 的形态，例如
+///
+/// ```text
+/// class.book_cell
+/// <js>list = result.toArray(); … result = String(html)</js>
+/// a
+/// ```
+///
+/// legado 用 `JS_PATTERN` 把 `<js>` 段单独抽出来，剩下的文本前后各成一段，
+/// 逐段串联求值（上一段的输出喂给下一段）。桌面端早先只认「规则以 JS 开头」
+/// 的形态，中间夹 JS 时整条规则被当成一个 CSS 选择器 —— 选择器里含 `<js>`
+/// 自然选不到任何东西，搜索于是恒为 0 条。
+fn split_rule_segments(rule: &str) -> Vec<RuleSegment<'_>> {
+    let mut segments = Vec::new();
+    let mut rest = rule;
+    loop {
+        let js_open = rest.find("<js>");
+        let at_js = rest.find("@js:");
+        let (start, open_len, close) = match (js_open, at_js) {
+            (Some(i), Some(j)) if j < i => (j, 4, None),
+            (Some(i), _) => (i, 4, Some("</js>")),
+            (None, Some(j)) => (j, 4, None),
+            (None, None) => {
+                if !rest.trim().is_empty() {
+                    segments.push(RuleSegment::Rule(rest));
+                }
+                break;
+            }
+        };
+        let head = &rest[..start];
+        if !head.trim().is_empty() {
+            segments.push(RuleSegment::Rule(head));
+        }
+        let after = &rest[start + open_len..];
+        match close {
+            Some(close) => match after.find(close) {
+                Some(end) => {
+                    segments.push(RuleSegment::Script(&after[..end]));
+                    rest = &after[end + close.len()..];
+                }
+                None => {
+                    // 未闭合: 整段当脚本(legado 的 `[\\w\\W]*` 也是吃到行尾)。
+                    segments.push(RuleSegment::Script(after));
+                    break;
+                }
+            },
+            // `@js:` 吃到最后（legado `@js:([\w\W]*)` 语义）。
+            None => {
+                segments.push(RuleSegment::Script(after));
+                break;
+            }
+        }
+    }
+    segments
+}
+
+/// 链式求值中的"当前内容"。
+enum RuleChainValue {
+    /// 上一段给出的文本/HTML 串。
+    Text(String),
+    /// 上一段选出的元素集合（快照），JS 段要按 JSoup `Elements` 注入。
+    Elements(Vec<Value>),
+}
+
+/// 串联求值「规则段 / 脚本段」链，返回最终 HTML（元素的 outerHtml 拼接）。
+///
+/// 规则段在**当前内容**上求值：内容看起来是 HTML 就按 CSS 选择器选元素；
+/// 脚本段的 `result` 按 legado 语义注入 —— 上一段是元素集合时给 JSoup
+/// `Elements`（可 `toArray()` / `size()` / 索引），否则给字符串。
+fn eval_list_rule_chain(rule: &str, body: &str, base_url: &str) -> Option<String> {
+    let segments = split_rule_segments(rule);
+    if segments.is_empty() {
+        return None;
+    }
+    let mut current = RuleChainValue::Text(body.to_string());
+    for segment in segments {
+        match segment {
+            RuleSegment::Script(script) => {
+                if script.trim().is_empty() {
+                    continue;
+                }
+                let output = match &current {
+                    RuleChainValue::Elements(items) => {
+                        let mut bindings = HashMap::new();
+                        bindings.insert(
+                            "result".to_string(),
+                            crate::parser::js::elements_binding(items),
+                        );
+                        eval_js_with_bindings(script, "", base_url, &bindings)
+                    }
+                    RuleChainValue::Text(text) => eval_js(script, text, base_url),
+                };
+                current = match output {
+                    Ok(value) => RuleChainValue::Text(value),
+                    Err(err) => {
+                        push_js_log(format!("[列表 JS] {err}"));
+                        return None;
+                    }
+                };
+            }
+            RuleSegment::Rule(selector) => {
+                let selector = selector.trim();
+                if selector.is_empty() {
+                    continue;
+                }
+                let source_text = match &current {
+                    RuleChainValue::Text(text) => text.clone(),
+                    RuleChainValue::Elements(items) => items
+                        .iter()
+                        .map(|item| {
+                            item.get("outerHtml")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                let doc = html::parse_document(&source_text);
+                let elements = html::select_list(&doc, selector);
+                if elements.is_empty() {
+                    // 文本内容上的规则段（正则/纯文本）选不到元素，保持原样。
+                    current = RuleChainValue::Text(source_text);
+                    continue;
+                }
+                let snapshots = elements
+                    .iter()
+                    .map(element_snapshot_json)
+                    .collect::<Vec<_>>();
+                current = RuleChainValue::Elements(snapshots);
+            }
+        }
+    }
+    Some(match current {
+        RuleChainValue::Text(text) => text,
+        RuleChainValue::Elements(items) => items
+            .iter()
+            .map(|item| {
+                item.get("outerHtml")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    })
+}
+
+/// 链式求值入口（供测试与诊断使用）。
+#[doc(hidden)]
+pub fn eval_rule_chain_for_test(rule: &str, body: &str, base_url: &str) -> Option<String> {
+    eval_list_rule_chain(rule, body, base_url)
+}
+
+/// `scraper` 元素 → 元素快照 JSON（与 `element_binding_from_ref` 同构）。
+fn element_snapshot_json(el: &scraper::ElementRef) -> Value {
+    let attrs: serde_json::Map<String, Value> = el
+        .value()
+        .attrs()
+        .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+        .collect();
+    json!({
+        "tag": el.value().name(),
+        "text": el.text().collect::<String>(),
+        "ownText": el.text().collect::<String>(),
+        "innerHtml": el.inner_html(),
+        "outerHtml": el.html(),
+        "attrs": attrs,
+    })
+}
+
 fn eval_field_html(rule: &str, el: &scraper::ElementRef, base_url: &str) -> Option<String> {
     eval_field_html_with_ctx(rule, el, base_url, &mut HashMap::new())
 }
@@ -2556,6 +2790,15 @@ fn eval_field_html_doc_with_ctx(
     // 症状就是「详情页有书名、作者和分类却都是空」—— 书源的
     // `ruleBookInfo.author` / `kind` 常写成 `…@text##作\s*者[：:]\s*` 这种形态。
     let (pure_rule, regex_part) = split_legado_regex(&interpolated_rule);
+    // 「脚本段 + 后续选择器段」的链式字段规则（见 `eval_field_rule_chain`）。
+    // 必须在 `extract_js` 之前接管：后者只认 `</js>` 之前的部分，会把脚本
+    // 之后的选择器整段丢掉，脚本输出于是被当成字段值（简介变成整页 HTML）。
+    if let Some(value) = eval_field_rule_chain(&pure_rule, &doc.html(), base_url) {
+        return Some(match regex_part {
+            Some(reg) => apply_legado_regex(&value, &reg),
+            None => value,
+        });
+    }
     let (pure, js) = extract_js(&pure_rule);
     let mut text = if pure.is_empty() {
         // 纯 JS 规则: legado 里 `result` 就是**当前内容**(整页响应),
@@ -2584,6 +2827,89 @@ fn eval_field_html_doc_with_ctx(
         None
     } else {
         Some(text)
+    }
+}
+
+/// 字段规则里「JS 段 + 后续规则段」的串行求值。
+///
+/// legado 的 `AnalyzeRule.splitSourceRule` 把 `<js>…</js>` / `@js:` 单独切成一段，
+/// 其余文本前后各成一段，**逐段串起来**（上一段的输出是下一段的输入）。书源的
+/// 字段规则常见这种形态：
+///
+/// ```text
+/// <js>java.ajax(另一个页面地址)</js>
+/// tag.p.1:2@text
+/// ```
+///
+/// 也就是「先用脚本另抓一页，再在那一页上选元素」。桌面端早先只取 `</js>`
+/// **之前**的规则、把后面的选择器整段丢掉，脚本的输出于是被原样当成字段值 ——
+/// 症状是**简介显示成一整页 HTML 源码**（详情弹窗里那屏 `<!DOCTYPE html…`）。
+///
+/// 返回 `None` 表示「这条规则不需要走链式路径」，交给原有单段逻辑。
+fn eval_field_rule_chain(rule: &str, input_html: &str, base_url: &str) -> Option<String> {
+    let segments = split_rule_segments(rule);
+    if segments.is_empty() {
+        return None;
+    }
+    // 只有「脚本段之后还跟着规则段」才接管，其余保持原路径不变。
+    let Some(script_index) = segments
+        .iter()
+        .position(|segment| matches!(segment, RuleSegment::Script(_)))
+    else {
+        return None;
+    };
+    let last_rule_index = segments
+        .iter()
+        .rposition(|segment| matches!(segment, RuleSegment::Rule(text) if !text.trim().is_empty()))?;
+    if last_rule_index <= script_index {
+        return None;
+    }
+
+    let mut current = input_html.to_string();
+    for (index, segment) in segments.iter().enumerate() {
+        match segment {
+            RuleSegment::Script(script) => {
+                if script.trim().is_empty() {
+                    continue;
+                }
+                current = match eval_js(script, &current, base_url) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        push_js_log(format!("[字段 JS] {err}"));
+                        return None;
+                    }
+                };
+            }
+            RuleSegment::Rule(selector) => {
+                let selector = selector.trim();
+                if selector.is_empty() {
+                    continue;
+                }
+                let doc = html::parse_document(&current);
+                if index == last_rule_index {
+                    // 末段按字段提取器取值（`@text` / `@html` / `@src` …），
+                    // 多命中时按 legado 的 `joinToString("\n")` 拼接。
+                    current = html::select_all_text(&doc, selector).unwrap_or_default();
+                } else {
+                    // 中间段必须保留 HTML 结构，下一段还要继续选。
+                    let elements = html::select_list(&doc, selector);
+                    if elements.is_empty() {
+                        continue;
+                    }
+                    current = elements
+                        .iter()
+                        .map(|el| el.html())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                }
+            }
+        }
+    }
+
+    if current.trim().is_empty() {
+        None
+    } else {
+        Some(current)
     }
 }
 
@@ -4447,7 +4773,7 @@ mod tests {
     }
     /// 带 UTF-8 BOM 的 JSON 目录必须能解析出章节。
     ///
-    /// 实测 `catalog.chuangke.tv` 的目录接口响应就是 `\u{FEFF}{"code":1,...}`。
+    /// 实测某站的目录接口响应就是 ``\u{FEFF}{"code":1,...}``。
     /// `serde_json` 遇到 BOM 直接报 "expected value"，目录被静默解析成 0 条 ——
     /// 阅读页表现为「打开书一直转圈、目录空白、书源也加载不出来」（issue #22）。
     #[test]
@@ -4495,7 +4821,7 @@ mod tests {
     /// 并发求值必须与串行**逐章一致**（顺序、标题、地址都要相同）。
     ///
     /// 这是并发化的正确性底线：章节顺序错乱或域名拼接失效会直接毁掉目录。
-    /// 用真实书源「小小阅读（+++）」的 1826 章目录做对照，只有在 fixture
+    /// 用一份真实的 1826 章目录做对照，只有在 fixture
     /// 存在时才跑（CI 上没有该文件，自动跳过）。
     #[test]
     #[ignore]
@@ -4511,7 +4837,7 @@ mod tests {
         let body = body.trim_start_matches('\u{feff}').to_string();
         let source: BookSource = serde_json::from_str(&src_raw).expect("source");
         let toc = source.rule_toc.clone().unwrap_or_default();
-        let base = "https://catalog.chuangke.tv/qu/241/57/ae/229.html";
+        let base = "https://catalog.example.test/qu/241/57/ae/229.html";
 
         let v: Value = serde_json::from_str(&body).expect("json");
         let items = jsonpath::jsonpath_query(&v, "$.data");

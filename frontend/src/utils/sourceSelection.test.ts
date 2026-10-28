@@ -56,11 +56,11 @@ describe('sourceSelection', () => {
 
   it('filters book sources by text and group', () => {
     const grouped: BookSource[] = [
-      { bookSourceName: '猫眼看书', bookSourceUrl: 'https://maoyan.example', bookSourceGroup: 'API' },
-      { bookSourceName: '笔趣阁', bookSourceUrl: 'https://biqu.example', bookSourceGroup: '网页' },
+      { bookSourceName: '示例阅读', bookSourceUrl: 'https://reader.example', bookSourceGroup: 'API' },
+      { bookSourceName: '示例书库', bookSourceUrl: 'https://library.example', bookSourceGroup: '网页' },
     ]
 
-    expect(filterBookSources(grouped, 'mao', '')).toEqual([grouped[0]])
+    expect(filterBookSources(grouped, 'reader', '')).toEqual([grouped[0]])
     expect(filterBookSources(grouped, '', '网页')).toEqual([grouped[1]])
   })
 

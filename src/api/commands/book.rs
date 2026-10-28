@@ -3039,7 +3039,7 @@ async fn resolve_book_source(
             Err(_) => "".to_string(),
         };
         if !b_host.is_empty() {
-            // Extract root domain for comparison (e.g., "22biqu" from "m.22biqu.com")
+            // Extract root domain for comparison (e.g., "novelx" from "m.novelx.com")
             let b_root = extract_root_domain(&b_host);
             let sources = state.book_source_service.list(&user_ns).await?;
             for s in sources {
@@ -3066,7 +3066,7 @@ async fn resolve_book_source(
     ))
 }
 
-/// Extract root domain for matching (e.g., "22biqu" from "m.22biqu.com" or "m.22biqu.net")
+/// Extract root domain for matching (e.g., "novelx" from "m.novelx.com" or "m.novelx.net")
 fn extract_root_domain(host: &str) -> String {
     let parts: Vec<&str> = host.split('.').collect();
     if parts.len() >= 2 {
@@ -3999,15 +3999,15 @@ mod tests {
         let cached = vec![SearchBook {
             name: "深空彼岸".to_string(),
             author: "作者：另一作者".to_string(),
-            origin: "https://m.22biqu.com/".to_string(),
-            book_url: "https://m.22biqu.com/biqu2986/".to_string(),
+            origin: "https://m.reader-example.com/".to_string(),
+            book_url: "https://m.reader-example.com/book2986/".to_string(),
             ..SearchBook::default()
         }];
 
         let matches = take_available_source_cached_matches(cached, 5);
 
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].origin, "https://m.22biqu.com/");
+        assert_eq!(matches[0].origin, "https://m.reader-example.com/");
     }
 
     #[test]

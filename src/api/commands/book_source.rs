@@ -1115,10 +1115,10 @@ mod tests {
     fn resolve_remote_source_url_unwraps_import_links() {
         assert_eq!(
             resolve_remote_source_url(
-                "yuedu://booksource/importonline?src=https://www.yck2026.fun/yuedu/shuyuan/json/id/7965.json"
+                "yuedu://booksource/importonline?src=https://repo.example.com/yuedu/shuyuan/json/id/1.json"
             )
             .unwrap(),
-            "https://www.yck2026.fun/yuedu/shuyuan/json/id/7965.json"
+            "https://repo.example.com/yuedu/shuyuan/json/id/1.json"
         );
         assert_eq!(
             resolve_remote_source_url(

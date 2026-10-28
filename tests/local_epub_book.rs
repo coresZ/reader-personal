@@ -116,7 +116,7 @@ fn epub2_fixture() -> Vec<u8> {
     )
 }
 
-/// 复刻《遮天》那类多用（杜坎）排版：章节标题被 `<br/>` 拆成两段、标题前有 logo、
+/// 复刻一类多用（杜坎）排版：章节标题被 `<br/>` 拆成两段、标题前有 logo、
 /// 封面用 SVG `<image>`、样式表里有 `@import`/`@font-face` 与相对 `url()`。
 fn styled_fixture() -> Vec<u8> {
     make_epub(
@@ -134,8 +134,8 @@ fn styled_fixture() -> Vec<u8> {
                 r#"<?xml version="1.0"?>
 <package version="2.0" xmlns="http://www.idpf.org/2007/opf">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:title>遮天</dc:title>
-    <dc:creator>辰东</dc:creator>
+    <dc:title>示例书名</dc:title>
+    <dc:creator>示例作者</dc:creator>
     <meta name="cover" content="cover.jpg"/>
   </metadata>
   <manifest>

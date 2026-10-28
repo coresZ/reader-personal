@@ -26,16 +26,16 @@ describe('matchesShelfKeyword', () => {
     const target = book('三体', {
       author: '刘慈欣',
       intro: '地球往事三部曲',
-      originName: '起点',
-      origin: 'https://www.qidian.com',
+      originName: '示例书城',
+      origin: 'https://www.example-shucheng.com',
       latestChapterTitle: '第三十九章 黑暗森林',
       durChapterTitle: '第一章 科学边界',
     })
     expect(matchesShelfKeyword(target, '三体')).toBe(true)
     expect(matchesShelfKeyword(target, '刘慈欣')).toBe(true)
     expect(matchesShelfKeyword(target, '地球往事')).toBe(true)
-    expect(matchesShelfKeyword(target, '起点')).toBe(true)
-    expect(matchesShelfKeyword(target, 'qidian')).toBe(true)
+    expect(matchesShelfKeyword(target, '示例书城')).toBe(true)
+    expect(matchesShelfKeyword(target, 'shucheng')).toBe(true)
     expect(matchesShelfKeyword(target, '黑暗森林')).toBe(true)
     expect(matchesShelfKeyword(target, '科学边界')).toBe(true)
   })
@@ -80,10 +80,10 @@ describe('filterShelfBooks', () => {
 
   it('可按书源 URL 过滤(与最近阅读页口径一致)', () => {
     const list = [
-      book('三体', { origin: 'https://www.qidian.com' }),
-      book('沙丘', { origin: 'https://www.duokan.com' }),
+      book('三体', { origin: 'https://www.example-a.com' }),
+      book('沙丘', { origin: 'https://www.example-b.com' }),
     ]
-    expect(filterShelfBooks(list, 'duokan').map((b) => b.name)).toEqual(['沙丘'])
+    expect(filterShelfBooks(list, 'example-b').map((b) => b.name)).toEqual(['沙丘'])
   })
 
   it('大小写不敏感在过滤层同样成立', () => {

@@ -896,7 +896,7 @@ JS 运行时 SHOULD 提供 `JsExtensions` 等价能力，至少包括：
 
 - `http://1.2.3.4` -> `1.2.3.4`
 - `https://www.example.com` -> `example.com`
-- `http://www.biquge.com.cn` -> `biquge.com.cn`
+- `http://www.example.cn` -> `example.cn`
 - 解析失败返回原输入或 baseUrl。
 
 ### 11.3 concurrentRate

@@ -579,7 +579,7 @@ struct SourceLoginSession {
 }
 
 /// Detect anti-crawler / degradation markers so the debugger can tell「被站点拦截」
-/// apart from「规则写错」. Factors collected from the Qidian debugging session:
+/// apart from「规则写错」. Factors collected from real-site debugging sessions:
 /// - 202 + `var buid` = PC 站验证壳(要浏览器指纹)
 /// - 验证码页 / WAF tunnel
 /// - 移动站被重定向到 PC 站(`source=m_jump`)
@@ -1727,7 +1727,7 @@ impl BookService {
                     return false;
                 }
                 // Filter out URLs with the same path but different domain
-                // This handles cases like m.22biqu.com vs m.22biqu.net
+                // This handles cases like m.novelx.com vs m.novelx.net
                 if let (Ok(parsed_u), Ok(parsed_visited)) =
                     (url::Url::parse(u), url::Url::parse(&actual_visited_url))
                 {
@@ -2333,7 +2333,7 @@ impl BookService {
                         ) {
                             let ch_path = ch_parsed.path();
                             let b_path = b_parsed.path();
-                            // Check if paths share a common prefix (e.g., /biqu104/)
+                            // Check if paths share a common prefix (e.g., /book104/)
                             if ch_path.starts_with(b_path.trim_end_matches('/'))
                                 || b_path
                                     .trim_end_matches('/')
@@ -2961,7 +2961,7 @@ impl BookService {
                 (bytes, false)
             }
         };
-        // 服务器没给 Content-Type 时, 上面的兜底会拿 URL 后缀猜, 而番茄一类的
+        // 服务器没给 Content-Type 时, 上面的兜底会拿 URL 后缀猜, 而带尺寸参数的
         // `…:1200:0.image` 猜不出来。图就在手里, 按魔数认格式最可靠。
         //
         // 解密过的字节要**无条件**重认: 服务端给的 content-type 描述的是密文
@@ -4190,7 +4190,7 @@ fn sniff_image_content_type(bytes: &[u8]) -> Option<String> {
 
 /// 封面落盘用的扩展名。
 ///
-/// 以服务端给的 `Content-Type` 为准: 番茄一类图床的地址形如 `…:1200:0.image`,
+/// 以服务端给的 `Content-Type` 为准: 一类图床的地址形如 `…:1200:0.image`,
 /// 按 URL 取后缀会落下 `.image` —— 文件本身是正常 JPEG, 只是系统没有这个后缀的
 /// 缩略图/打开方式, 在资源管理器里看着像「空白文件」。`Content-Type` 认不出时
 /// 才回退到 URL 后缀, 再兜底 `img`(不写 `image`, 免得继续冒充未知类型)。
@@ -4633,7 +4633,7 @@ mod tests {
 
     #[test]
     fn cover_extension_follows_content_type_not_url_suffix() {
-        // 番茄图床: 地址以 `…:1200:0.image?…%3D` 结尾, 实际是 JPEG。
+        // 图床: 地址以 `…:1200:0.image?…%3D` 结尾, 实际是 JPEG。
         let url = "https://img.example/novel-pic-r/abc~tplv:1200:0.image?x-signature=a%3D";
         assert_eq!(cover_file_extension(url, "image/jpeg"), "jpg");
         assert_eq!(cover_file_extension(url, "image/webp"), "webp");

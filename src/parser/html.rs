@@ -352,20 +352,28 @@ fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
 }
 
 fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<ElementRef<'a>> {
-    match split_jsoup_pseudos(css_selector) {
-        Some((base, filters)) => {
-            let mut matches = match parse_css_selector(&base) {
-                Some(sel) => el.select(&sel).collect(),
-                None => Vec::new(),
-            };
-            apply_jsoup_filters(&mut matches, &filters);
-            matches
-        }
-        None => match parse_css_selector(css_selector) {
-            Some(sel) => el.select(&sel).collect(),
-            None => Vec::new(),
-        },
+    let (base, filters) = match split_jsoup_pseudos(css_selector) {
+        Some((base, filters)) => (base, Some(filters)),
+        None => (css_selector.to_string(), None),
+    };
+    let Some(sel) = parse_css_selector(&base) else {
+        return Vec::new();
+    };
+
+    // JSoup 的 `Element.select(...)` **把元素自身也算进匹配集**：它的
+    // `Collector.collect` 从 root 开始遍历并在第一步就测 root；W3C 的
+    // `querySelectorAll` / `scraper` 的 `ElementRef::select` 则跳过自身。
+    //
+    // 书源把这一点当常规写法用，最典型的是目录规则
+    // `class.zjlb@class.lb@ul@li`：`<ul class="lb fk">` 里面直接就是 `<li>`，
+    // 并没有嵌套的 `<ul>`，第二步 `@ul` 靠的正是「自身也匹配」。少了这一步，
+    // 目录恒为 0 条（手机端能读、桌面端没有章节）。
+    let mut matches: Vec<ElementRef<'a>> = if sel.matches(&el) { vec![el] } else { Vec::new() };
+    matches.extend(el.select(&sel));
+    if let Some(filters) = filters {
+        apply_jsoup_filters(&mut matches, &filters);
     }
+    matches
 }
 
 fn select_css_plain<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {

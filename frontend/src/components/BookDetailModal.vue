@@ -427,10 +427,10 @@ const coverSrc = computed(() => {
   // 会被 `||` 跳过而回落到 `props.book.customCoverUrl` —— 那正是刚被删除的旧封面
   // 文件, 图片 404 → 显示「无封面」, 用户刚点完还原却看不到书源封面。
   const url = isEditing.value
-    ? (draft.value.customCoverUrl || props.book.coverUrl)
+    ? (draft.value.customCoverUrl || props.book.coverUrl || detailCover.value)
     : savedOverride.value
-    ? (savedOverride.value.customCoverUrl || props.book.coverUrl)
-    : ((props.book as Book).customCoverUrl || props.book.coverUrl)
+    ? (savedOverride.value.customCoverUrl || props.book.coverUrl || detailCover.value)
+    : ((props.book as Book).customCoverUrl || props.book.coverUrl || detailCover.value)
   // 带上书源地址: 加密封面要靠它反查 `coverDecodeJs`（issue #23）。
   return url ? getCoverUrl(url, props.book.origin) : ''
 })
@@ -450,6 +450,13 @@ const introExpanded = ref(false)
  *  `ruleBookInfo.intro` 只有访问详情页才拿得到。弹窗打开时补拉一次，避免
  *  「手机端简介很长、桌面端只有一行」这种差异。 */
 const detailIntro = ref('')
+/** 详情页补拉回来的封面地址。
+ *
+ *  很多书源的 `ruleSearch.coverUrl` 是空的（搜索列表页压根没有封面图），
+ *  封面只写在详情页规则里。早先这里只补简介、不补封面，于是「搜索结果有、
+ *  点进详情弹窗却是空封面」—— 后台 `/cover` 其实能拿到图，只是前端从没
+ *  请求过它。 */
+const detailCover = ref('')
 
 /** 非编辑态展示用的书籍信息: 优先用刚保存的结果, 其次才是 props。
  *  props.book 是打开弹窗时的对象引用, 保存后不会自动更新。 */
@@ -580,16 +587,21 @@ function resetDetailState() {
   chapterError.value = ''
   loadedCatalogIdentity.value = ''
   detailIntro.value = ''
+  detailCover.value = ''
 }
 
-/** 补拉书源详情页的完整简介（搜索结果的 intro 通常只是站点摘要）。
- *  失败时保持搜索结果的简介，不影响其它信息展示。 */
+/** 补拉书源详情页的完整简介与封面（搜索结果的 intro 通常只是站点摘要，
+ *  coverUrl 更常常是空的）。失败时保持原有信息，不影响其它展示。 */
 async function loadDetailIntro(loadId: number, bookKey: string) {
   const b = props.book as Book | null
   if (!b || !b.bookUrl || isLocal.value) return
   try {
     const info = await getBookInfo(b.bookUrl, b.origin)
     if (!isCurrentDetail(loadId, bookKey)) return
+    if (info?.coverUrl && !b.coverUrl) {
+      detailCover.value = info.coverUrl
+      coverFailed.value = false
+    }
     if (info?.intro) detailIntro.value = info.intro
   } catch {
     // 详情页拉取失败就退回搜索结果里的简介，不打扰用户。

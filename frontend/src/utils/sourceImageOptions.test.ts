@@ -156,7 +156,7 @@ describe('reserveImageSpace（用最小 DOM 桩，不依赖 jsdom）', () => {
   }
 
   it('leaves an image that already declares width and height alone', () => {
-    // 番茄源插图都带这两个属性, 浏览器据此即可在加载前按比例占位。
+    // 书源插图常带这两个属性, 浏览器据此即可在加载前按比例占位。
     const [image] = runOn([makeImage({ attrs: { width: '1024', height: '576' } })])
 
     expect(image.style.aspectRatio).toBeUndefined()
