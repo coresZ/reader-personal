@@ -384,6 +384,11 @@ impl RuleEngine {
         })
     }
 
+    /// 供测试观察 `init` 规则的处理结果。
+    pub fn prepare_rule_body_for_test(&self, rule: &str, body: &str, base_url: &str) -> anyhow::Result<String> {
+        self.prepare_rule_body(rule, body, base_url)
+    }
+
     fn prepare_rule_body(&self, rule: &str, body: &str, base_url: &str) -> anyhow::Result<String> {
         match self.detect_mode(rule, body) {
             ParseMode::Js => {
@@ -932,7 +937,7 @@ impl RuleEngine {
                 .cover_url
                 .as_ref()
                 .and_then(|r| eval_field_html(r, &el, base_url))
-                .map(|u| resolve_url(base_url, &u));
+                .map(|u| resolve_asset_url(base_url, &u));
             let intro = rule
                 .intro
                 .as_ref()
@@ -1239,7 +1244,7 @@ impl RuleEngine {
                 .as_ref()
                 .and_then(|r| eval_field_html(r, &el, base_url));
             let book_url_abs = resolve_url(base_url, &book_url);
-            let cover_url_abs = cover_url.map(|u| resolve_url(base_url, &u));
+            let cover_url_abs = cover_url.map(|u| resolve_asset_url(base_url, &u));
             out.push(SearchBook {
                 name,
                 author,
@@ -1297,7 +1302,7 @@ impl RuleEngine {
                 author: author.unwrap_or_default(),
                 book_url: resolve_url(base_url, &book_url.unwrap_or_default()),
                 origin: source.book_source_url.clone(),
-                cover_url: cover_url.map(|u| resolve_url(base_url, &u)),
+                cover_url: cover_url.map(|u| resolve_asset_url(base_url, &u)),
                 intro,
                 kind,
                 last_chapter,
@@ -1339,7 +1344,7 @@ impl RuleEngine {
             let word_count =
                 eval_field_json(rule.word_count.as_deref().unwrap_or(""), &item, base_url);
             let book_url = book_url.map(|u| resolve_url(base_url, &u));
-            let cover_url = cover_url.map(|u| resolve_url(base_url, &u));
+            let cover_url = cover_url.map(|u| resolve_asset_url(base_url, &u));
             out.push(SearchBook {
                 name: name.unwrap_or_default(),
                 author: author.unwrap_or_default(),
@@ -1392,7 +1397,7 @@ fn parse_book_info_html(
     let kind = field(rule.kind.as_ref());
     let last_chapter = field(rule.last_chapter.as_ref());
     let update_time = field(rule.update_time.as_ref());
-    let cover_url = field(rule.cover_url.as_ref()).map(|u| resolve_url(base_url, &u));
+    let cover_url = field(rule.cover_url.as_ref()).map(|u| resolve_asset_url(base_url, &u));
     let word_count = field(rule.word_count.as_ref());
     let toc_url = field(rule.toc_url.as_ref()).map(|u| resolve_url(base_url, &u));
     let can_re_name = rule
@@ -2063,10 +2068,88 @@ fn select_json_scope(
         .unwrap_or_else(|| v.clone())
 }
 
+/// 按 legado 的组合符语义求值形如 `$.a||$.b` / `$.a&&$.b` 的 JSONPath 规则。
+///
+/// `||` 是回退链（第一个非空即返回），`&&` 是全部求值后按行拼接。括号/方括号
+/// 里的 `||`（如 `$[?(@.a||@.b)]`）属于 JSONPath 自身语法，不能被拆开。
+fn pick_json_field_composed(v: &Value, rule: &str) -> Option<String> {
+    let alternatives = split_json_rule(rule);
+    if alternatives.len() <= 1 {
+        return jsonpath::jsonpath_first_string(v, rule);
+    }
+    let mut values = Vec::new();
+    for part in &alternatives {
+        if let Some(found) = jsonpath::jsonpath_first_string(v, part.trim()) {
+            if !found.is_empty() {
+                values.push(found);
+            }
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+    // `||` 取第一个有值的；`&&` 全部按行拼接（两者都是 legado 的语义，
+    // 在实际书源里 `||` 远更常见，用于新旧字段名兼容）。
+    let is_or = rule.contains("||");
+    if is_or {
+        values.into_iter().next()
+    } else {
+        Some(values.join("\n"))
+    }
+}
+
+/// 把 `$.a||$.b` 按**顶层**组合符拆成多段（跳过括号/方括号内的内容）。
+fn split_json_rule(rule: &str) -> Vec<&str> {
+    let bytes = rule.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'|' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                parts.push(&rule[start..i]);
+                i += 2;
+                start = i;
+                continue;
+            }
+            b'&' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                parts.push(&rule[start..i]);
+                i += 2;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if parts.is_empty() {
+        return vec![rule];
+    }
+    parts.push(&rule[start..]);
+    parts
+}
+
+/// 供测试观察 `{{$.a||$.b}}` 的求值结果（回退链语义容易写错）。
+pub fn pick_json_field_for_test(v: &Value, rule: &str) -> Option<String> {
+    pick_json_field(v, Some(rule))
+}
+
+/// 供测试观察地址拼接是否保留 URL 选项。
+pub fn resolve_url_for_test(base: &str, url: &str) -> String {
+    resolve_url(base, url)
+}
+
 fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
     let rule = rule?;
     if rule.trim_start().starts_with('$') {
-        return jsonpath::jsonpath_first_string(v, rule);
+        // legado 的 `AnalyzeByJSonPath.getString` 会先用 `splitRule("&&","||")`
+        // 切段再逐段求值。书源大量写 `{{$.bookId||$.bid}}` 兼容新旧字段名；
+        // 整串直接交给 JSONPath 是非法语法、结果恒空 —— 于是 bookUrl 拼出来
+        // 只剩接口路径，每本书地址都一样、点进去打不开。
+        return pick_json_field_composed(v, rule);
     }
     // 管道串 item 是数组: 字段规则为纯数字时按索引取第 N 段
     if let Some(arr) = v.as_array() {
@@ -2103,31 +2186,62 @@ fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
     None
 }
 
+/// 资源地址（封面/图片）用：与 `resolve_url` 相同，但**剥掉 URL 选项**。
+///
+/// 封面是给 `<img src>` 直接加载的，浏览器无法携带选项里的 headers/method；
+/// 带着 `,{"headers":…}` 会让前端加载失败（之前就是靠这层剥离保证的）。
+/// 与之相对，`bookUrl` / `tocUrl` 是**请求规则**，选项必须保留。
+fn resolve_asset_url(base: &str, url: &str) -> String {
+    resolve_url(base, crate::crawler::url_analyzer::split_url_options(url).0)
+}
+
 fn resolve_url(base: &str, url: &str) -> String {
     let base = normalize_source_url(base);
-    let url = normalize_source_url(strip_url_config(url));
+    // URL 选项（`,{"body":…,"method":"POST"}`）**必须保留**。
+    //
+    // legado 的 `NetworkUtils.getAbsoluteURL` 对已是绝对地址的输入原样返回，选项串
+    // 因此一直跟着 `bookUrl` / `tocUrl` 走，后续 `AnalyzeUrl` 再解析出来发 POST。
+    // 书源常这么写：
+    //
+    //   url = GetUrl(path, params);   // → "https://…/info,{\"body\":…,\"method\":\"POST\"}"
+    //
+    // 早先这里用 `strip_url_config` 剥掉选项、只留接口路径，请求于是变成无 body 的
+    // GET，服务端拿不到 bookId —— 症状是**搜索有结果但每本书地址都一样、点进去
+    // 详情页/目录全空**。
+    //
+    // 相对地址拼接时仍按纯 URL 处理（取选项左边部分），拼好后再把选项接回去。
+    let (url_only, options) = crate::crawler::url_analyzer::split_url_options(url);
+    let url_only = normalize_source_url(url_only);
+    let with_options = |resolved: String| match options {
+        Some(opts) if !opts.trim().is_empty() => format!("{resolved},{}", opts.trim()),
+        _ => resolved,
+    };
 
-    if url.is_empty() {
+    if url_only.is_empty() {
         return base.to_string();
     }
-    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
-        return url.to_string();
+    if url_only.starts_with("http://")
+        || url_only.starts_with("https://")
+        || url_only.starts_with("data:")
+    {
+        // 已是绝对地址: 连选项一起原样返回（与 legado 一致），不要再拼一次。
+        return normalize_source_url(url);
     }
-    if url.starts_with("//") {
-        return format!("https:{}", url);
+    if url_only.starts_with("//") {
+        return with_options(format!("https:{}", url_only));
     }
 
     let mut base_url = match url::Url::parse(&base) {
         Ok(u) => u,
-        Err(_) => return url.to_string(),
+        Err(_) => return normalize_source_url(url),
     };
     base_url.set_fragment(None);
 
-    match base_url.join(&url) {
-        Ok(u) => u.to_string(),
+    match base_url.join(&url_only) {
+        Ok(u) => with_options(u.to_string()),
         Err(_) => {
             let base = base.trim_end_matches('/');
-            format!("{}/{}", base, url.trim_start_matches('/'))
+            with_options(format!("{}/{}", base, url_only.trim_start_matches('/')))
         }
     }
 }
@@ -2248,43 +2362,6 @@ fn interpolate_common_templates(
             eval_js(expr, input, base_url).unwrap_or_default()
         })
         .into_owned()
-}
-
-fn strip_url_config(url: &str) -> &str {
-    if let Some(idx) = url.find("##$##") {
-        &url[..idx]
-    } else if let Some(idx) = url.find(",{'webView'") {
-        &url[..idx]
-    } else if let Some(idx) = url.find(",{\"webView\"") {
-        &url[..idx]
-    } else if let Some(idx) = url.find(",{") {
-        // legado 的 URL option 语法: `地址,{"headers":{…},"method":"POST"}`。
-        // 书源常把 headers 直接拼在**资源地址**上(封面、图片), 例如
-        // `img.0@src` 后接 `withImageHeaders(result)` 返回 `https://img/1.jpg,{"headers":{…}}`。
-        // 这种值只能当请求参数用, 存成封面/图片地址会让前端加载失败。
-        //
-        // 判定要足够保守: `,{` 之后必须是合法的 JSON 对象开头, 且整段能闭合,
-        // 避免误切本身就含 `,{` 的地址(极少, 但存在)。`data:` 地址里的逗号是
-        // 数据分隔符, 不能切 —— 那会把 base64 内容砍断。
-        if !url.starts_with("data:") && looks_like_url_option(&url[idx + 1..]) {
-            &url[..idx]
-        } else {
-            url
-        }
-    } else {
-        url
-    }
-}
-
-/// `,{...}` 之后的部分是否是 legado 的 URL option(合法 JSON 对象)。
-fn looks_like_url_option(rest: &str) -> bool {
-    let trimmed = rest.trim();
-    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
-        return false;
-    }
-    serde_json::from_str::<serde_json::Value>(trimmed)
-        .map(|value| value.is_object())
-        .unwrap_or(false)
 }
 
 /// 把元素转成 JS 侧可用的只读快照(`java.getElement` / `getElements` 的返回值)。
@@ -3990,7 +4067,7 @@ fn build_search_book_from_json(
         base_url,
         &mut ctx,
     )
-    .map(|u| resolve_url(base_url, &u));
+    .map(|u| resolve_asset_url(base_url, &u));
     let intro = eval_field_json_with_ctx(
         rule.intro.as_deref().unwrap_or(""),
         item,

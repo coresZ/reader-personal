@@ -239,6 +239,40 @@
       getEncoder: function () { return {encodeToString: function (v) { return native('base64Encode', {data:array(v)}); }}; },
       getDecoder: function () { return {decode: function (v) { return native('base64Decode', {text:String(v)}); }}; }
     };
+    // `Packages.android.util.Base64.decode(text, flags)`：Android 专有类，书源用它
+    // 解 URL-safe base64（`-`/`_` 代替 `+`/`/`）。第二个参数是 flags 位掩码：
+    //   URL_SAFE=8 / NO_PADDING=1 / NO_WRAP=2 / DEFAULT=0
+    // 手机端（Android 运行时）本来就有这个类，桌面端必须补齐，否则脚本里直接
+    // `cannot read property 'util' of undefined` —— 这类源表现为解码出 null、
+    // 发现页/正文空白。
+    //
+    // 实现上先按 flags 还原字符表与补位，再复用同一套宽松解码；`NO_PADDING`
+    // 与 `URL_SAFE` 是实际会遇到的两种，其余位按 DEFAULT 处理即可。
+    var AndroidBase64 = {
+      DEFAULT: 0,
+      NO_PADDING: 1,
+      NO_WRAP: 2,
+      CRLF: 4,
+      URL_SAFE: 8,
+      NO_CLOSE: 16,
+      decode: function (text, flags) {
+        var raw = String(text == null ? '' : text);
+        var bits = Number(flags) || 0;
+        if (bits & 8) raw = raw.replace(/-/g, '+').replace(/_/g, '/');
+        // NO_WRAP/CRLF 只影响编码侧换行，解码时把空白去掉即可。
+        raw = raw.replace(/\s+/g, '');
+        if (!(bits & 1)) { while (raw.length % 4) raw += '='; }
+        return native('base64Decode', { text: raw });
+      },
+      encodeToString: function (data, flags) {
+        var encoded = String(native('base64Encode', { data: array(data) }));
+        var bits = Number(flags) || 0;
+        if (bits & 8) encoded = encoded.replace(/\+/g, '-').replace(/\//g, '_');
+        if (bits & 1) encoded = encoded.replace(/=+$/, '');
+        if (bits & 2) encoded = encoded.replace(/(.{76})/g, '$1\n');
+        return encoded;
+      }
+    };
     // `Packages.java.util.UUID.randomUUID()`: 源脚本用它生成设备指纹字段,
     // 与 legado 的 java.randomUUID() 同源。
     var UUID = {
@@ -352,6 +386,56 @@
     };
     ByteArrayOutputStream.prototype.toByteArray = function () { return this.bytes.slice(); };
     ByteArrayOutputStream.prototype.close = function () {};
+    // `Packages.java.util.zip.Inflater(nowrap)`：书源把压缩段（raw deflate）逐块
+    // 解压成 JSON。Java 的用法是一组固定调用序列：
+    //
+    //   var inf = new Inflater(true);
+    //   inf.setInput(raw, 1, raw.length - 1);
+    //   while (!inf.finished()) { n = inf.inflate(buf); if (n <= 0) break; out.write(buf, 0, n); }
+    //   inf.end();
+    //
+    // 桌面端没有流式解压，这里在 `setInput` 时一次性解完、缓存结果，`inflate(buf)`
+    // 只负责按 buf 长度分块搬运。这样上面那套循环不需要客户端改动。
+    //
+    // **nowrap 必须区分**：`Inflater(true)` 对应 raw deflate（不带 zlib 头），
+    // 用 zlib 解码会报 "invalid zlib header"。书源用 `(true)`，所以默认按 raw。
+    function Inflater(nowrap) {
+      this.nowrap = nowrap !== false;
+      this.input = [];
+      this.output = [];
+      this.position = 0;
+      this.finishedFlag = false;
+    }
+    Inflater.prototype.setInput = function (data, offset, length) {
+      offset = offset === undefined ? 0 : size(offset);
+      var values = array(data);
+      length = length === undefined ? values.length - offset : size(length);
+      this.input = values.slice(offset, offset + length);
+      try {
+        this.output = array(native('inflate', { data: this.input, nowrap: this.nowrap }));
+      } catch (e) {
+        this.output = [];
+      }
+      this.position = 0;
+      this.finishedFlag = false;
+      return this.input.length;
+    };
+    Inflater.prototype.inflate = function (target) {
+      if (this.position >= this.output.length) { this.finishedFlag = true; return 0; }
+      var remaining = this.output.length - this.position;
+      if (!target) { this.position = this.output.length; this.finishedFlag = true; return remaining; }
+      var capacity = target.length === undefined ? 0 : target.length;
+      var count = Math.min(capacity || remaining, remaining);
+      for (var i = 0; i < count; i++) target[i] = this.output[this.position + i];
+      this.position += count;
+      this.finishedFlag = this.position >= this.output.length;
+      return count;
+    };
+    Inflater.prototype.finished = function () { return this.finishedFlag || this.position >= this.output.length; };
+    Inflater.prototype.needsInput = function () { return this.position >= this.output.length; };
+    Inflater.prototype.getRemaining = function () { return Math.max(0, this.output.length - this.position); };
+    Inflater.prototype.reset = function () { this.position = 0; this.finishedFlag = false; };
+    Inflater.prototype.end = function () { this.input = []; this.output = []; this.position = 0; this.finishedFlag = true; };
     function GZIPInputStream(input) { ByteArrayInputStream.call(this, native('gunzip', {data:input.bytes.slice(input.position)})); }
     GZIPInputStream.prototype = Object.create(ByteArrayInputStream.prototype);
     function GZIPOutputStream(output) {
@@ -534,15 +618,38 @@
         } catch (e) { return text; }
       }
     };
+    // `Packages.java.lang.reflect.Array.newInstance(SomeType, n)`：书源用它申请
+    // 一个定长字节缓冲区交给 `Inflater.inflate(buf)`。桌面端返回普通数组即可。
+    var ReflectArray = {
+      newInstance: function (componentType, length) {
+        var n = Math.max(0, Number(length) || 0);
+        var out = new Array(n);
+        for (var i = 0; i < n; i++) out[i] = 0;
+        return out;
+      }
+    };
     var nextTypes = {
       math:{BigInteger:BigInteger},
-      lang:{String:JavaString, System:{currentTimeMillis:function () { return Date.now(); }, arraycopy:arraycopy}, Thread:{sleep:function (ms) { g.__sleep(Number(ms)); }}},
-      util:{Arrays:Arrays, Base64:Base64, Collections:Collections, UUID:UUID, zip:{GZIPInputStream:GZIPInputStream, GZIPOutputStream:GZIPOutputStream}},
+      lang:{
+        String:JavaString,
+        System:{currentTimeMillis:function () { return Date.now(); }, arraycopy:arraycopy},
+        Thread:{sleep:function (ms) { g.__sleep(Number(ms)); }},
+        reflect:{Array:ReflectArray},
+        // `Packages.java.lang.Byte.TYPE`：书源写
+        // `Array.newInstance(Byte.TYPE, 8192)` 申请字节缓冲区。桌面端只需要
+        // 一个非空占位（ReflectArray 会忽略元素类型），但不能缺 —— 缺了就是
+        // `cannot read property 'TYPE' of undefined`，解压整段失败。
+        Byte:{TYPE:'byte'}
+      },
+      util:{Arrays:Arrays, Base64:Base64, Collections:Collections, UUID:UUID, zip:{GZIPInputStream:GZIPInputStream, GZIPOutputStream:GZIPOutputStream, Inflater:Inflater}},
       security:{MessageDigest:MessageDigest, SecureRandom:SecureRandom},
       io:{ByteArrayInputStream:ByteArrayInputStream, ByteArrayOutputStream:ByteArrayOutputStream, InputStreamReader:InputStreamReader, BufferedReader:BufferedReader},
       net:{URL:URLImpl, HttpURLConnection:UrlConnection, URLEncoder:URLEncoderImpl, URLDecoder:URLDecoderImpl},
       nio:{charset:{Charset:Charset}},
-      crypto:{Cipher:Cipher, spec:{SecretKeySpec:SecretKeySpec, IvParameterSpec:IvParameterSpec}}
+      crypto:{Cipher:Cipher, spec:{SecretKeySpec:SecretKeySpec, IvParameterSpec:IvParameterSpec}},
+      // `Packages.android.util.Base64` 等 Android 专有类。手机端天然存在，桌面端
+      // 必须补；缺了就是 `cannot read property 'util' of undefined`。
+      android:{util:{Base64:AndroidBase64}}
     };
     // 已有类型保持原引用(jsLib 里的 `instanceof` 依赖它), 新类型按首次注册。
     Object.keys(nextTypes).forEach(function (namespace) {
@@ -572,4 +679,7 @@
   g.java.nio = types.nio;
   g.javax = {crypto:types.crypto};
   g.Packages.javax = g.javax;
+  // `Packages.android.util.Base64`：Android 专有命名空间，不属于 `Packages.java`，
+  // 因此不能挂在 g.java 上 —— 书源写的就是 `Packages.android.util.Base64.decode(...)`。
+  g.Packages.android = types.android;
 })(globalThis);

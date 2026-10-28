@@ -730,7 +730,7 @@ impl BookService {
         let mut book_ctx = self.js_book_context(user_ns, book_url, "").await.unwrap_or_default();
         book_ctx.book["tocUrl"] = json!(book_url);
         let source_key = book_ctx.book["bookUrl"].as_str().unwrap_or(book_url).to_string();
-        let (body, url) = (res.body.clone(), res.url.clone());
+        let (body, url) = (res.body.clone(), if book_url.trim().is_empty() { res.url.clone() } else { book_url.to_string() });
         self.run_source_task(user_ns, source, move |source| {
             with_book_context(Some(book_ctx), || {
                 RuleEngine::new().unwrap().chapter_list(source, &body, &url, Some(&source_key))
@@ -784,7 +784,13 @@ impl BookService {
                 } else {
                     // 退回 URL 的**路径末段**（先剥掉 query/fragment 再取最后一段）。
                     // 顺序反了会拿到 `?dcs=…` 这种查询串、剥完变空串，兜底就失效了。
-                    let without_query = book_url
+                    //
+                    // 还必须先剥掉 legado 的 URL 选项 `,{"body":…,"method":"POST"}`：
+                    // 书源的 bookUrl 规则常返回「地址 + 请求选项」的复合串，不剥就会
+                    // 把整段选项当成书名显示出来（界面里书名变成
+                    // `info,{"body":"user_id=…"}`）。
+                    let url_only = crate::crawler::url_analyzer::split_url_options(&book_url).0;
+                    let without_query = url_only
                         .split(['?', '#'])
                         .next()
                         .unwrap_or("")
@@ -870,6 +876,51 @@ impl BookService {
         let url = url::Url::parse(source_url).map_err(|_| AppError::BadRequest("书源地址无效".to_string()))?;
         context.session.cookies.replace(&url, cookie).map_err(AppError::Internal)?;
         Ok(())
+    }
+
+    /// 登录页(`/__login/<s>/`)写入单条 cookie 到该书源的 jar。
+    ///
+    /// 与 `set_panel_cookie` 同源：登录页 iframe 跑在 reader origin 下，
+    /// `document.cookie` 与上游站点完全隔离，页面自己写的 token 只留在浏览器里，
+    /// 后续转发请求带不上、页面自己读也读不到。这里把单条 `名字=值` 落到 jar。
+    ///
+    /// 与手动 `set_source_cookie` 的区别：那个用 `replace`（整批覆盖），这个是
+    /// 逐条 `set`，因为登录页会分多次写不同 cookie（token、deviceId…）。
+    pub async fn set_source_login_cookie(
+        &self,
+        source_url: &str,
+        cookie: &str,
+    ) -> Result<(), String> {
+        let head = cookie.split(';').next().unwrap_or("").trim();
+        let Some((name, value)) = head.split_once('=') else {
+            return Err("Cookie 格式无效".to_string());
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Cookie 格式无效".to_string());
+        }
+        if name.chars().any(char::is_control) || value.chars().any(char::is_control) {
+            return Err("Cookie 含控制字符".to_string());
+        }
+        let context = self
+            .http
+            .source_context("default", source_url, None)
+            .map_err(|e| e.to_string())?;
+        // 目标域固定取书源地址: 登录页脚本不能挑域名写会话。
+        let url = url::Url::parse(source_url).map_err(|e| e.to_string())?;
+        // 空值代表页面删除该 cookie(退出登录), 必须从 jar 移除而非写成空值。
+        if value.trim().is_empty() {
+            return context
+                .session
+                .cookies
+                .remove(&url, name)
+                .map_err(|e| e.to_string());
+        }
+        context
+            .session
+            .cookies
+            .set(&url, head)
+            .map_err(|e| e.to_string())
     }
 
     pub async fn clear_source_cookie(&self, user_ns: &str, source_url: &str) {

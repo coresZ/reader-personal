@@ -63,6 +63,11 @@ async fn route(
         "/epub" => epub_route(state, query).await,
         "/pdf" => pdf_route(state, query).await,
         "/files" => files_route(state, query).await,
+        // 登录页的 cookie 桥: 页面用 `document.cookie = …` 记录登录态时,
+        // 经此落到书源 cookie jar。用独立顶层路径 + 会话参数, 不塞进
+        // `/__login/<s>/` 空间 —— 那里每个路径都会原样转发给上游,
+        // 保留一个自用路径会与上游可能的同名路径抢语义。
+        "/loginCookieBridge" => source_login_cookie_route(state, query, &request).await,
         // 登录页兜底: 登录 iframe 跑在专属路径空间里, 并**完整保留上游路径**:
         //   http://reader.localhost/__login/<session>/user/me?app=yuedu
         //
@@ -88,6 +93,54 @@ async fn route(
 
 /// 登录页专属路径空间的前缀: `/__login/<session>/<上游路径>`。
 const SESSION_PATH_PREFIX: &str = "/__login/";
+
+/// 登录页 cookie 桥: 把页面写入的 `document.cookie` 落到书源 cookie jar。
+///
+/// 与面板的 `cookieSet` 桥是同一个目的、同一套域校验(`set_panel_cookie`),
+/// 区别只在凭据来源: 面板按 `panelId` 查面板, 这里按 `loginSession` 查书源。
+///
+/// **为什么必须有**：登录页 iframe 跑在 `reader.localhost` 自定义协议 origin 下，
+/// 那个 origin 的 `document.cookie` 既读不到上游站点的 cookie，也写不进去。
+/// 一类站点把 token 存 `document.cookie`（而不是服务端 session），页面自己
+/// 随后要 `getCookie(...)` 判登录态 —— 读不到就当作未登录，触发「登出 + 弹回
+/// 登录页」。症状正是「提示登录成功，但页面不跳转」。
+async fn source_login_cookie_route(
+    state: &AppState,
+    query: &str,
+    request: &tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    let params = parse_query(query);
+    let Some(login_session) = params.get("loginSession").filter(|v| !v.is_empty()) else {
+        return error_response(400, "loginSession required");
+    };
+    let Some(source_url) = state
+        .book_service
+        .source_for_login_session(login_session)
+        .await
+    else {
+        return error_response(403, "invalid or expired loginSession");
+    };
+    let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap_or_default();
+    let cookie = body.get("cookie").and_then(|v| v.as_str()).unwrap_or("");
+    if cookie.trim().is_empty() {
+        return error_response(400, "cookie required");
+    }
+    // 目标地址由**后端**决定(书源地址), 不接受页面传入 —— 否则登录页脚本就能
+    // 把会话写到任意域。页面若要写子域 cookie, 由 `set_panel_cookie` 的域校验兜住。
+    if let Err(err) = state
+        .book_service
+        .set_source_login_cookie(&source_url, cookie)
+        .await
+    {
+        return error_response(400, &err);
+    }
+    http::Response::builder()
+        .status(200)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .body(br#"{"ok":true}"#.to_vec())
+        .unwrap_or_default()
+}
 
 /// 登录页代理: 从路径里取会话, 把**剩余路径**原样转发给上游。
 ///
@@ -2325,6 +2378,30 @@ fn find_head_end_tag(html: &str) -> Option<usize> {
 /// 不能在脚本文本里改：`"/api"` 是 axios 的 baseURL，字符串替换既认不出哪些
 /// 字面量是接口前缀，也会把正则/提示文案里的路径一起改坏。运行时拦截
 /// `fetch` / `XMLHttpRequest` / `sendBeacon` 才能精确处理「真正要发出的请求」。
+///
+/// **导航也必须接管**（与 `build_source_panel_bridge_script` 同一套思路）。
+/// 登录成功后应用要换页：Vue Router 走 `history.pushState(state, title, "/user/profile")`，
+/// 失败兜底走 `location.href = "/user/login"`。两者的目标路径都**不带会话段**，
+/// 一旦放行地址栏就跳出 `/__login/<s>/` 空间 —— 兜底路由只从 query/cookie 认
+/// 会话，认不出写在路径里的那一份，于是 404，页面停在原地。用户看到的就是
+/// 「提示登录成功，但不跳转」。
+/// 供集成测试取登录页注入脚本（脚本本体是 `format!` 拼的，语法写坏了不会有
+/// 编译期报错，只能在测试里交给 JS 引擎解析一遍）。
+pub fn build_login_request_rewrite_script_for_test(
+    login_session: &str,
+    upstream_origin: &str,
+) -> String {
+    build_login_request_rewrite_script(login_session, upstream_origin)
+}
+
+/// 同上，供测试取 cookie 桥脚本。
+pub fn build_cookie_harvest_script_for_test(
+    book_source_url: &str,
+    login_session: &str,
+) -> String {
+    build_cookie_harvest_script(book_source_url, login_session)
+}
+
 fn build_login_request_rewrite_script(login_session: &str, upstream_origin: &str) -> String {
     let session_json = serde_json::to_string(login_session).unwrap_or_else(|_| "\"\"".to_string());
     let origin_json = serde_json::to_string(upstream_origin).unwrap_or_else(|_| "\"\"".to_string());
@@ -2336,6 +2413,9 @@ fn build_login_request_rewrite_script(login_session: &str, upstream_origin: &str
   var upstreamOrigin = {origin_json};
   var prefix = "/__login/" + encodeURIComponent(session) + "/";
   var here = location.origin;
+  // 本应用自己的、不能收进会话路径空间的端点。cookie 桥就在这里 —— 它属于宿主,
+  // 不是上游页面的一部分。
+  var RESERVED_PATHS = ["/loginCookieBridge", "/sourcePanel", "/sourcePanelBridge", "/bookSourceProxy", "/cover", "/epub", "/pdf", "/files"];
   // 上游文档路径: 当前地址剥掉会话段后的部分。相对路径必须相对**它**解析
   // (`/__login/<s>/user/me` 里的 `api/x` 是上游的 `/user/api/x`)。
   var upstreamPath = location.pathname;
@@ -2351,8 +2431,14 @@ fn build_login_request_rewrite_script(login_session: &str, upstream_origin: &str
       // data:/blob:/javascript: 等非 http(s) 协议交给浏览器自己处理。
       if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url) && !/^https?:/i.test(url)) return url;
       if (url.lastIndexOf("/__login/", 0) === 0 || url.indexOf(prefix) === 0) return url;
+      // **本应用自己的端点不能被补会话段**。cookie 桥挂在 reader origin 根下
+      // (`/loginCookieBridge`), 它既不是上游页面也不是上游接口, 补成
+      // `/__login/<s>/loginCookieBridge` 会被当成上游路径转发, 上游没有它就 404
+      // —— cookie 于是写不进 jar, 页面判登录态读不到 token, 又退回登录页。
+      if (url.lastIndexOf(RESERVED_PATHS[0], 0) === 0) return url;
       var parsed = new URL(url, base);
       if (parsed.pathname.lastIndexOf(prefix, 0) === 0) return url;
+      if (parsed.pathname.lastIndexOf(RESERVED_PATHS[0], 0) === 0) return url;
       // 本站(**reader origin**)与上游域名的请求都要收回代理: 前者是 axios 的
       // `baseURL` 拼出的绝对路径, 后者是写死域名的接口地址。跨域直连会被
       // CORS 拦掉, 站点 Cookie 也不在浏览器侧。
@@ -2374,6 +2460,22 @@ fn build_login_request_rewrite_script(login_session: &str, upstream_origin: &str
       return rawFetch.call(this, input, init);
     }};
   }}
+  // 登录页常是 PWA, 会自注册 ServiceWorker(`/user/sw.js`)。自定义协议下
+  // WebView2 不支持 SW, 注册必然失败并在控制台留一条 TypeError。这里让它
+  // 立刻"成功"返回一个占位 registration: 不能返回 rejected promise —— 页面
+  // 普遍写 `register(...)` 而不接 `.catch`, 那样仍是一条 unawaited rejection。
+  if (navigator.serviceWorker) {{
+    try {{
+      var fakeScope = (function () {{
+        try {{ return new URL("./", location.href).href; }} catch (_e) {{ return location.href; }}
+      }})();
+      navigator.serviceWorker.register = function () {{
+        return Promise.resolve({{ scope: fakeScope, active: null, installing: null, waiting: null, update: function () {{ return Promise.resolve(); }}, unregister: function () {{ return Promise.resolve(true); }} }});
+      }};
+      navigator.serviceWorker.getRegistrations = function () {{ return Promise.resolve([]); }};
+      navigator.serviceWorker.getRegistration = function () {{ return Promise.resolve(undefined); }};
+    }} catch (_e) {{}}
+  }}
   var rawOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url) {{
     var args = Array.prototype.slice.call(arguments);
@@ -2384,6 +2486,110 @@ fn build_login_request_rewrite_script(login_session: &str, upstream_origin: &str
     var rawBeacon = navigator.sendBeacon.bind(navigator);
     navigator.sendBeacon = function (url, data) {{ return rawBeacon(fix(url), data); }};
   }}
+
+  // ── 导航接管（登录成功后为什么不跳转）──
+  //
+  // 上面只接管了「请求」。「登录成功后换页」走的是另一条路，而且不止一种：
+  //
+  //   Vue Router 的 pushState/replaceState → 同文档路由切换，不发请求
+  //   `location.href = "/user/login"`      → 整页导航（登录失败兜底）
+  //
+  // 两者的目标路径都**不带会话段**（路由 base 是 `/user/`）。放行就等于把
+  // 地址栏从 `/__login/<s>/user/me` 换成 `/user/me`，兜底路由只从 query 与
+  // cookie 认会话，认不出写在**路径**里的那一份 → 404 → 页面停住不动。
+  // 用户看到的就是「提示登录成功，但页面没跳转」。
+  //
+  // 这里必须把「导航目标」也过一遍 fix()，让会话段跟着走。与
+  // `build_source_panel_bridge_script` 同一套思路（那边是换成面板代理地址，
+  // 这里是补上会话段），但**不能照搬它的 click 委托**：登录页是单页应用，
+  // 路由切换根本不产生 click，只拦 <a> 完全没用。
+  var nativePush = window.history.pushState;
+  var nativeReplace = window.history.replaceState;
+  function rewriteHistoryUrl(url) {{
+    if (url == null) return url;
+    var fixed = fix(String(url));
+    return fixed;
+  }}
+  window.history.pushState = function (state, title, url) {{
+    var args = Array.prototype.slice.call(arguments);
+    if (args.length >= 3) args[2] = rewriteHistoryUrl(args[2]);
+    return nativePush.apply(window.history, args);
+  }};
+  window.history.replaceState = function (state, title, url) {{
+    var args = Array.prototype.slice.call(arguments);
+    if (args.length >= 3) args[2] = rewriteHistoryUrl(args[2]);
+    return nativeReplace.apply(window.history, args);
+  }};
+  // 页面脚本出错时在页面上留一行文字, 而不是让用户对着一片空白。
+  //
+  // 登录页普遍是打包产物, 一个模块加载失败就整体不挂载; WebView2 的控制台用户
+  // 看不到, 于是只能看到「空白」。把首个未捕获错误写到页面上(带堆栈首行),
+  // 用户截图报障时就能直接定位是脚本错误还是网络错误。
+  // `?__readerNoErrorOverlay=1` 可关掉(排查时不想被它干扰)。
+  if (location.search.indexOf("__readerNoErrorOverlay=1") < 0) {{
+    var shown = false;
+    function showFailure(text) {{
+      if (shown) return;
+      shown = true;
+      try {{
+        var box = document.createElement("div");
+        box.setAttribute("data-reader-error", "1");
+        box.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:2147483647;"
+          + "max-height:45%;overflow:auto;padding:10px 12px;margin:0;"
+          + "font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;"
+          + "background:#2b1d1d;color:#ffd9d9;border-top:1px solid #8a3b3b;";
+        box.textContent = "登录页加载失败：" + text;
+        (document.body || document.documentElement).appendChild(box);
+      }} catch (_e) {{}}
+    }}
+    window.addEventListener("error", function (event) {{
+      var target = event && event.target;
+      // 资源加载错误(`<script>`/`<link>` 的 error 不冒泡, 只能靠捕获阶段拿到)。
+      if (target && target !== window && (target.src || target.href)) {{
+        showFailure("资源加载失败 " + (target.src || target.href));
+        return;
+      }}
+      var err = event && event.error;
+      var detail = (err && (err.stack || err.message)) || (event && event.message) || "未知脚本错误";
+      showFailure(String(detail).split("\n").slice(0, 3).join("\n"));
+    }}, true);
+    window.addEventListener("unhandledrejection", function (event) {{
+      var reason = event && event.reason;
+      var detail = (reason && (reason.stack || reason.message)) || String(reason);
+      showFailure("未处理的 Promise 拒绝：" + String(detail).split("\n").slice(0, 3).join("\n"));
+    }});
+  }}
+  // 整页导航：`location.href = …` / `location.assign(…)` / `<a>` 点击。
+  // `Location.prototype.href` 是 [Unforgeable] 属性，改 setter 不生效，只能
+  // 拦 navigation 事件；老 WebView 没有该 API 时靠 click 兜底。
+  var rawAssign = window.location.assign.bind(window.location);
+  if (window.navigation && typeof window.navigation.addEventListener === "function") {{
+    window.navigation.addEventListener("navigate", function (event) {{
+      if (event.hashChange || event.downloadRequest || !event.cancelable) return;
+      var destination = event.destination.url;
+      var fixed;
+      try {{ fixed = fix(destination); }} catch (_e) {{ return; }}
+      if (!fixed || fixed === destination) return;
+      event.preventDefault();
+      try {{ rawAssign(fixed); }} catch (_e) {{}}
+    }});
+  }}
+  document.addEventListener("click", function (event) {{
+    if (event.defaultPrevented || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    var anchor = event.target && event.target.closest ? event.target.closest("a[href]") : null;
+    if (!anchor || anchor.hasAttribute("download")) return;
+    var anchorTarget = (anchor.getAttribute("target") || "").toLowerCase();
+    if (anchorTarget && anchorTarget !== "_self") return;
+    var raw = anchor.getAttribute("href") || "";
+    // 这里用单引号比较: 双引号加井号的字面量会提前终止外层的原始字符串。
+    if (!raw || raw.charAt(0) === '#') return;
+    if (/^(mailto|tel|javascript):/i.test(raw)) return;
+    var fixed = fix(raw);
+    if (fixed === raw) return;
+    event.preventDefault();
+    try {{ rawAssign(fixed); }} catch (_e) {{}}
+  }}, true);
 }})();
 </script>
 "#,
@@ -2392,26 +2598,107 @@ fn build_login_request_rewrite_script(login_session: &str, upstream_origin: &str
     )
 }
 
-/// 登录页请求代理脚本。Cookie 不暴露给页面，避免不同书源共享
-/// reader.localhost origin。
+/// 登录页的 cookie 桥：让页面写入的 `document.cookie` 真正落到书源 jar。
+///
+/// 登录页与面板是两条独立的链路，早先这里只把 `document.cookie` 用 postMessage
+/// **上报给父窗口**，而父窗口根本没有监听这条消息 —— 等于死消息。更要命的是：
+/// 有些站点把登录凭据写在 `document.cookie` 里（token 而非服务端 session），
+/// 页面自己随后要读 `document.cookie` 判断「我登录了没」。WebView2 在自定义
+/// 协议下对 `__login/<s>/` 路径的 document.cookie 读写是**隔离且为空**的，
+/// 于是：
+///
+/// 1. 登录接口确实成功（页面弹出「登录成功」）；
+/// 2. 路由守卫执行 `getCookie('novel_user_access_token')` → 空 → 判定未登录；
+/// 3. 守卫随即 `POST /api/auth/logout` 并把地址重定向回 `/login`；
+/// 4. 用户看到「提示登录成功，但页面停在登录页不动」。
+///
+/// 面板那条链路早就解决了同一个问题（`render_source_panel_page_with_cookie` 里
+/// 劫持 setter + 同步桥写 jar），登录页漏了这一半。这里补齐：
+///
+/// - **写入**：setter 把 `名字=值` 经同步桥落到书源 jar（`cookieSet`），
+///   过期/空值按删除处理；
+/// - **读取**：getter 把 jar 里的条目合并进返回值，页面自己判登录态就能通过；
+/// - **初始注入**：先把 jar 里已有的条目写回浏览器（部分环境可写）。
 fn build_cookie_harvest_script(book_source_url: &str, login_session: &str) -> String {
     let login_session_json =
         serde_json::to_string(login_session).unwrap_or_else(|_| "\"\"".to_string());
-    // 登录页跑在 reader origin 的**上游原始路径**上(见前端 frameUrl), 页面发出的
-    // 每个请求天然带着正确路径, 由兜底路由统一转发回上游。
-    //
-    // 因此这里**不再改写** fetch/XHR/资源地址: 一旦改写成 `/bookSourceProxy?...`,
-    // 打包产物的绝对路径(路由 base `/user/`、分片 `"/user/"+chunk`)就会全部 404,
-    // 单页应用永远挂载不起来 —— 那正是登录页长期白屏的根因。保持地址原样才能
-    // 复刻 legado 在手机端直接 `loadUrl` 的行为。
-    //
-    // 本脚本只负责把 document.cookie 的变化同步给宿主(部分站点把凭据写在脚本
-    // 可读的 cookie 里), 供上层尝试采集。
     let _ = book_source_url;
     format!(
-        r#"<script>
+        r##"<script>
 (function() {{
   var loginSession = {login_session_json};
+  if (!loginSession) return;
+  var bridgeUrl = "/loginCookieBridge?loginSession=" + encodeURIComponent(loginSession);
+
+  // 页面写入的 cookie 落到书源 jar。同步发送: `document.cookie = …` 是同步
+  // 赋值, 调用方紧接着就可能读回来, 异步队列会让它读到旧值。
+  function pushCookie(pair) {{
+    try {{
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", bridgeUrl, false);
+      xhr.setRequestHeader("Content-Type", "text/plain;charset=UTF-8");
+      xhr.send(JSON.stringify({{ cookie: String(pair) }}));
+    }} catch (_e) {{}}
+  }}
+
+  // ── 劫持 document.cookie ──
+  //
+  // 两个方向都必要：
+  //   读：页面用 `getCookie('novel_user_access_token')` 判登录态，读不到就
+  //       当作未登录（触发登出并弹回登录页）—— 这是「提示登录成功但不跳转」
+  //       的真正原因，比导航本身更靠前一步。
+  //   写：token 只在浏览器侧写的话，转发请求带不上，上游也认不出登录态。
+  var jar = {{}};
+  var desc = Object.getOwnPropertyDescriptor(Document.prototype, "cookie")
+    || Object.getOwnPropertyDescriptor(HTMLDocument.prototype, "cookie")
+    || Object.getOwnPropertyDescriptor(document, "cookie");
+  if (desc && desc.get && desc.set) {{
+    var nativeGet = desc.get, nativeSet = desc.set;
+    Object.defineProperty(document, "cookie", {{
+      configurable: true,
+      get: function () {{
+        var merged = {{}};
+        try {{
+          String(nativeGet.call(document) || "").split(/;\s*/).forEach(function (p) {{
+            var i = p.indexOf("=");
+            if (i > 0) merged[p.slice(0, i).trim()] = p.slice(i + 1).trim();
+          }});
+        }} catch (_e) {{}}
+        // 宿主侧 jar 优先：同名时以真正会发给上游的值为准。
+        Object.keys(jar).forEach(function (k) {{
+          if (jar[k] === null) delete merged[k];
+          else merged[k] = jar[k];
+        }});
+        return Object.keys(merged).map(function (k) {{ return k + "=" + merged[k]; }}).join("; ");
+      }},
+      set: function (value) {{
+        try {{ nativeSet.call(document, value); }} catch (_e) {{}}
+        try {{
+          var raw = String(value);
+          var head = raw.split(";")[0].trim();
+          if (!head || head.indexOf("=") <= 0) return;
+          var name = head.slice(0, head.indexOf("=")).trim();
+          var val = head.slice(head.indexOf("=") + 1).trim();
+          // 页面用 `x=; expires=<过去>` 删除 cookie(退出登录), 空值/过期都要删。
+          var expired = false;
+          var m = /;\s*expires\s*=\s*([^;]+)/i.exec(raw);
+          if (m) {{
+            var at = Date.parse(m[1].trim());
+            expired = !isNaN(at) && at <= Date.now();
+          }}
+          if (expired || !val) {{
+            delete jar[name];
+            // 宿主侧按「空值」判定删除, 不能把原串发过去(那会被当成有效值)。
+            pushCookie(name + "=");
+            return;
+          }}
+          jar[name] = val;
+          pushCookie(head);
+        }} catch (_e) {{}}
+      }}
+    }});
+  }}
+
   function report() {{
     try {{
       if (window.parent && window.parent !== window) {{
@@ -2429,7 +2716,7 @@ fn build_cookie_harvest_script(book_source_url: &str, login_session: &str) -> St
   window.addEventListener("pagehide", report);
 }})();
 </script>
-"#,
+"##,
         login_session_json = login_session_json,
     )
 }
@@ -3228,7 +3515,30 @@ mod tests {
         assert!(script.contains("parsed.origin === upstreamOrigin"));
         // 不加 Cookie: 站点 Cookie 只留在后端按书源隔离的 jar 里。
         assert!(!script.contains("document.cookie"));
-        assert!(!script.contains("/bookSourceProxy"));
+        // 不改写成 `/bookSourceProxy?url=` 那种代理形态: 保持上游路径原样,
+        // 会话靠路径前缀带。`RESERVED_PATHS` 里出现该串是「不要去改写它」,
+        // 与「改写成它」不是一回事, 因此判据要看有没有构造这种 URL。
+        assert!(!script.contains("bookSourceProxy?"));
+    }
+
+    /// 登录成功后换页也必须补会话段，否则地址栏会跳出 `/__login/<s>/` 空间。
+    ///
+    /// 症状是「提示登录成功，但页面不跳转」：单页应用的路由 base 是 `/user/`，
+    /// 登录成功后 `history.pushState(state, title, "/user/me")` 的目标不带会话段，
+    /// 兜底路由认不出**路径**里的会话 → 404 → 页面停在原地。
+    #[test]
+    fn login_script_rewrites_navigation_targets() {
+        let script = build_login_request_rewrite_script("session-a", "https://m.example.site");
+        // 路由跳转: 同文档切换不发请求, 只能拦 history API。
+        assert!(script.contains("window.history.pushState ="));
+        assert!(script.contains("window.history.replaceState ="));
+        // 整页跳转: `location.href = …` 的 setter 改不了([Unforgeable]), 拦导航事件。
+        assert!(script.contains("window.navigation.addEventListener"));
+        // 老 WebView 无 navigation API 时的 click 兜底。
+        assert!(script.contains(r#"closest("a[href]")"#));
+        // 改写后的地址仍要过同一套 fix(): 不能出现「补了会话段却没校验来源」的第二条路径。
+        assert!(script.contains("fix(String(url))"));
+        assert!(script.contains("fix(destination)"));
     }
 
     /// 注入脚本必须排在页面的 `<script>` **之前** 才拦得到请求。

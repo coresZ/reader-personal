@@ -78,6 +78,13 @@ struct JsSourceInfo {
     /// (issue #13 的书源正是这种写法)。
     comment: String,
     variable_comment: String,
+    /// legado `BookSource.loginUrl`：**脚本**可读。一类书源把登录脚本只放在这里，
+    /// 并在 `exploreUrl` 里 `eval(String(source.loginUrl)); login();` 复用其中的
+    /// `login()` / `set()` 等函数。JS 里取不到就是 `login is not defined`，
+    /// 发现页整块失效。
+    login_url: String,
+    /// legado `BookSource.loginUi`：同上，部分书源的 `exploreUrl` 会读它判断登录态。
+    login_ui: String,
     headers: Vec<(String, String)>,
     header_script: Option<String>,
     http: Option<SourceHttpContext>,
@@ -220,6 +227,8 @@ pub fn with_source<T>(source: &BookSource, f: impl FnOnce() -> T) -> T {
         name: source.book_source_name.clone(),
         comment: source.book_source_comment.clone().unwrap_or_default(),
         variable_comment: source.variable_comment.clone().unwrap_or_default(),
+        login_url: source.login_url.clone().unwrap_or_default(),
+        login_ui: source.login_ui.clone().unwrap_or_default(),
         headers,
         header_script,
         http,
@@ -876,6 +885,39 @@ const JS_PRELUDE: &str = r#"(function (g) {
         if (prop === 'headers') return headers;
         if (prop === 'header') {
           return function (k) { var v = headers[S(k).toLowerCase()]; return v === undefined ? null : v; };
+        }
+        // legado 的 `StrResponse.cookies()` 返回 okhttp `Response.cookies()`
+        // （`List<Cookie>`）。书源用它读**响应下发的 Cookie**，典型写法：
+        //
+        //   var token = java.get("https://passport.example.test", {}).cookies()
+        //     .toString().match(/session_token=([^,]*)/)[1];
+        //   source.putLoginHeader(JSON.stringify({authorization: "Bearer " + token}));
+        //
+        // 缺这个方法时脚本抛 "not a function"，`Token()` 整个失败 —— 后续所有
+        // 接口请求都少 `authorization`，服务端回 `401`。
+        // 界面症状是**详情简介空、目录 0 章**，而搜索正常（搜索接口不校验 token）。
+        //
+        // 我们的 jar 已按域名隔离并保存了下发的 cookie（`__http` 收完响应会
+        // `g.cookie.setCookie`），因此这里按**本次请求的最终地址**把该域下的
+        // cookie 拼成 `name=value` 串；`toString()` 交给 JS 侧 match 用，
+        // 与 okhttp 的 `List<Cookie>.toString()` 输出形式一致（逗号分隔）。
+        if (prop === 'cookies') {
+          return function () {
+            var jarUrl = S(o.url || o.__requestUrl || '');
+            var raw = jarUrl ? S(g.cookie.getCookie(jarUrl)) : '';
+            var list = raw ? raw.split(';') : [];
+            var parts = [];
+            for (var i = 0; i < list.length; i++) {
+              var item = String(list[i]).trim();
+              if (item) parts.push(item);
+            }
+            var joined = parts.join(', ');
+            // 同时给出数组接口，兼容 `cookies().length` 与 `cookies()[0].name` 写法。
+            var arr = parts.slice();
+            arr.toString = function () { return joined; };
+            arr.join = function (sep) { return parts.join(sep === undefined ? ', ' : sep); };
+            return arr;
+          };
         }
         // legado 的 `StrResponse.raw()` 返回 okhttp `Response`, 书源用它判断
         // **重定向**: `result.raw().priorResponse()` 拿到重定向链的上一跳,
@@ -2208,7 +2250,21 @@ const JS_PRELUDE: &str = r#"(function (g) {
   // 再用 `eval(String(source.bookSourceComment))` 取用(issue #13)。
   src.bookSourceComment = si.comment;
   src.variableComment = si.variableComment;
-  src.getVariable = function () { var v = g.__source_get('variable'); return v === null ? g.__store_get('sv:' + si.url) || '' : v; };
+  // legado 的 BookSource 在 JS 里可读 loginUrl / loginUi。一类书源把登录脚本
+  // 只放在 loginUrl 里, 再用 `eval(String(source.loginUrl)); login();` 复用其中的
+  // 函数 —— 取不到就是 login is not defined, 发现页整块失效。
+  src.loginUrl = si.loginUrl;
+  src.loginUi = si.loginUi;
+  // legado 的 `getVariable()` 在**无值**时返回空串，不是 `undefined`/`null`。
+  //
+  // 书源普遍写 `var v = source.getVariable(); if (v == "") { set(0); }` 做首次
+  // 初始化 —— 返回 undefined 时判空不成立，紧接着的 `JSON.parse(v)` 抛
+  // `unexpected token: 'undefined'`，发现页整块失效。
+  src.getVariable = function () {
+    var v = g.__source_get('variable');
+    if (v === null || v === undefined) v = g.__store_get('sv:' + si.url);
+    return v === null || v === undefined ? '' : String(v);
+  };
   src.setVariable = function (v) { if (!g.__source_set('variable', S(v))) throw new Error('保存书源变量失败'); };
   src.putVariable = src.setVariable;
   src.getLoginInfo = function () { return g.__source_get('loginInfo'); };
@@ -2216,7 +2272,20 @@ const JS_PRELUDE: &str = r#"(function (g) {
   src.putLoginInfo = function (v) { return g.__source_set('loginInfo', S(v)); };
   src.removeLoginInfo = function () { g.__source_del('loginInfo'); };
   src.getLoginHeader = function () { return g.__source_get('loginHeader'); };
-  src.getLoginHeaderMap = function () { try { return JSON.parse(src.getLoginHeader() || '{}'); } catch (e) { return {}; } };
+  // legado 的 `getLoginHeaderMap()` 在**没有登录头**时返回 `null`（`BookSource.kt`：
+  // `getLoginHeader()` 为空直接 `null`，否则 GSON 反序列化成 Map）。
+  //
+  // 书源普遍靠这个判空来触发「首次取 token」：
+  //   if (source.getLoginHeaderMap() == null) { this.Token(); }
+  // 早先这里恒返回 `{}`，条件永不成立，`Token()` 从不执行 —— 后续请求全部缺少
+  // `authorization`，接口回 `401 Api Gateway Auth ERROR`。
+  // 界面症状：**详情简介只剩标签、目录 0 章、正文空白**，而搜索正常
+  // （搜索接口不校验 token）。
+  src.getLoginHeaderMap = function () {
+    var raw = src.getLoginHeader();
+    if (raw === null || raw === undefined || String(raw).trim() === '' || String(raw).trim() === '{}') return null;
+    try { return JSON.parse(raw); } catch (e) { return null; }
+  };
   src.putLoginHeader = function (v) {
     var text = typeof v === 'string' ? v : JSON.stringify(v), headers = JSON.parse(text);
     if (!g.__source_set('loginHeader', text)) throw new Error('保存登录请求头失败');
@@ -2890,6 +2959,9 @@ fn eval_js_inner_with_source(
             "name": source_info.name,
             "comment": source_info.comment,
             "variableComment": source_info.variable_comment,
+            // 登录脚本与登录界面: 书源会在 exploreUrl 里 eval(String(source.loginUrl)); login(); 复用其中的函数。
+            "loginUrl": source_info.login_url,
+            "loginUi": source_info.login_ui,
         })
         .to_string();
         globals.set(
@@ -3514,14 +3586,25 @@ fn latin1_string(bytes: &[u8]) -> String {
 
 /// 在 QuickJS 里求值一段脚本。
 ///
-/// Rhino(legado 手机端用的引擎)允许箭头函数的解构形参省掉圆括号, 书源里就有这种写法
-/// (某聚合源的 exploreUrl 就是这种写法):
-///     rows.map([a, b] => ...)   /   rows.map({a} => ...)
-/// 正式语法(ES2015)要求写成 ([a, b]) / ({a}), QuickJS 按正式语法解析, 直接报
-/// "Unexpected token '=>'", 整个书海报废 —— 而这些源在手机上显示正常。
+/// Rhino(legado 手机端用的引擎)比正式规范宽松, 书源里大量依赖这层宽容, 桌面端
+/// 用 QuickJS(严格按 ES 解析)会直接 SyntaxError, 整个书源报废 —— 而手机端正常。
+/// 已知两类, 且都只在**解析失败**后才补救(不预改写, 免得上无关脚本被改动):
 ///
-/// 解析失败且错误提到 "=>" 时, 按 Rhino 的宽容语义补上圆括号重试一次;
-/// 重试仍失败就返回原始错误, 其它失败路径的表现保持不变。
+/// 1. **裸解构箭头形参**: `rows.map([a, b] => …)` / `rows.map({a} => …)`。
+///    正式语法要求 `([a, b])` / `({a})`, QuickJS 报 `Unexpected token '=>'`。
+/// 2. **`let`/`const` 重声明同名形参**:
+///
+///    ```js
+///    function GetUrl(path, params, sourceUrl) {
+///      let sourceUrl = sourceUrl || "…";   // 与形参同名
+///    }
+///    ```
+///
+///    正式规范里 `let`/`const` 绝不能与形参同名, Rhino 允许, QuickJS 报
+///    `invalid redefinition of parameter name`。改成 `var` 语义等价(函数作用域)
+///    且合法 —— 书源本来指望的就是「给形参一个默认值」。
+///
+/// 两个补丁依次叠加尝试, 任一步改写成功就重跑; 都不适用时保留原始错误。
 fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Value<'js>> {
     let failure = match eval_script_raw(ctx.clone(), script) {
         Ok(value) => return Ok(value),
@@ -3535,13 +3618,25 @@ fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Val
     // 判定不靠错误文案(JSON.parse 这类运行期异常文本里同样有 "expecting ...",
     // 关键词匹配会认错), 而是把脚本塞进一个**从不调用**的函数体里求值:
     // 函数体只做语法解析、不执行, 解析失败才说明脚本本身有语法错误。
-    if !script.contains("=>") || !script_fails_to_parse(ctx.clone(), script) {
+    if !script_fails_to_parse(ctx.clone(), script) {
         return Err(failure);
     }
-    let Some(patched) = patch_bare_destructuring_arrow_params(script) else {
+    let mut current = script.to_string();
+    for patch in [
+        patch_bare_destructuring_arrow_params,
+        patch_let_redeclared_params,
+    ] {
+        if !script_fails_to_parse(ctx.clone(), &current) {
+            break;
+        }
+        if let Some(next) = patch(&current) {
+            current = next;
+        }
+    }
+    if current == script {
         return Err(failure);
-    };
-    match eval_script_raw(ctx.clone(), &patched) {
+    }
+    match eval_script_raw(ctx.clone(), &current) {
         Ok(value) => Ok(value),
         // 补丁改对了、但脚本运行期才出错时, 真实原因在重试错误里; 返回首次的
         // "Unexpected token '=>'" 会把 "BOOM" 这类信息整个丢掉。
@@ -3700,6 +3795,261 @@ fn patch_bare_destructuring_arrow_params(script: &str) -> Option<String> {
         out.push(c);
         i += 1;
     }
+    changed.then(|| out.into_iter().collect())
+}
+
+/// 把「`let`/`const` 重声明同名形参」改成 `var`。
+///
+/// 书源里有这种写法（Rhino 允许、正式规范不允许）：
+///
+/// ```js
+/// function GetUrl(path, params, sourceUrl) {
+///   let sourceUrl = sourceUrl || "https://…";   // SyntaxError: 与形参同名
+/// }
+/// ```
+///
+/// ES 规范规定 `let`/`const` 声明绝不能与同作用域的形参同名（即使非严格模式），
+/// QuickJS 严格照办并报 `invalid redefinition of parameter name`；Rhino 宽松放行。
+/// 书源的本意就是「给形参一个默认值」，`var` 在函数作用域里语义等价且合法。
+///
+/// 只改「确实与所在函数的形参同名」的那些声明，其余 `let`/`const` 一律不动 ——
+/// 改成 `var` 会扩大作用域，可能撞上块外的同名变量，不能无差别替换。
+///
+/// 实现从简（只在解析失败后调用）：逐字符扫描，跳过字符串/模板串/注释/正则，
+/// 跟踪函数体的花括号层级与**直接子级**形参名集合，遇到 `let|const <名字> =`
+/// 且该名字在本层形参里时，把这一个关键字换成 `var`。
+/// 供测试观察补丁结果（词法扫描容易写错，需要能直接看改写后的源码）。
+pub fn patch_let_redeclared_params_for_test(script: &str) -> Option<String> {
+    patch_let_redeclared_params(script)
+}
+
+fn patch_let_redeclared_params(script: &str) -> Option<String> {
+    const QUOTE_SINGLE: char = '\u{27}';
+    const QUOTE_DOUBLE: char = '\u{22}';
+    const BACKTICK: char = '\u{60}';
+    const BACKSLASH: char = '\u{5C}';
+    const NEWLINE: char = '\u{A}';
+
+    let chars: Vec<char> = script.chars().collect();
+    // 每层函数体: (花括号深度, 该函数的形参名集合)
+    let mut scopes: Vec<(i32, std::collections::HashSet<String>)> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut out: Vec<char> = Vec::with_capacity(chars.len() + 16);
+    let mut changed = false;
+    let mut i = 0usize;
+
+    // 读一个标识符（从 i 开始），返回 (名字, 结束位置)。
+    fn read_ident(chars: &[char], mut at: usize) -> (String, usize) {
+        let start = at;
+        while at < chars.len()
+            && (chars[at].is_alphanumeric() || chars[at] == '_' || chars[at] == '$')
+        {
+            at += 1;
+        }
+        (chars[start..at].iter().collect(), at)
+    }
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // 字符串 / 模板串：原样复制。
+        if c == QUOTE_SINGLE || c == QUOTE_DOUBLE || c == BACKTICK {
+            out.push(c);
+            i += 1;
+            while i < chars.len() {
+                let ch = chars[i];
+                out.push(ch);
+                i += 1;
+                if ch == BACKSLASH && i < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                } else if ch == c {
+                    break;
+                }
+            }
+            continue;
+        }
+        // 行注释。
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            while i < chars.len() && chars[i] != NEWLINE {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // 块注释。
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            out.push('/');
+            out.push('*');
+            i += 2;
+            while i < chars.len() {
+                if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    out.push('*');
+                    out.push('/');
+                    i += 2;
+                    break;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // 正则字面量。
+        if c == '/' && regex_literal_can_start(&out) {
+            out.push(c);
+            i += 1;
+            let mut in_class = false;
+            while i < chars.len() {
+                let ch = chars[i];
+                if ch == BACKSLASH && i + 1 < chars.len() {
+                    out.push(ch);
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if ch == NEWLINE {
+                    break;
+                }
+                out.push(ch);
+                i += 1;
+                if ch == '[' {
+                    in_class = true;
+                } else if ch == ']' {
+                    in_class = false;
+                } else if ch == '/' && !in_class {
+                    break;
+                }
+            }
+            while i < chars.len() && chars[i].is_ascii_alphabetic() {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        // `function name(params) {` —— 记下形参名，等遇到 `{` 时开作用域。
+        let rest: String = chars[i..chars.len().min(i + 8)].iter().collect();
+        if rest.starts_with("function") && !out.last().is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$') {
+            for ch in "function".chars() {
+                out.push(ch);
+            }
+            i += "function".len();
+            // 函数名（可省略）。
+            while i < chars.len() && chars[i].is_whitespace() {
+                out.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$') {
+                let (_, next) = read_ident(&chars, i);
+                while i < next {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            while i < chars.len() && chars[i] != '(' && chars[i] != '{' && chars[i] != '=' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '(' {
+                let mut params: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut level = 0i32;
+                while i < chars.len() {
+                    let ch = chars[i];
+                    out.push(ch);
+                    i += 1;
+                    match ch {
+                        '(' => level += 1,
+                        ')' => {
+                            level -= 1;
+                            if level == 0 {
+                                break;
+                            }
+                        }
+                        _ => {
+                            // 收集形参名（跳过解构与默认值的粗粒度处理：只认纯标识符）。
+                            if level == 1
+                                && (ch.is_alphanumeric() || ch == '_' || ch == '$')
+                                && !out
+                                    .get(out.len().saturating_sub(2))
+                                    .is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$')
+                            {
+                                let (name, next) = read_ident(&chars, i - 1);
+                                if !name.is_empty() && !name.chars().all(|c| c.is_ascii_digit()) {
+                                    params.insert(name);
+                                }
+                                while i < next {
+                                    out.push(chars[i]);
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                // 等函数体的 `{`。
+                let mut pending = Some(params);
+                while i < chars.len() {
+                    if chars[i] == '{' {
+                        depth += 1;
+                        out.push('{');
+                        i += 1;
+                        if let Some(p) = pending.take() {
+                            scopes.push((depth, p));
+                        }
+                        break;
+                    }
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            continue;
+        }
+
+        // `let x =` / `const x =`：若 x 在当前函数形参里，换成 `var`。
+        let is_let = rest.starts_with("let") && !chars.get(i + 3).is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$');
+        let is_const = rest.starts_with("const") && !chars.get(i + 5).is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$');
+        if (is_let || is_const)
+            && !out.last().is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$' || *p == '.')
+        {
+            let kw_len = if is_let { 3 } else { 5 };
+            // 跳过关键字与空白，读变量名。
+            let mut at = i + kw_len;
+            while at < chars.len() && chars[at].is_whitespace() {
+                at += 1;
+            }
+            let (name, after) = read_ident(&chars, at);
+            let shadowed = !name.is_empty()
+                && scopes
+                    .iter()
+                    .rev()
+                    .find(|(d, _)| *d == depth)
+                    .is_some_and(|(_, params)| params.contains(&name));
+            if shadowed {
+                // 只替换关键字本身，其余原样（缩进、空白都保留）。
+                for ch in "var".chars() {
+                    out.push(ch);
+                }
+                for ch in &chars[i + kw_len..at] {
+                    out.push(*ch);
+                }
+                i = at;
+                let _ = after;
+                changed = true;
+                continue;
+            }
+        }
+
+        // 维护花括号层级。
+        if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            scopes.retain(|(d, _)| *d != depth);
+            depth -= 1;
+        }
+        out.push(c);
+        i += 1;
+    }
+
     changed.then(|| out.into_iter().collect())
 }
 

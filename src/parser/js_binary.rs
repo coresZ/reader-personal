@@ -59,6 +59,26 @@ pub fn run(operation: &str, payload: &Value) -> anyhow::Result<Value> {
             anyhow::ensure!(result.len() <= 64 * 1024 * 1024, "解压内容过大");
             Ok(output(result))
         }
+        // `Packages.java.util.zip.Inflater(true)`（nowrap）：书源把自定义请求体的
+        // 压缩段用 raw deflate 存起来，再在脚本里逐块 inflate 取回 JSON。
+        // nowrap=true 表示**不带 zlib 头**，必须用 `DeflateDecoder` 而不是 `ZlibDecoder`；
+        // 用错会直接报 "invalid zlib header"，书源表现为「解码出 null、发现页空白」。
+        "inflate" => {
+            let data = bytes(&payload["data"])?;
+            let nowrap = payload["nowrap"].as_bool().unwrap_or(true);
+            let mut result = Vec::new();
+            if nowrap {
+                let mut decoder =
+                    flate2::read::DeflateDecoder::new(data.as_slice()).take(64 * 1024 * 1024 + 1);
+                decoder.read_to_end(&mut result)?;
+            } else {
+                let mut decoder =
+                    flate2::read::ZlibDecoder::new(data.as_slice()).take(64 * 1024 * 1024 + 1);
+                decoder.read_to_end(&mut result)?;
+            }
+            anyhow::ensure!(result.len() <= 64 * 1024 * 1024, "解压内容过大");
+            Ok(output(result))
+        }
         // `Packages.java.util.zip.GZIPOutputStream`: 源脚本用它把设备注册包
         // gzip 压缩后再按自定义头部字节发送。
         "gzip" => {

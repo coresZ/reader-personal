@@ -1,7 +1,7 @@
 <template>
   <Transition name="scale">
     <div v-if="modelValue && source" class="source-login-overlay" @click.self="close" @keydown.esc.stop="close">
-      <section class="source-login-dialog" role="dialog" aria-modal="true" :aria-labelledby="`${formId}-title`" :inert="!!browser">
+      <section class="source-login-dialog" :class="{ 'is-web': !!frameUrl }" role="dialog" aria-modal="true" :aria-labelledby="`${formId}-title`" :inert="!!browser">
         <header class="login-header">
           <div class="login-heading">
             <h3 :id="`${formId}-title`">{{ source.bookSourceName }} · 登录</h3>
@@ -33,7 +33,19 @@
           </div>
           <div v-if="messages.length" class="login-messages" role="status">
             <p v-for="(message, index) in messages" :key="index">{{ message }}</p>
-          </div>          <section class="cookie-section" :aria-labelledby="`${formId}-cookie-label`">
+          </div>
+          <!-- 网页登录时把 Cookie 区收成一行折叠条: 登录页本身要占满剩余高度,
+               而这块 static 内容会把它挤成一条窄缝(见 .is-web 的说明)。 -->
+          <details v-if="frameUrl" class="cookie-section cookie-fold">
+            <summary>手动导入 Cookie</summary>
+            <p>粘贴在网站登录后获取的 Cookie，保存后此书源会使用新的登录状态。</p>
+            <textarea :id="`${formId}-cookie`" v-model="cookieText" rows="3" spellcheck="false" autocomplete="off" placeholder="例如：session=…; user=…" :disabled="savingCookie || busy"></textarea>
+            <div class="cookie-actions">
+              <button class="login-button primary" type="button" :disabled="!cookieText.trim() || savingCookie || busy" @click="saveCookie(false)">{{ savingCookie ? '保存中…' : '导入 Cookie' }}</button>
+              <button class="login-button" type="button" :disabled="savingCookie || busy" @click="saveCookie(true)">清除 Cookie</button>
+            </div>
+          </details>
+          <section v-else class="cookie-section" :aria-labelledby="`${formId}-cookie-label`">
             <label :id="`${formId}-cookie-label`" :for="`${formId}-cookie`">手动导入 Cookie</label>
             <p>粘贴在网站登录后获取的 Cookie，保存后此书源会使用新的登录状态。</p>
             <textarea :id="`${formId}-cookie`" v-model="cookieText" rows="3" spellcheck="false" autocomplete="off" placeholder="例如：session=…; user=…" :disabled="savingCookie || busy"></textarea>
@@ -273,6 +285,26 @@ function close() { ++generation; browser.value = null; emit('update:modelValue',
 .login-error { color: var(--color-danger, #b23b38); margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; flex: none; }
 .login-messages { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; flex: none; }
 .login-messages p { margin: 0 0 6px; }
+/* 网页登录态: 弹窗放大, 登录页占满剩余高度。
+   登录页是完整的移动端站点, 880×~380 的窄条会把它的「我的」页压成一小块 —— 底部
+   导航栏能占掉一半, 用户得在巴掌大的区域里滚动。这里放到接近满窗, 并让 iframe
+   真正 flex 撑开(原先 `flex: 1 0 320px` 的 basis 会在内容不足时反过来限制它)。 */
+.source-login-dialog.is-web { width: min(1180px, 100%); height: calc(100dvh - 40px); max-height: calc(100dvh - 40px); }
+.source-login-dialog.is-web .login-body { padding: 0; gap: 0; overflow: hidden; }
+.source-login-dialog.is-web .login-form,
+.source-login-dialog.is-web .login-messages,
+.source-login-dialog.is-web .login-error,
+.source-login-dialog.is-web .login-status { margin: 12px 22px 0; }
+.source-login-dialog.is-web .login-frame { flex: 1 1 auto; min-height: 0; border: 0; border-top: 1px solid var(--color-border-light); }
+/* Cookie 区在网页登录时折叠成一行, 展开后才占高度。 */
+.cookie-fold { margin: 12px 22px 0; padding-top: 12px; }
+.cookie-fold > summary { cursor: pointer; font-size: 13px; color: var(--color-text-secondary); list-style: none; }
+.cookie-fold > summary::-webkit-details-marker { display: none; }
+.cookie-fold > summary::before { content: '▸ '; }
+.cookie-fold[open] > summary::before { content: '▾ '; }
+.cookie-fold > summary:hover { color: var(--color-text); }
+.cookie-fold[open] { flex: none; padding-bottom: 12px; }
+.cookie-fold:not([open]) { flex: none; }
 .login-frame { flex: 1 0 320px; width: 100%; min-height: 240px; border: 1px solid var(--color-border-light); background: #fff; }
-@media (max-width: 560px) { .source-login-overlay { padding: 8px; } .source-login-dialog { height: calc(100dvh - 16px); max-height: calc(100dvh - 16px); } .login-header, .login-body, .login-footer { padding-left: 14px; padding-right: 14px; } }
+@media (max-width: 560px) { .source-login-overlay { padding: 8px; } .source-login-dialog { height: calc(100dvh - 16px); max-height: calc(100dvh - 16px); } .login-header, .login-body, .login-footer { padding-left: 14px; padding-right: 14px; } .source-login-dialog.is-web .login-body { padding: 0; } .cookie-fold { margin-left: 14px; margin-right: 14px; } }
 </style>
