@@ -337,6 +337,68 @@ pub fn close_source_panel(panel_id: String) {
 /// 未登录」的成因。
 ///
 /// 窗口尺寸取主窗口的 92%，居中略偏上，视觉上像「从主窗口里弹出来的」。
+/// 独立窗口的**加载进度条**脚本（作为 `initialization_script` 注入）。
+///
+/// 上游站点常要几百毫秒到好几秒才出首屏，WebView2 在拿到 HTML 之前是一整片
+/// 空底色 —— 用户看到的就是「点了没反应、黑屏卡住」。
+///
+/// 这里只画**顶部 3px 细进度条 + 一行「正在加载…」**，不遮盖页面：
+/// 整层 `pointer-events: none`，页面一就绪就淡出移除。刻意不做全屏遮罩 ——
+/// 遮罩反而让「慢」变成「挡」。
+///
+/// 为什么挂在 `initialization_script` 而不是 `on_page_load(Started)` 里 `eval`：
+/// 前者在文档创建时同步执行，能保证**第一帧**就有东西画；后者要等 WebView2 建好
+/// 再走一次 IPC，慢站点上仍会先闪一下空白。
+fn external_window_progress_script() -> &'static str {
+    r##"
+(function () {
+  if (window.__readerLoadProgress) return;
+  window.__readerLoadProgress = true;
+  function build() {
+    if (!document.documentElement) return null;
+    var wrap = document.createElement('div');
+    wrap.id = '__reader-load-progress';
+    wrap.style.cssText = 'position:fixed;left:0;top:0;right:0;z-index:2147483647;pointer-events:none;font:13px/1.5 system-ui,-apple-system,sans-serif';
+    var track = document.createElement('div');
+    track.style.cssText = 'height:3px;background:rgba(197,111,53,0.18);overflow:hidden';
+    var bar = document.createElement('div');
+    bar.style.cssText = 'height:100%;width:12%;background:#c56f35;transition:width .35s ease-out;border-radius:0 2px 2px 0';
+    track.appendChild(bar);
+    wrap.appendChild(track);
+    var tip = document.createElement('div');
+    tip.textContent = '\u6b63\u5728\u52a0\u8f7d\u2026';
+    tip.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);color:#8a8f94;background:rgba(21,23,25,0.72);padding:8px 16px;border-radius:8px;white-space:nowrap';
+    wrap.appendChild(tip);
+    document.documentElement.appendChild(wrap);
+    return { wrap: wrap, bar: bar };
+  }
+  var parts = build();
+  if (!parts) return;
+  var pct = 12;
+  var timer = setInterval(function () {
+    pct += Math.max(0.8, (90 - pct) * 0.09);
+    if (pct > 90) pct = 90;
+    parts.bar.style.width = pct + '%';
+  }, 260);
+  function done() {
+    clearInterval(timer);
+    parts.bar.style.width = '100%';
+    setTimeout(function () {
+      parts.wrap.style.transition = 'opacity .25s ease-out';
+      parts.wrap.style.opacity = '0';
+      setTimeout(function () { parts.wrap.remove(); }, 260);
+    }, 180);
+  }
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    done();
+  } else {
+    document.addEventListener('DOMContentLoaded', done, { once: true });
+    setTimeout(done, 25000);
+  }
+})();
+"##
+}
+
 #[tauri::command]
 pub async fn open_external_window(
     state: tauri::State<'_, AppState>,
@@ -390,7 +452,11 @@ pub async fn open_external_window(
         tauri::WebviewWindowBuilder::new(&app, LABEL, tauri::WebviewUrl::External(parsed.clone()))
             .title(title.unwrap_or_else(|| "书源网页".to_string()))
             .inner_size(width, height)
-            .min_inner_size(420.0, 320.0);
+            .min_inner_size(420.0, 320.0)
+            // 窗口底色取应用深色背景，避免 WebView2 首帧的白闪。
+            .background_color(tauri::webview::Color(21, 23, 25, 255))
+            // 加载进度条：文档创建时就挂上，慢站点也不会看起来像卡死。
+            .initialization_script(external_window_progress_script());
 
     // 站点里的二级链接（目录、详情、翻页、下载页）常带 `target="_blank"`。
     // 不接管这个回调时 Tauri 走默认实现，在 Windows 上把它们丢给系统浏览器 ——
