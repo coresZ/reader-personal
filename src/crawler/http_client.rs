@@ -280,8 +280,40 @@ fn build_source_builder(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Resul
         .http1_only())
 }
 
+/// legado 的读超时。OkHttp 里 `readTimeout = 60s`、`callTimeout = 60s`
+/// （见 legado `HttpHelper.kt`），与 15s 的连接超时是两个独立的轴。
+///
+/// 早先这里只有一个 `timeout_secs` 同时套住连接和读取：正文页/接口慢一点
+/// （尤其是带图床或反爬延迟的站）就直接超时，而手机端同样的源能读 —— 这类
+/// 「手机能看、桌面空白」有一部分就是这个原因。
+///
+/// 不把 60s 做成配置项：它是**协议层容忍度**而不是产品偏好，跟 `request_timeout_secs`
+/// （连接阶段多久算不通）语义不同，混在一起调会让用户以为调大就能救慢站，
+/// 实际先把「站点已挂」的判断拖长了。
+const SOURCE_READ_TIMEOUT_SECS: u64 = 60;
+
 fn build_builder_base(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<reqwest::ClientBuilder> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let mut builder = Client::builder()
+        // TLS：与 legado 一致，**不校验证书与主机名**。
+        //
+        // legado 的 `HttpHelper.kt` 用的是 `SSLHelper.unsafeSSLSocketFactory` +
+        // `unsafeTrustManager` + `unsafeHostnameVerifier`，即全量跳过校验。书源
+        // 站点里自签名证书、过期证书、证书链不全、`m.xxx.net` 与 `m.xxx.com`
+        // 共用同一张证书的情况都很常见 —— 严格校验会直接把这些源判死，
+        // 表现成「手机端能读、桌面端报错」。
+        //
+        // 风险面与手机端相同：书源抓的是公开网页，唯一需要保密的是登录态
+        // Cookie，而那一层本来也是明文 HTTP 也照发。
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        // 连接阶段：沿用可配置的 `request_timeout_secs`。
+        .connect_timeout(Duration::from_secs(timeout_secs.max(1)))
+        // 读取阶段：按 legado 的 60s。`timeout` 是 reqwest 的**总**超时，
+        // 必须 ≥ 读超时，否则连接快的慢响应仍会被总超时砍掉。
+        .read_timeout(Duration::from_secs(SOURCE_READ_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(
+            SOURCE_READ_TIMEOUT_SECS.max(timeout_secs),
+        ));
     if let Some(proxy) = proxy {
         let bypass = NoProxy::from_string("localhost,127.0.0.1,::1");
         builder = builder.proxy(Proxy::all(proxy)?.no_proxy(bypass));

@@ -82,6 +82,12 @@ windows = { version = "0.62", features = ["Win32_System_Com", "Win32_Foundation"
 [dev-dependencies]
 # Only used by tests/*.rs to spin up local mock upstream sites.
 tokio = { version = "1", features = ["full"] }
+# `tests/source_tls_policy.rs`：起带自签名证书的本地 TLS 服务，验证书源 client
+# 跳过校验（与 legado 的 unsafeTrustManager 对齐）。与 reqwest 共用同一套 rustls。
+# `default-features = false` + `ring`：默认的 aws-lc-rs 需要额外的本地编译链，
+# 而 ring 已在依赖树里（reqwest 的 rustls 后端）。
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pemfile = "1"
 # `server::router` 的 body-limit 回归要直接 poll 一个 Router。
 tower = { version = "0.5", features = ["util"] }
 

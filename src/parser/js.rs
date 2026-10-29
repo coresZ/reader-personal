@@ -54,6 +54,11 @@ static JS_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .gzip(true)
         .brotli(true)
         .deflate(true)
+        // 与书源 client（`crawler::http_client`）保持同一套 TLS 策略：
+        // 不校验证书与主机名（legado `HttpHelper.kt` 的 unsafeTrustManager）。
+        // jsLib 常托管在与源站同一批小站上，自签名/过期证书很常见。
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
         .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build JS HTTP client")
@@ -5065,6 +5070,9 @@ fn js_request_with_bytes(
         // 面板请求(浏览器 `fetch` 过桥的那些)只压单次超时, 不重建 client:
         // 面板首屏会并发几十个头像, 每次新建 reqwest::Client 就得重做一轮 TLS
         // 握手/连接池, 反而更慢。`timeout` 是 per-request 覆盖, 连接池照旧复用。
+        // `follow_redirects` 交由 fetcher 执行：它会在每一跳按新地址重建 `Host`，
+        // 换域跳转才不会带着旧域的 `Host` 打转（详见 `fetcher::fetch_inner`）。
+        let spec = RequestSpec { follow_redirects, ..spec };
         let spec = if panel_request {
             let timeout = std::time::Duration::from_secs(js_panel_timeout_secs(http.timeout_secs));
             RequestSpec { timeout: Some(timeout), ..spec }

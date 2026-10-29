@@ -123,6 +123,10 @@ pub fn analyze_url(
             web_view,
             web_js,
             web_view_delay_time,
+            // 规则解析出的请求一律由 fetcher 自己跟随 3xx（换域跳转时按新地址
+            // 重建 `Host`，见 `fetcher::fetch_inner`）；书源若要读 302 的
+            // `Location`，走的是 `java.get/post/head` 那条显式设 false 的路径。
+            follow_redirects: true,
         })
     })
 }

@@ -44,6 +44,32 @@ pub struct RequestSpec {
     pub web_view: bool,
     pub web_js: Option<String>,
     pub web_view_delay_time: u64,
+    /// 是否跟随 3xx。默认 `true`。
+    ///
+    /// `java.get` / `java.post` / `java.head` 传 `false`（对应 legado 的
+    /// `Jsoup.connect(...).followRedirects(false)`），书源靠读 302 的 `Location`
+    /// 做两步搜索（先换 searchid 再拼结果地址）。跟随关闭时 fetcher 不动响应，
+    /// `Location` 原样交给脚本。
+    #[serde(default = "default_true")]
+    pub follow_redirects: bool,
+}
+
+fn default_true() -> bool { true }
+
+/// reqwest 的「跳转次数超限」错误。
+///
+/// 只能靠 `source()` 链判断：这种情况的 `ErrorKind` 是 `Redirect`，但
+/// `Display` / `{:#}` 都只打印 "error following redirect for url (...)"，
+/// 真正的 "too many redirects" 在最内层的 `source()` 上。
+fn is_too_many_redirects(err: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+    while let Some(inner) = source {
+        if inner.to_string().contains("too many redirects") {
+            return true;
+        }
+        source = inner.source();
+    }
+    false
 }
 
 impl Default for RequestSpec {
@@ -63,6 +89,7 @@ impl Default for RequestSpec {
             web_view: false,
             web_js: None,
             web_view_delay_time: 0,
+            follow_redirects: true,
         }
     }
 }
@@ -198,7 +225,7 @@ async fn fetch_inner(
 
         if let Some(bytes) = req.body_bytes.clone() {
             builder = builder.body(bytes);
-        } else if let Some(body) = req.body {
+        } else if let Some(body) = req.body.clone() {
             if matches!(req.method, HttpMethod::POST) && !has_content_type {
                 builder = builder.header(
                     reqwest::header::CONTENT_TYPE,
@@ -210,7 +237,40 @@ async fn fetch_inner(
             builder = builder.body(body);
         }
 
-        match builder.send().await {
+        let sent = builder.send().await;
+        // 换域跳转会让「显式 `Host`」变成毒药：reqwest 跟随 3xx 时原样沿用我们注入
+        // 的 `Host`，目标是新域却仍宣称旧域，对端于是再回 301 指回新域，直到
+        // `too many redirects`（实测 `m.xxx.net` → `m.xxx.com` 必现）。
+        //
+        // 这类站点只能放弃「Host 首位」这一个 Cloudflare 优化：不注入 `Host`
+        // 重发一次，交给 hyper 按当前地址生成。能走到这里说明首跳已经成功了，
+        // 站点本来也没在用它挡我们，重发是安全的。
+        let sent = match sent {
+            Err(err) if req.follow_redirects && is_too_many_redirects(&err) => {
+                let mut retry = match req.method {
+                    HttpMethod::GET => request_client.get(&req.url),
+                    HttpMethod::POST => request_client.post(&req.url),
+                    HttpMethod::HEAD => request_client.head(&req.url),
+                    HttpMethod::PUT => request_client.put(&req.url),
+                    HttpMethod::PATCH => request_client.patch(&req.url),
+                    HttpMethod::DELETE => request_client.delete(&req.url),
+                };
+                for (k, v) in &req.headers {
+                    retry = retry.header(k, v);
+                }
+                if let Some(timeout) = req.timeout {
+                    retry = retry.timeout(timeout);
+                }
+                if let Some(bytes) = req.body_bytes.clone() {
+                    retry = retry.body(bytes);
+                } else if let Some(body) = req.body.clone() {
+                    retry = retry.body(body);
+                }
+                retry.send().await.or(Err(err))
+            }
+            other => other,
+        };
+        match sent {
             Ok(res) => {
                 let status = res.status().as_u16();
                 let is_successful = res.status().is_success();
