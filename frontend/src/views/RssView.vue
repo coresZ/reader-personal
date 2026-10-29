@@ -177,6 +177,7 @@ import { useRssStore } from '../stores/rss'
 import { showContextMenu } from '../composables/useContextMenu'
 import { useAppStore } from '../stores/app'
 import { openRssSourcePanel, type RssSourcePanel } from '../api/rss'
+import { openExternalWindow } from '../api/sourceClick'
 import { readerOrigin } from '../api/scheme'
 import type { RssArticle } from '../types'
 
@@ -278,6 +279,18 @@ async function loadSourcePanel(sourceUrl: string, url: string) {
     const result = await openRssSourcePanel({ sourceUrl, url })
     if (seq !== panelRequestSeq) return
     panelSourceUrl.value = sourceUrl
+    // RSS 网页改用**独立窗口**打开（后端不再抓 HTML 托管成 iframe 面板）：
+    // 上游常带 X-Frame-Options / CSP frame-ancestors，或用前端安全 SDK 检测
+    // iframe 嵌入并在命中时整页换成拦截提示；独立窗口里 `window.top === window`，
+    // 这些检测都不触发。关窗时后端会把 Cookie 收回该 RSS 源的 jar。
+    if (!result.panelId) {
+      panelRequest.value = null
+      panelFallbackUrl.value = ''
+      panelError.value = ''
+      await openExternalWindow(result.url, result.title || 'RSS 网页', sourceUrl)
+        .catch((err) => { panelError.value = (err as Error).message || '打开窗口失败' })
+      return
+    }
     panelRequest.value = result
     if (result.external) {
       // 自定义 scheme 无法内嵌, 给出可点击的兜底入口。

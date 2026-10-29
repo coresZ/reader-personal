@@ -23,9 +23,19 @@ use reader_rust::model::book_source::book_source_from_value;
 use reader_rust::parser::js::{eval_js, with_source};
 
 fn source_with_lib(lib: &str) -> reader_rust::model::book_source::BookSource {
+    source_at("https://example.test", lib)
+}
+
+/// 同一份 jsLib，但挂在指定的书源地址下。
+///
+/// `js_store` 是**跨用例共享的持久 KV**，键里含书源地址。多个用例若共用同一个
+/// 地址，`cargo test` 并发跑时就会互相踩（A 的 `removeLoginHeader()` 恰好落在
+/// B 的 `putLoginHeader` 与 `getLoginHeaderMap` 之间 → B 读到 `null` 而失败）。
+/// 需要独立登录头的用例必须换一个地址。
+fn source_at(url: &str, lib: &str) -> reader_rust::model::book_source::BookSource {
     book_source_from_value(serde_json::json!({
         "bookSourceName": "示例源",
-        "bookSourceUrl": "https://example.test",
+        "bookSourceUrl": url,
         "jsLib": lib,
     }))
     .expect("source")
@@ -56,7 +66,8 @@ String(source.getLoginHeaderMap())
 /// 写入登录头之后应能解析回对象。
 #[test]
 fn login_header_map_round_trips() {
-    let source = source_with_lib("");
+    // 独立地址：避免与 `login_header_map_is_null_when_absent` 争同一个 KV 键。
+    let source = source_at("https://round-trip.example.test", "");
     let out = with_source(&source, || {
         eval_js(
             r#"

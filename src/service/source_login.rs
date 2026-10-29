@@ -187,11 +187,21 @@ pub fn run(source: &BookSource, action: Option<&str>, supplied_values: Option<Ma
     let browser = take_show_browser_request().map(|request| {
         register_browser_request(request, source_panel_entry(&source.book_source_url)?)
     }).transpose()?;
+    // `mode: "web"` 的语义是「登录页是一个真实网页」。这种页面必须用**独立窗口**
+    // 打开，不能塞进 iframe：上游常带 `X-Frame-Options: SAMEORIGIN` / CSP
+    // `frame-ancestors`，或用前端安全 SDK 检测「自己是否被 iframe 嵌入」——
+    // 命中就整页替换成「页面渲染安全策略拦截」。独立窗口里 `window.top === window`，
+    // 检测不触发，与手机端 legado 直接 `loadUrl` 一致。
+    //
+    // `externalWindow` 让前端走 `open_external_window`（窗口关闭时自动回收
+    // Cookie 写回书源 jar）；`url` 仍照旧返回，便于调试与兼容旧前端。
+    let is_web = !is_form && url.is_some();
     Ok(json!({
-        "mode": if is_form {"form"} else if url.is_some() {"web"} else {"cookie"},
+        "mode": if is_form {"form"} else if is_web {"web"} else {"cookie"},
         "fields":rows, "values":values, "url":url, "openUrl":open_url,
         "messages":messages, "actionCompleted":action.is_some() && !cancelled,
         "showBrowser":browser, "cancelled":cancelled,
+        "externalWindow":is_web,
     }))
 }
 

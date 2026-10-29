@@ -323,6 +323,148 @@ pub fn close_source_panel(panel_id: String) {
     crate::service::book_service::remove_source_panel(&panel_id);
 }
 
+/// 把书源面板里的「二级链接」（注册页、用户后台等）**交给独立窗口**打开。
+///
+/// 为什么不能用 iframe：上游站点常常带 `X-Frame-Options: SAMEORIGIN` 或
+/// CSP `frame-ancestors`，嵌在 iframe 里会被浏览器拒绝渲染；有的站点还会用
+/// 前端安全 SDK 主动检测「自己是否被 iframe 嵌入」，命中就整页替换成
+/// 「页面渲染安全策略拦截」。独立窗口里 `window.top === window`，这些检测
+/// 都不触发 —— 与手机端 legado 直接 `loadUrl` 的行为一致。
+///
+/// **Cookie 回传**：窗口里登录成功后，站点把会话写在它自己的域下，那份 Cookie
+/// 只存在于 WebView2 profile；书源后续请求走我们自己的 jar，两边不通。所以窗口
+/// 关闭时要把 Cookie 读出来写回 jar —— 这正是「窗口里登录成功、回面板仍显示
+/// 未登录」的成因。
+///
+/// 窗口尺寸取主窗口的 92%，居中略偏上，视觉上像「从主窗口里弹出来的」。
+#[tauri::command]
+pub async fn open_external_window(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    url: String,
+    title: Option<String>,
+    book_source_url: Option<String>,
+) -> Result<ApiResponse<()>, AppError> {
+    use tauri::Manager;
+
+    let parsed = url::Url::parse(url.trim())
+        .map_err(|_| AppError::BadRequest(format!("无效的网址: {url}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::BadRequest("只能打开网页地址".into()));
+    }
+
+    // 复用同一个窗口标签：连续点多个链接时只保留最新的那个，不堆窗口。
+    const LABEL: &str = "source-link";
+    if let Some(existing) = app.get_webview_window(LABEL) {
+        let _ = existing.close();
+    }
+
+    // 尺寸按主窗口算：比它小一点，用户能看出这是「子窗口」。
+    let mut width = 900.0_f64;
+    let mut height = 700.0_f64;
+    let mut x = None;
+    let mut y = None;
+    if let Some(main) = app.get_webview_window("main") {
+        if let Ok(size) = main.inner_size() {
+            let scale = main.scale_factor().unwrap_or(1.0);
+            let logical_w = size.width as f64 / scale;
+            let logical_h = size.height as f64 / scale;
+            // 92% 且不超过 1200×900：大屏上不铺满，小屏上留出边距。
+            width = (logical_w * 0.92).clamp(560.0, 1200.0);
+            height = (logical_h * 0.92).clamp(420.0, 900.0);
+        }
+        if let (Ok(pos), Ok(size), Ok(scale)) =
+            (main.outer_position(), main.inner_size(), main.scale_factor())
+        {
+            let logical_x = pos.x as f64 / scale;
+            let logical_y = pos.y as f64 / scale;
+            let logical_w = size.width as f64 / scale;
+            let logical_h = size.height as f64 / scale;
+            // 相对主窗口居中。
+            x = Some(logical_x + (logical_w - width) / 2.0);
+            y = Some(logical_y + (logical_h - height) / 2.0 - 20.0);
+        }
+    }
+
+    let mut builder =
+        tauri::WebviewWindowBuilder::new(&app, LABEL, tauri::WebviewUrl::External(parsed.clone()))
+            .title(title.unwrap_or_else(|| "书源网页".to_string()))
+            .inner_size(width, height)
+            .min_inner_size(420.0, 320.0);
+
+    // 站点里的二级链接（目录、详情、翻页、下载页）常带 `target="_blank"`。
+    // 不接管这个回调时 Tauri 走默认实现，在 Windows 上把它们丢给系统浏览器 ——
+    // 表现就是「窗口里点链接没反应，浏览器却弹出一个新标签」。
+    //
+    // 这里把二级链接**导航回本窗口**：这个窗口本来就只承载一个网页，
+    // 首页 → 二级页 → 详情页在同一窗口里前进后退更像浏览器。
+    // 返回 `Deny` 而不是 `Allow`：`Allow` 会新建 WebView2，而新窗口与主窗口
+    // 各建一个 Environment（见 `0x8007139F` 的说明），很可能建不出来。
+    {
+        let app_for_links = app.clone();
+        builder = builder.on_new_window(move |target, _features| {
+            if matches!(target.scheme(), "http" | "https") {
+                if let Some(window) = app_for_links.get_webview_window(LABEL) {
+                    let _ = window.navigate(target);
+                }
+            }
+            tauri::webview::NewWindowResponse::Deny
+        });
+    }
+
+    // 非网页 scheme（`weixin://`、`alipays://`、`magnet:` 等）留给系统处理，
+    // 否则 WebView2 会当成未知协议报错。网页内的导航一律放行 —— 这个窗口
+    // 的用途就是让人浏览上游站点。
+    builder = builder.on_navigation(|target| {
+        matches!(
+            target.scheme(),
+            "http" | "https" | "about" | "data" | "blob" | "javascript"
+        )
+    });
+    if let (Some(x), Some(y)) = (x, y) {
+        builder = builder.position(x, y);
+    }
+    let window = builder
+        .build()
+        .map_err(|err| AppError::BadRequest(format!("打开窗口失败: {err}")))?;
+
+    // 关闭时把该窗口里的 Cookie 收进 jar。只在**书源侧**登录时做：
+    // 显式传了 `bookSourceUrl` 才写，避免把随便开的网页 Cookie 混进书源会话。
+    if let Some(source_url) = book_source_url.map(|value| value.trim().to_string()) {
+        if !source_url.is_empty() {
+            let service = Arc::clone(&state.book_service);
+            let watched = window.clone();
+            window.on_window_event(move |event| {
+                // 必须在 CloseRequested 里读：Destroyed 触发时 WebView2 已经
+                // 销毁，`with_webview` 拿不到 controller，Cookie 读不出来。
+                if !matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                    return;
+                }
+                let cookies = match crate::service::webview_cookies::read_all(&watched) {
+                    Ok(cookies) => cookies,
+                    Err(err) => {
+                        tracing::warn!(%err, "读取登录窗口 Cookie 失败");
+                        return;
+                    }
+                };
+                if cookies.is_empty() {
+                    return;
+                }
+                let service = Arc::clone(&service);
+                let target = source_url.clone();
+                tauri::async_runtime::spawn(async move {
+                    match service.set_source_window_cookies(&target, &cookies).await {
+                        Ok(0) => tracing::warn!("登录窗口未产生可写入的 Cookie"),
+                        Ok(count) => tracing::info!(count, "已把登录窗口的 Cookie 写回书源"),
+                        Err(err) => tracing::warn!(%err, "写入书源 Cookie 失败"),
+                    }
+                });
+            });
+        }
+    }
+
+    Ok(ApiResponse::ok(()))
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSourceCookieParam {

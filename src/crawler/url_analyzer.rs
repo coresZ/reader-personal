@@ -650,6 +650,54 @@ fn encode_form_value(input: &str, charset: Option<&str>) -> String {
     percent_encode_query_bytes(&bytes)
 }
 
+/// `java.encodeURI(text, charset)` —— 等价于 Java 的
+/// `URLEncoder.encode(text, charset)`。
+///
+/// 与 [`encode_form_value`] 的区别（这不是同一个东西）：
+///   1. **不跳过含 `%` 的片段**。`URLEncoder.encode` 会把 `%` 编成 `%25`，
+///      调用方若已自己编好再交给它只会被二次编码 —— 这正是 Java 的语义。
+///   2. 空格编成 `+`（form 语义），不是 `%20`。
+///   3. 安全字符集是 `[A-Za-z0-9._*-]`，`~` 不在其中（会被编成 `%7E`）。
+///
+/// `charset` 缺失时按 UTF-8，与 legado 的单参数重载一致。
+///
+/// 书源 `java.encodeURI(key,'gbk')` 依赖这条：关键词按 GBK 编码后交给站点的
+/// `charset=gbk` 表单。字符集被忽略时（此前恒按 UTF-8）站点按 GBK 解码得到
+/// 乱码关键词，搜索稳定 0 条 —— 而发现页走 GET、不经过这里，所以看着正常。
+pub(crate) fn java_url_encoder(input: &str, charset: Option<&str>) -> String {
+    let charset = charset.map(str::trim).filter(|value| !value.is_empty());
+    let bytes: Vec<u8> = match charset {
+        // 未声明 / 显式 UTF-8：直接取 UTF-8 字节。
+        None => input.as_bytes().to_vec(),
+        Some(label)
+            if label.eq_ignore_ascii_case("utf-8") || label.eq_ignore_ascii_case("utf8") =>
+        {
+            input.as_bytes().to_vec()
+        }
+        Some(label) => match Encoding::for_label(label.as_bytes()) {
+            Some(encoding) => {
+                let (encoded, _, _) = encoding.encode(input);
+                encoded.into_owned()
+            }
+            // 未知字符集：Java 侧会抛异常并返回空串，这里退回 UTF-8 更宽容 ——
+            // 宁可发出「可能不对但非空」的关键词，也不要让搜索整条链路炸掉。
+            None => input.as_bytes().to_vec(),
+        },
+    };
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for byte in bytes {
+        let ch = byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '*' | '_') {
+            out.push(ch);
+        } else if ch == ' ' {
+            out.push('+');
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 fn escape_encode(input: &str) -> String {
     input
         .chars()
@@ -774,6 +822,19 @@ fn parse_header_token(chars: &[char], index: &mut usize, stop_at_colon: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `java_url_encoder` 必须按声明字符集编码字节。
+    #[test]
+    fn java_url_encoder_honours_charset() {
+        // 「剑来」GBK = BD A3 C0 B4；UTF-8 = E5 89 91 E6 9D A5
+        assert_eq!(java_url_encoder("剑来", Some("gbk")), "%BD%A3%C0%B4");
+        assert_eq!(java_url_encoder("剑来", Some("UTF-8")), "%E5%89%91%E6%9D%A5");
+        assert_eq!(java_url_encoder("剑来", None), "%E5%89%91%E6%9D%A5");
+        // Java URLEncoder 的 form 语义
+        assert_eq!(java_url_encoder("a b", None), "a+b");
+        assert_eq!(java_url_encoder("100%", None), "100%25");
+    }
+
 
     /// 规范 JSON 选项走严格解析（最常走的路径）。
     #[test]

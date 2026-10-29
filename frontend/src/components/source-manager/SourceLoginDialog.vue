@@ -1,7 +1,7 @@
 <template>
   <Transition name="scale">
     <div v-if="modelValue && source" class="source-login-overlay" @click.self="close" @keydown.esc.stop="close">
-      <section class="source-login-dialog" :class="{ 'is-web': !!frameUrl }" role="dialog" aria-modal="true" :aria-labelledby="`${formId}-title`" :inert="!!browser">
+      <section class="source-login-dialog" :class="{ 'is-web': !!webLoginUrl }" role="dialog" aria-modal="true" :aria-labelledby="`${formId}-title`" :inert="!!browser">
         <header class="login-header">
           <div class="login-heading">
             <h3 :id="`${formId}-title`">{{ source.bookSourceName }} · 登录</h3>
@@ -36,7 +36,7 @@
           </div>
           <!-- 网页登录时把 Cookie 区收成一行折叠条: 登录页本身要占满剩余高度,
                而这块 static 内容会把它挤成一条窄缝(见 .is-web 的说明)。 -->
-          <details v-if="frameUrl" class="cookie-section cookie-fold">
+          <details v-if="webLoginUrl" class="cookie-section cookie-fold">
             <summary>手动导入 Cookie</summary>
             <p>粘贴在网站登录后获取的 Cookie，保存后此书源会使用新的登录状态。</p>
             <textarea :id="`${formId}-cookie`" v-model="cookieText" rows="3" spellcheck="false" autocomplete="off" placeholder="例如：session=…; user=…" :disabled="savingCookie || busy"></textarea>
@@ -54,7 +54,13 @@
               <button class="login-button" type="button" :disabled="savingCookie || busy" @click="saveCookie(true)">清除 Cookie</button>
             </div>
           </section>
-          <iframe v-if="frameUrl" class="login-frame" :src="frameUrl" title="书源网页登录"></iframe>
+          <!-- 网页登录页改用**独立窗口**打开（见 applyView 的说明）：上游常用
+               X-Frame-Options / CSP frame-ancestors 或前端 SDK 检测 iframe 嵌入，
+               嵌在这里会整页替换成「渲染安全策略拦截」。这里只显示入口状态。 -->
+          <p v-if="webLoginUrl" class="login-web-hint">
+            登录页已在独立窗口打开。完成登录后关闭该窗口，Cookie 会自动写回此书源。
+            <button class="login-button" type="button" :disabled="busy" @click="reopenWebLogin">重新打开</button>
+          </p>
         </div>
         <footer class="login-footer">
           <span v-if="busy" role="status">正在执行书源操作…</span>
@@ -70,10 +76,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { loginBookSource, setBookSourceCookie, type SourceLoginField, type SourceLoginView } from '../../api/source'
-import { readerOrigin } from '../../api/scheme'
 import type { BookSource } from '../../types'
 import SourceBrowserPanel from '../SourceBrowserPanel.vue'
-import { closeSourcePanel, type ShowBrowserRequest } from '../../api/sourceClick'
+import { closeSourcePanel, openExternalWindow, type ShowBrowserRequest } from '../../api/sourceClick'
 import type { CSSProperties } from 'vue'
 import { useAppStore } from '../../stores/app'
 
@@ -103,31 +108,28 @@ function notify(message: string, type: 'success' | 'error' | 'warning' = 'succes
   appStore.showToast(text, type)
 }
 
-const frameUrl = computed(() => {
-  if (!/^https?:\/\//i.test(previewUrl.value)) return ''
-  // These login pages depend on their original document.domain.
-  if (/^https?:\/\/([\w-]+\.)?(qidian|yuewen)\.com(?:[/:]|$)/i.test(previewUrl.value)) return previewUrl.value
-  // 登录页跑在 reader origin 的专属路径空间里, 且**完整保留上游路径**:
-  //   http://reader.localhost/__login/<session>/user/me?app=yuedu&version=...
-  //
-  // 原因有两个, 缺一不可:
-  // 1. 打包产出的单页应用把路径写死进代码 —— Vue Router 的 base 是 `/user/`,
-  //    分片也可能是 `"/user/" + chunk`。文档路径一旦对不上, 这些绝对路径全部
-  //    404, 应用永远挂载不起来(纯白页)。
-  // 2. WebView2 在自定义协议下**不给子资源发 Cookie, Referer 也是空串**(实测),
-  //    所以会话只能编码进路径, 让每个分片请求天然带着它 —— 见后端
-  //    `source_login_fallback_route`。
-  //
-  // 效果等于在桌面端复刻 legado 手机端直接 `loadUrl(登录页)` 的行为。
-  const session = view.value?.loginSession || ''
-  try {
-    const target = new URL(previewUrl.value)
-    return `${readerOrigin}/__login/${encodeURIComponent(session)}${target.pathname}${target.search}${target.hash}`
-  } catch {
-    const params = new URLSearchParams({ loginSession: session, url: previewUrl.value })
-    return `${readerOrigin}/bookSourceProxy?${params}`
-  }
+/**
+ * `mode: "web"` 的登录页地址。这种页面**不再用 iframe 内嵌**，而是交给独立
+ * 窗口打开（`open_external_window`）—— 上游常带 `X-Frame-Options: SAMEORIGIN`
+ * 或 CSP `frame-ancestors`，或者用前端安全 SDK 检测「自己是否被 iframe 嵌入」，
+ * 命中就把整页替换成「页面渲染安全策略拦截」。独立窗口里 `window.top === window`，
+ * 这些检测都不触发，与手机端 legado 直接 `loadUrl` 的行为一致。
+ *
+ * 这里保留地址只用于「重新打开」按钮与状态提示。
+ */
+const webLoginUrl = computed(() => {
+  if (!view.value?.externalWindow) return ''
+  const target = previewUrl.value
+  return /^https?:\/\//i.test(target) ? target : ''
 })
+
+/** 重新打开独立登录窗口（用户第一次关早了、或想换账号）。 */
+function reopenWebLogin() {
+  const target = webLoginUrl.value
+  if (!target) return
+  void openExternalWindow(target, `登录 ${props.source?.bookSourceName || ''}`, props.source?.bookSourceUrl)
+    .catch((err) => notify(err instanceof Error ? err.message : '打开登录窗口失败', 'error'))
+}
 
 function fieldStyle(field: SourceLoginField): CSSProperties {
   const style = field.style || {}
@@ -144,6 +146,15 @@ function fieldStyle(field: SourceLoginField): CSSProperties {
 }
 
 function showBrowser(request: ShowBrowserRequest, current: number) {
+  // 「看一眼就走」的链接（注册页 / 用户后台 / 网页版阅读）走**独立窗口**：
+  // 这些页面常带 X-Frame-Options / CSP frame-ancestors，或用前端安全 SDK
+  // 检测「是否被 iframe 嵌入」并整页替换成拦截提示。独立窗口不触发。
+  if (request.externalWindow) {
+    if (current !== generation || !props.modelValue) return
+    void openExternalWindow(request.url, request.title || '书源网页', props.source?.bookSourceUrl)
+      .catch((err) => notify(err instanceof Error ? err.message : '打开窗口失败', 'error'))
+    return
+  }
   if (current === generation && props.modelValue) browser.value = request
   else if (request.panelId) void closeSourcePanel(request.panelId).catch(() => {})
 }
@@ -178,6 +189,17 @@ function applyView(result: SourceLoginView) {
   values.value = { ...result.values }
   for (const message of result.messages || []) notify(message)
   if (result.showBrowser) browser.value = result.showBrowser
+  // `mode: "web"` 的登录页必须用**独立窗口**打开：上游常带 X-Frame-Options /
+  // CSP frame-ancestors，或用前端安全 SDK 检测 iframe 嵌入并整页替换成拦截
+  // 提示。窗口关闭时后端会把 Cookie 收回书源 jar。
+  if (result.externalWindow && result.url) {
+    void openExternalWindow(result.url, `登录 ${props.source?.bookSourceName || ''}`, props.source?.bookSourceUrl)
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : '打开登录窗口失败'
+        error.value = message
+        appStore.showToast(message, 'error')
+      })
+  }
 }
 
 watch(() => [props.modelValue, props.source?.bookSourceUrl] as const, async ([visible]) => {
@@ -285,17 +307,18 @@ function close() { ++generation; browser.value = null; emit('update:modelValue',
 .login-error { color: var(--color-danger, #b23b38); margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; flex: none; }
 .login-messages { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; flex: none; }
 .login-messages p { margin: 0 0 6px; }
-/* 网页登录态: 弹窗放大, 登录页占满剩余高度。
-   登录页是完整的移动端站点, 880×~380 的窄条会把它的「我的」页压成一小块 —— 底部
-   导航栏能占掉一半, 用户得在巴掌大的区域里滚动。这里放到接近满窗, 并让 iframe
-   真正 flex 撑开(原先 `flex: 1 0 320px` 的 basis 会在内容不足时反过来限制它)。 */
-.source-login-dialog.is-web { width: min(1180px, 100%); height: calc(100dvh - 40px); max-height: calc(100dvh - 40px); }
-.source-login-dialog.is-web .login-body { padding: 0; gap: 0; overflow: hidden; }
-.source-login-dialog.is-web .login-form,
-.source-login-dialog.is-web .login-messages,
-.source-login-dialog.is-web .login-error,
-.source-login-dialog.is-web .login-status { margin: 12px 22px 0; }
-.source-login-dialog.is-web .login-frame { flex: 1 1 auto; min-height: 0; border: 0; border-top: 1px solid var(--color-border-light); }
+/* 网页登录态: 登录页在**独立窗口**里跑, 弹窗这边只留一条状态提示, 所以不需要
+   放大到满窗 —— 保持普通尺寸反而更像「一个设置项」。 */
+.login-web-hint {
+  margin: 12px 22px 0;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-secondary, rgba(127, 127, 127, .08));
+  border-radius: 8px;
+}
+.login-web-hint .login-button { margin-left: 8px; }
 /* Cookie 区在网页登录时折叠成一行, 展开后才占高度。 */
 .cookie-fold { margin: 12px 22px 0; padding-top: 12px; }
 .cookie-fold > summary { cursor: pointer; font-size: 13px; color: var(--color-text-secondary); list-style: none; }
@@ -305,6 +328,6 @@ function close() { ++generation; browser.value = null; emit('update:modelValue',
 .cookie-fold > summary:hover { color: var(--color-text); }
 .cookie-fold[open] { flex: none; padding-bottom: 12px; }
 .cookie-fold:not([open]) { flex: none; }
-.login-frame { flex: 1 0 320px; width: 100%; min-height: 240px; border: 1px solid var(--color-border-light); background: #fff; }
-@media (max-width: 560px) { .source-login-overlay { padding: 8px; } .source-login-dialog { height: calc(100dvh - 16px); max-height: calc(100dvh - 16px); } .login-header, .login-body, .login-footer { padding-left: 14px; padding-right: 14px; } .source-login-dialog.is-web .login-body { padding: 0; } .cookie-fold { margin-left: 14px; margin-right: 14px; } }
+
+@media (max-width: 560px) { .source-login-overlay { padding: 8px; } .source-login-dialog { height: calc(100dvh - 16px); max-height: calc(100dvh - 16px); } .login-header, .login-body, .login-footer { padding-left: 14px; padding-right: 14px; } .cookie-fold { margin-left: 14px; margin-right: 14px; } }
 </style>

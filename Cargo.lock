@@ -4069,6 +4069,8 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "webview2-com",
+ "windows",
  "winreg",
  "zip",
 ]

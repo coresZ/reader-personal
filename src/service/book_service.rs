@@ -44,6 +44,17 @@ pub struct ShowBrowserRequest {
     /// 后端托管的面板 id(前端按 `${readerOrigin}/sourcePanel?panelId=...` 加载)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub panel_id: Option<String>,
+    /// 用**独立窗口**打开，而不是 iframe 面板。
+    ///
+    /// 只用于「看一眼就走」的链接（注册页、用户后台、网页版阅读页等）：这类
+    /// 上游站点常带 `X-Frame-Options: SAMEORIGIN` / CSP `frame-ancestors`，或
+    /// 用前端安全 SDK 检测「是否被 iframe 嵌入」并整页替换成拦截提示；独立窗口
+    /// 里 `window.top === window`，这些检测都不触发。
+    ///
+    /// 与面板的区别还在于**不回传数据**：前端打开窗口后立即返回，
+    /// 调用脚本拿到空页继续执行。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external_window: bool,
 }
 
 thread_local! {
@@ -321,7 +332,7 @@ pub async fn handle_source_panel_bridge(
                 url: text_of("url"),
                 html: payload.get("html").and_then(|v| v.as_str()).map(str::to_string),
                 preload_js: payload.get("preloadJs").and_then(|v| v.as_str()).map(str::to_string),
-                options, title: None, await_result: false, panel_id: None,
+                options, title: None, await_result: false, panel_id: None, external_window: false,
             }, entry.clone()).map_err(|e| e.to_string())?;
             Ok(json!(request))
         }
@@ -886,6 +897,55 @@ impl BookService {
     ///
     /// 与手动 `set_source_cookie` 的区别：那个用 `replace`（整批覆盖），这个是
     /// 逐条 `set`，因为登录页会分多次写不同 cookie（token、deviceId…）。
+    /// 把**独立登录窗口**里读到的 Cookie 批量写进书源 jar。
+    ///
+    /// 与 `set_source_login_cookie` 的区别：
+    ///   1. 一次写多条（窗口里登录后通常有好几个 Cookie）；
+    ///   2. 域取自 Cookie 自身（`domain`），而不是书源地址 —— 独立窗口打开的是
+    ///      上游真实站点，Cookie 的域可能与之不同（`www` vs 裸域、auth 子域）；
+    ///   3. 书源地址本身可能**不是 URL**（一类聚合源用 jsLib 在运行时拼线路，
+    ///      `bookSourceUrl` 只是一句标识而非网址），那种情况下 `url::Url::parse`
+    ///      会失败，只能完全依赖 Cookie 的域。
+    pub async fn set_source_window_cookies(
+        &self,
+        source_url: &str,
+        cookies: &[crate::service::webview_cookies::CookieRecord],
+    ) -> Result<usize, String> {
+        let context = self
+            .http
+            .source_context("default", source_url, None)
+            .map_err(|e| e.to_string())?;
+        let mut written = 0;
+        for cookie in cookies {
+            if cookie.name.is_empty() || cookie.name.chars().any(char::is_control) {
+                continue;
+            }
+            if cookie.value.chars().any(char::is_control) {
+                continue;
+            }
+            // 域必须是能解析的主机名；`Cookie.Domain` 有时带前导点。
+            let host = cookie.domain.trim().trim_start_matches('.');
+            if host.is_empty() || !host.contains('.') {
+                continue;
+            }
+            let scheme = if cookie.secure { "https" } else { "http" };
+            let path = if cookie.path.starts_with('/') { cookie.path.clone() } else { "/".to_string() };
+            let Ok(url) = url::Url::parse(&format!("{scheme}://{host}{path}")) else {
+                continue;
+            };
+            // 空值代表站点删除了该 Cookie（退出登录）：从 jar 移除同名项，
+            // 而不是写一个空值进去。
+            if cookie.value.trim().is_empty() {
+                let _ = context.session.cookies.remove(&url, &cookie.name);
+                continue;
+            }
+            if context.session.cookies.set(&url, &cookie.pair()).is_ok() {
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
     pub async fn set_source_login_cookie(
         &self,
         source_url: &str,

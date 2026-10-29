@@ -123,6 +123,17 @@ pub fn await_browser(mut request: ShowBrowserRequest) -> BrowserReply {
     outcome
 }
 
+/// 把「看一眼就走」的链接交给独立窗口：**只投递请求，不等待**。
+///
+/// 与 `await_browser` 的区别是不同步等用户操作 —— 注册页/用户后台这类页面
+/// 打开即可，脚本不需要从里面回读数据，所以直接返回让 JS 继续跑，避免把
+/// 整个解析线程挂在一个可能永远关不掉的窗口上。
+pub fn request_external_window(request: ShowBrowserRequest) -> Result<(), String> {
+    let context = BROWSER_CONTEXT
+        .with(|cell| cell.borrow().clone())
+        .ok_or_else(|| "此操作需要先打开书源登录窗口".to_string())?;
+    (context.handler)(request)
+}
 pub fn complete_browser(panel_id: &str, page: BrowserPage) -> Result<(), String> {
     if page.body.trim().is_empty() {
         return Err("网页尚未加载完成，请稍后确认".to_string());

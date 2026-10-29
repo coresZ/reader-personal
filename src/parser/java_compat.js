@@ -4,7 +4,35 @@
     if (result.error) throw new Error(result.error);
     return result.value;
   }
-  function array(value) { return Array.prototype.slice.call(value || []).map(function (v) { return (Number(v) << 24) >> 24; }); }
+  /// 把任意值转成「字节数组」。
+///
+/// **字符串要按 UTF-8 拆字节**，不能走 `Array.prototype.slice.call` —— 那得到的是
+/// 字符（`"key"` → `["k","e","y"]`），`Number("k")` 是 `NaN`，`NaN << 24` 归零，
+/// 于是 `new SecretKeySpec("key", alg)` 的密钥变成 `[0,0,0]`，HMAC 全错。
+/// 这与 Java 的 `String.getBytes()` 语义一致。
+function stringBytes(text) {
+  var out = [];
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i);
+    // 代理对（U+10000 以上）合并成一个码位后再编码。
+    if (code >= 0xD800 && code <= 0xDBFF && i + 1 < text.length) {
+      var low = text.charCodeAt(i + 1);
+      if (low >= 0xDC00 && low <= 0xDFFF) {
+        code = ((code - 0xD800) << 10) + (low - 0xDC00) + 0x10000;
+        i++;
+      }
+    }
+    if (code < 0x80) out.push(code);
+    else if (code < 0x800) out.push(0xC0 | (code >> 6), 0x80 | (code & 63));
+    else if (code < 0x10000) out.push(0xE0 | (code >> 12), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+    else out.push(0xF0 | (code >> 18), 0x80 | ((code >> 12) & 63), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+  }
+  return out;
+}
+function array(value) {
+  if (typeof value === 'string') return stringBytes(value);
+  return Array.prototype.slice.call(value || []).map(function (v) { return (Number(v) << 24) >> 24; });
+}
   function size(n) {
     n = Number(n);
     if (!Number.isInteger(n) || n < 0 || n > 16777216) throw new RangeError('Invalid array length');
@@ -341,6 +369,25 @@
     function SecureRandom() {}
     SecureRandom.prototype.nextBytes = function (target) { arraycopy(native('random', {length:target.length}), 0, target, 0, target.length); };
     SecureRandom.prototype.generateSeed = function (length) { return native('random', {length:size(length)}); };
+    /// `nextInt(bound)`：Java 语义是 `[0, bound)` 的均匀整数；无参时返回任意 32 位有符号数。
+    /// 书源拿它生成 IV / nonce（`SecureRandom().nextInt(256)`），没有它整段加密初始化
+    /// 就抛 `not a function`。
+    SecureRandom.prototype.nextInt = function (bound) {
+      var bytes = native('random', {length:4});
+      var value = ((bytes[0] & 255) << 24) | ((bytes[1] & 255) << 16)
+                | ((bytes[2] & 255) << 8) | (bytes[3] & 255);
+      if (bound === undefined) return value | 0;
+      var n = Math.floor(Number(bound));
+      if (!(n > 0)) throw new Error('bound must be positive');
+      // 取模会有极轻微偏差，但对 IV 用途（256/0x7fffffff）完全够用。
+      return ((value >>> 0) % n);
+    };
+    /// `nextLong()` 的近似实现。
+    SecureRandom.prototype.nextLong = function () {
+      var bytes = native('random', {length:8}), v = 0n;
+      for (var i = 0; i < 8; i++) v = (v << 8n) | BigInt(bytes[i] & 255);
+      return Number(BigInt.asIntN(64, v));
+    };
     var MessageDigest = {getInstance: function (algorithm) {
       var pending = [];
       return {
@@ -360,6 +407,38 @@
       if (!(this instanceof IvParameterSpec)) return new IvParameterSpec(value);
       this.bytes = array(value);
     }
+    /// `javax.crypto.spec.GCMParameterSpec(tagLen, iv)`：AES/GCM 的 IV 载体。
+    /// 与 `IvParameterSpec` 的区别是多了认证标签长度（128 = 16 字节），
+    /// 而 `Cipher` 侧只关心 `bytes` —— 两者可互换交给 `init`。
+    /// 缺了它，源里 `new Packages.javax.crypto.spec.GCMParameterSpec(128, iv)`
+    /// 会抛 `not a function`，整段解密（进而整个搜索）失败。
+    function GCMParameterSpec(tagLen, value) {
+      if (!(this instanceof GCMParameterSpec)) return new GCMParameterSpec(tagLen, value);
+      // 兼容 `(iv)` 单参形式：此时第一个参数其实是 IV。
+      if (value === undefined) { value = tagLen; tagLen = 128; }
+      this.bytes = array(value);
+      this.tLen = Number(tagLen) || 128;
+    }
+    /// `javax.crypto.Mac`：书源写
+    /// `Packages.javax.crypto.Mac.getInstance("HmacSHA256")`
+    /// `.init(new SecretKeySpec(k, alg))` / `.doFinal(bytes)` 做签名。
+    /// 缺了它就是 `cannot read property 'getInstance' of undefined`，
+    /// 整个搜索地址拼不出来 —— 表现为「搜索 0 条」。
+    var Mac = {getInstance: function (algorithm) {
+      var key = null, pending = [];
+      return {
+        init: function (spec) { key = spec && spec.bytes ? spec.bytes : array(spec); },
+        update: function (value) { pending = pending.concat(typeof value === 'number' ? [value] : array(value)); },
+        // `doFinal()` 无参时用 update 累积的数据；带参时把参数接在后面。
+        doFinal: function (value) {
+          if (!key) throw new Error('Mac not initialized');
+          var data = pending.concat(value === undefined ? [] : array(value));
+          pending = [];
+          return native('mac', {algorithm:String(algorithm), key:key, data:data});
+        },
+        reset: function () { pending = []; }
+      };
+    }};
     var Cipher = {ENCRYPT_MODE:1, DECRYPT_MODE:2, getInstance:function (transformation) {
       var key, iv = [], encrypt, pending = [];
       return {
@@ -368,7 +447,59 @@
         doFinal: function (data) { if (!key) throw new Error('Cipher not initialized'); var input = pending.concat(data === undefined ? [] : array(data)); pending = []; return native('cipher', {transformation:String(transformation), encrypt:encrypt, key:key, iv:iv, data:input}); }
       };
     }};
-    function ByteArrayInputStream(data) { this.bytes = array(data); this.position = 0; }
+    /// `java.nio.ByteBuffer`（只实现书源真正用到的那一小块）：
+  /// `allocate(n)` / `putInt` / `put` / `putShort` / `array()` / `flip()`。
+  ///
+  /// 来源写法是 `ByteBuffer.allocate(4).putInt(n|0).array()` 取 4 字节**大端**
+  /// 整数（pow 校验里拼 counter）。缺它整个搜索前置校验就抛
+  /// `not a function`，界面只显示「搜索 0 条」。
+  function ByteBuffer(capacity) {
+    this.buffer = new Array(capacity).fill(0);
+    this.position = 0;
+    this.limit = capacity;
+  }
+  ByteBuffer.allocate = function (capacity) { return new ByteBuffer(Number(capacity) || 0); };
+  ByteBuffer.prototype._ensure = function (need) {
+    if (this.position + need <= this.buffer.length) return;
+    while (this.buffer.length < this.position + need) this.buffer.push(0);
+  };
+  ByteBuffer.prototype.put = function (value) {
+    if (typeof value === 'number') {
+      this._ensure(1);
+      this.buffer[this.position++] = value & 255;
+    } else {
+      var bytes = array(value);
+      this._ensure(bytes.length);
+      for (var i = 0; i < bytes.length; i++) this.buffer[this.position++] = bytes[i] & 255;
+    }
+    return this;
+  };
+  ByteBuffer.prototype.putInt = function (value) {
+    var v = Number(value) >>> 0;
+    this._ensure(4);
+    // Java 的 ByteBuffer 默认大端
+    this.buffer[this.position++] = (v >>> 24) & 255;
+    this.buffer[this.position++] = (v >>> 16) & 255;
+    this.buffer[this.position++] = (v >>> 8) & 255;
+    this.buffer[this.position++] = v & 255;
+    return this;
+  };
+  ByteBuffer.prototype.putShort = function (value) {
+    var v = Number(value) & 0xFFFF;
+    this._ensure(2);
+    this.buffer[this.position++] = (v >>> 8) & 255;
+    this.buffer[this.position++] = v & 255;
+    return this;
+  };
+  ByteBuffer.prototype.flip = function () { this.limit = this.position; this.position = 0; return this; };
+  ByteBuffer.prototype.rewind = function () { this.position = 0; return this; };
+  ByteBuffer.prototype.remaining = function () { return this.limit - this.position; };
+  ByteBuffer.prototype.array = function () { return this.buffer.slice(0, this.limit); };
+  ByteBuffer.prototype.get = function (index) {
+    return this.buffer[index === undefined ? this.position++ : index] & 255;
+  };
+
+  function ByteArrayInputStream(data) { this.bytes = array(data); this.position = 0; }
     ByteArrayInputStream.prototype.read = function (target, offset, length) {
       if (this.position >= this.bytes.length) return -1;
       if (target === undefined) return this.bytes[this.position++] & 255;
@@ -645,8 +776,8 @@
       security:{MessageDigest:MessageDigest, SecureRandom:SecureRandom},
       io:{ByteArrayInputStream:ByteArrayInputStream, ByteArrayOutputStream:ByteArrayOutputStream, InputStreamReader:InputStreamReader, BufferedReader:BufferedReader},
       net:{URL:URLImpl, HttpURLConnection:UrlConnection, URLEncoder:URLEncoderImpl, URLDecoder:URLDecoderImpl},
-      nio:{charset:{Charset:Charset}},
-      crypto:{Cipher:Cipher, spec:{SecretKeySpec:SecretKeySpec, IvParameterSpec:IvParameterSpec}},
+      nio:{charset:{Charset:Charset}, ByteBuffer:ByteBuffer},
+      crypto:{Cipher:Cipher, Mac:Mac, spec:{SecretKeySpec:SecretKeySpec, IvParameterSpec:IvParameterSpec, GCMParameterSpec:GCMParameterSpec}},
       // `Packages.android.util.Base64` 等 Android 专有类。手机端天然存在，桌面端
       // 必须补；缺了就是 `cannot read property 'util' of undefined`。
       android:{util:{Base64:AndroidBase64}}

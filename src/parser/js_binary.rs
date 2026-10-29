@@ -41,6 +41,25 @@ pub fn run(operation: &str, payload: &Value) -> anyhow::Result<Value> {
             };
             Ok(output(digest))
         }
+        // `Packages.javax.crypto.Mac.getInstance(alg).doFinal(bytes)`：返回原始
+        // 字节而非十六进制。一类书源用它做签名（`HmacSHA256` / `HmacSHA1`），
+        // 再把结果 hex/base64 化拼进请求头。此前 `javax.crypto` 下没有 `Mac`，
+        // 脚本第一行就是 `cannot read property 'getInstance' of undefined`，
+        // 整个搜索 URL 拼不出来 —— 表现为「搜索 0 条」。
+        // `Packages.javax.crypto.Mac.getInstance(alg).doFinal(bytes)`：返回原始
+        // 字节而非十六进制。一类书源用它做签名（`HmacSHA256` 等），再把结果
+        // hex/base64 化拼进请求头。此前 `javax.crypto` 下没有 `Mac`，
+        // 脚本第一行就是 `cannot read property 'getInstance' of undefined`，
+        // 整个搜索 URL 拼不出来 —— 表现为「搜索 0 条」。
+        "mac" => {
+            let data = bytes(&payload["data"])?;
+            let key = bytes(&payload["key"])?;
+            // 复用 `java.HMacHex` 的算法分发表（返回十六进制），再解回字节：
+            // 这样只需维护一处算法映射，也避开 hmac/digest crate 的多版本
+            // trait bound 纠缠（依赖树里同时存在 digest 0.10 与 0.11）。
+            let hex_digest = super::js::java_hmac_hex_bytes(&key, &text("algorithm"), &data)?;
+            Ok(output(hex::decode(hex_digest)?))
+        }
         "random" => {
             let length = payload["length"].as_u64().filter(|n| *n <= 16 * 1024 * 1024).ok_or_else(|| anyhow::anyhow!("无效数组长度"))? as usize;
             let mut data = vec![0; length];

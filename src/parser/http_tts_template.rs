@@ -643,9 +643,14 @@ mod tests {
     #[test]
     fn expands_java_encode_uri_twice() {
         // 思必驰等引擎要求 text 双重编码：第一层编码中文，第二层编码 '%' 本身。
+        //
+        // 空格的形态跟 `java.encodeURI` 的语义绑定：legado 它是
+        // `URLEncoder.encode`（form 语义，空格 = `+`），所以第一层产出 `+`、
+        // 第二层把 `+` 编成 `%2B`。`%20` 与 `+` 在 query / form 解码下都是空格，
+        // 服务端拿到的一样 —— 这条用例跟着 legado 语义走，不是行为回归。
         let out = expand_template("text={{java.encodeURI(java.encodeURI(speakText))}}", "你好 &x", 5)
             .unwrap();
-        assert_eq!(out, "text=%25E4%25BD%25A0%25E5%25A5%25BD%2520%2526x");
+        assert_eq!(out, "text=%25E4%25BD%25A0%25E5%25A5%25BD%2B%2526x");
     }
 
     #[test]

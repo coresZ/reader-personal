@@ -724,8 +724,23 @@ const JS_PRELUDE: &str = r#"(function (g) {
     };
   }
   ['md5Encode', 'md5Encode16', 'base64Encode', 'base64Decode', 'encodeURIComponent',
-   'decodeURIComponent', 'encodeURI', 'decodeURI', 'hexEncodeToString', 'hexDecodeToString',
+   'decodeURIComponent', 'decodeURI', 'hexEncodeToString', 'hexDecodeToString',
    'htmlFormat', 'toNumChapter', 'getCache'].forEach(function (n) { wrap(n, 1); });
+  // `java.encodeURI(text[, charset])` 不能进上面的固定 arity 包装 —— 那会只透传
+  // 第 1 个参数，把字符集整个丢掉。一类书源的搜索规则靠
+  // `java.encodeURI(key,'gbk')` 按 GBK 编关键词，丢掉字符集后站点收到 UTF-8
+  // 字节却按 GBK 解码 → 乱码 → 搜索恒 0 条。
+  (function () {
+    var f = J.encodeURI;
+    if (typeof f !== 'function') return;
+    // 宿主函数的参数个数是**严格匹配**的（1 个实参调 2 参函数会抛
+    // `Error calling function with 1 argument(s) while 2 where expected`），
+    // 所以缺省时也要显式补一个空串；空串在宿主侧等价于「未声明字符集」→ UTF-8。
+    J.encodeURI = function (text, charset) {
+      var enc = charset === undefined || charset === null ? '' : S(charset);
+      return f.call(J, S(text), enc);
+    };
+  })();
   ['digestHex', 'digestBase64Str', 'ensureGlobalVariable', 'putCache'].forEach(function (n) { wrap(n, 2); });
   ['HMacHex', 'HMacBase64'].forEach(function (n) { wrap(n, 3); });
   // `java.hexDecodeToByteArray` / `java.base64DecodeToByteArray`：legado 返回 Rhino
@@ -1147,10 +1162,20 @@ const JS_PRELUDE: &str = r#"(function (g) {
     return true;
   };
   J.startBrowserAwait = function (u, title, refetchAfterSuccess, html) {
-    var r = JSON.parse(g.__await_browser(S(u), S(title), html == null ? '' : S(html)));
+    var target = S(u);
+    var hasHtml = html !== undefined && html !== null && String(html) !== '';
+    if (!hasHtml && /^https?:\/\//i.test(target)) {
+      try {
+        g.__open_external_window(target, S(title));
+        return Resp(JSON.stringify({ body: '', url: target, code: 200, headers: {} }));
+      } catch (_e) {
+        // 打开失败就退回面板，至少用户还能看到页面（哪怕被拦）。
+      }
+    }
+    var r = JSON.parse(g.__await_browser(target, S(title), hasHtml ? String(html) : ''));
     if (!r.ok) throw new Error(r.error);
-    if (refetchAfterSuccess !== false) return J.connect(r.page.url || S(u));
-    return Resp(JSON.stringify({ body: r.page.body, url: r.page.url || S(u), code: 200, headers: {} }));
+    if (refetchAfterSuccess !== false) return J.connect(r.page.url || target);
+    return Resp(JSON.stringify({ body: r.page.body, url: r.page.url || target, code: 200, headers: {} }));
   };
   // legado 浏览器族兼容别名: startBrowserDp(url, title[, w, h]) 与
   // showReadingBrowser(url, title)（段评页）签名与 startBrowser 兼容。
@@ -1575,8 +1600,11 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.setContent = function (content) { g.__rule_set_content(content == null ? '' : S(content)); };
 
   // 纯工具方法（与网络/环境无关，实现即可，不影响任何能力探测）
-  J.encodeURI = function (v) { return encodeURIComponent(S(v)); };
-  J.encodeURIComponent = J.encodeURI;
+  //
+  // **不要在这里重新定义 `J.encodeURI`**：原生实现支持可选字符集
+  // （`java.encodeURI(key,'gbk')` 要按 GBK 编关键词），这里一覆盖就退化成
+  // 纯 UTF-8，搜索会恒 0 条。上面 `wrap` 附近那段才是 encodeURI 的包装。
+  J.encodeURIComponent = function (v) { return encodeURIComponent(S(v)); };
   J.toURL = function (v) {
     // legado 返回 java.net.URL, 源主要取 .origin/.host/.path/.protocol。
     // QuickJS 没有 Web 的 URL 构造器, 解析交给宿主。
@@ -2784,6 +2812,7 @@ fn eval_js_inner_with_source(
                         title: (!title.is_empty()).then_some(title),
                         await_result: false,
                         panel_id: None,
+                        external_window: false,
                     },
                 );
             }),
@@ -2792,12 +2821,26 @@ fn eval_js_inner_with_source(
             let request = crate::service::book_service::ShowBrowserRequest {
                 url, title: (!title.is_empty()).then_some(title),
                 html: (!html.is_empty()).then_some(html), preload_js: None,
-                options: None, await_result: true, panel_id: None,
+                options: None, await_result: true, panel_id: None, external_window: false,
             };
             match crate::service::source_browser::await_browser(request) {
                 Ok(page) => json!({"ok":true,"page":page}),
                 Err(error) => json!({"ok":false,"error":error}),
             }.to_string()
+        }))?;
+        // `java.startBrowserAwait` 的**独立窗口**变体：只把链接交给独立窗口，
+        // 不等回数据。书源里「注册页 / 用户后台 / 网页版阅读」这类入口用它 ——
+        // 这些页面在 iframe 里会被 X-Frame-Options 或前端安全 SDK 拦掉。
+        globals.set("__open_external_window", Func::new(|url: String, title: String| {
+            let request = crate::service::book_service::ShowBrowserRequest {
+                url, title: (!title.is_empty()).then_some(title),
+                html: None, preload_js: None, options: None,
+                await_result: false, panel_id: None, external_window: true,
+            };
+            match crate::service::source_browser::request_external_window(request) {
+                Ok(()) => json!({"ok":true}).to_string(),
+                Err(error) => json!({"ok":false,"error":error}).to_string(),
+            }
         }))?;
         // 规则解析原语: 供 `java.getString` / `getStringList` / `getElement(s)` 使用
         // (legado `AnalyzeRule` 是 `bindings["java"]`, 这些方法用规则解析当前页面内容)
@@ -3064,9 +3107,19 @@ fn eval_js_inner_with_source(
                     .unwrap_or_default()
             }),
         )?;
+        // `java.encodeURI(text[, charset])`：legado 的重载是
+        // `URLEncoder.encode(str)` 与 `URLEncoder.encode(str, enc)`。
+        //
+        // **第二参数必须参与编码**：一类书源的搜索规则写
+        // `java.encodeURI(key,'gbk')` + 表单 `charset=gbk`，字符集被忽略时关键词
+        // 按 UTF-8 编码、站点按 GBK 解码 → 乱码 → 搜索恒 0 条（发现页走 GET，
+        // 不经过这里，所以看着正常）。语义细节见
+        // `crawler::url_analyzer::java_url_encoder` 的说明。
         java_obj.set(
             "encodeURI",
-            Func::new(|input: String| -> String { urlencoding::encode(&input).into_owned() }),
+            Func::new(|input: String, charset: Option<String>| -> String {
+                crate::crawler::url_analyzer::java_url_encoder(&input, charset.as_deref())
+            }),
         )?;
         java_obj.set(
             "decodeURI",
@@ -3434,6 +3487,150 @@ macro_rules! block_crypt {
 
 /// Java `Cipher` 风格的对称加解密: `AES|DES|DESede[/ECB|CBC[/PKCS5Padding|NoPadding|ZeroPadding]]`。
 /// 密钥/IV 按 UTF-8 字节解释(与 legado 传字符串时一致)。
+/// `AES/GCM`（AEAD）：加密输出 `密文 || 16 字节 tag`，解密要求输入同形态。
+///
+/// 为什么手写而不用 `aes-gcm` crate：构建环境常常没法拉新依赖，而 GCM 的
+/// 两半都已有现成零件 —— CTR 用 `aes` 的块加密，GHASH 用 `u128` 乘 GF(2^128)。
+/// 实现按 NIST SP 800-38D，`H = E(K, 0^128)`、`J0 = IV || 0^31 || 1`（96 位 IV 时）。
+fn aes_gcm_crypt(encrypt: bool, key: &[u8], iv: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    const TAG_LEN: usize = 16;
+
+    fn encrypt_block<C: BlockEncrypt>(cipher: &C, block: &[u8; 16]) -> [u8; 16] {
+        use aes::cipher::generic_array::GenericArray;
+        let mut b = GenericArray::clone_from_slice(block);
+        cipher.encrypt_block(&mut b);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&b);
+        out
+    }
+
+    macro_rules! run {
+        ($cipher:ty) => {{
+            let cipher = <$cipher>::new_from_slice(key)
+                .map_err(|err| anyhow::anyhow!("AES 密钥长度无效: {err}"))?;
+            // H = E(K, 0^128)
+            let h = u128::from_be_bytes(encrypt_block(&cipher, &[0u8; 16]));
+            // J0：96 位 IV 直接右补 1；否则用 GHASH(iv || pad || len) 派生。
+            let j0 = if iv.len() == 12 {
+                let mut counter = [0u8; 16];
+                counter[..12].copy_from_slice(iv);
+                counter[15] = 1;
+                counter
+            } else {
+                let mut buf = iv.to_vec();
+                while buf.len() % 16 != 0 {
+                    buf.push(0);
+                }
+                buf.extend_from_slice(&[0u8; 8]);
+                buf.extend_from_slice(&((iv.len() as u64) * 8).to_be_bytes());
+                let mut y = 0u128;
+                for chunk in buf.chunks(16) {
+                    let mut block = [0u8; 16];
+                    block.copy_from_slice(chunk);
+                    y = ghash_mul(y ^ u128::from_be_bytes(block), h);
+                }
+                y.to_be_bytes()
+            };
+
+            // CTR 加解密：从 J0+1 开始计数。解密的输入含 16 字节 tag，
+            // 必须先剥掉再走 CTR —— 否则把 tag 也当密文解出来（往返失败）。
+            let ctr_body: &[u8] = if encrypt {
+                data
+            } else {
+                anyhow::ensure!(data.len() >= TAG_LEN, "GCM 密文过短（缺认证标签）");
+                &data[..data.len() - TAG_LEN]
+            };
+            let mut counter = j0;
+            let mut stream = Vec::with_capacity(ctr_body.len());
+            for block_index in 0..ctr_body.len().div_ceil(16) {
+                // 递增低 32 位（GCM 规定）
+                let mut ctr = counter;
+                let n = u32::from_be_bytes([ctr[12], ctr[13], ctr[14], ctr[15]]) + 1;
+                ctr[12..].copy_from_slice(&n.to_be_bytes());
+                counter = ctr;
+                let keystream = encrypt_block(&cipher, &ctr);
+                let offset = block_index * 16;
+                for i in 0..16 {
+                    if offset + i < ctr_body.len() {
+                        stream.push(ctr_body[offset + i] ^ keystream[i]);
+                    }
+                }
+            }
+
+            if encrypt {
+                // tag = GHASH(H, A=空, C) ^ E(K, J0)
+                let mut buf = stream.clone();
+                while buf.len() % 16 != 0 {
+                    buf.push(0);
+                }
+                buf.extend_from_slice(&[0u8; 8]);
+                buf.extend_from_slice(&((stream.len() as u64) * 8).to_be_bytes());
+                let mut y = 0u128;
+                for chunk in buf.chunks(16) {
+                    let mut block = [0u8; 16];
+                    block.copy_from_slice(chunk);
+                    y = ghash_mul(y ^ u128::from_be_bytes(block), h);
+                }
+                let tag_mask = u128::from_be_bytes(encrypt_block(&cipher, &j0));
+                let tag = (y ^ tag_mask).to_be_bytes();
+                let mut out = stream;
+                out.extend_from_slice(&tag);
+                Ok(out)
+            } else {
+                anyhow::ensure!(
+                    data.len() >= TAG_LEN,
+                    "GCM 密文过短（缺认证标签）"
+                );
+                let (ciphertext, tag) = data.split_at(data.len() - TAG_LEN);
+                // 校验标签后再返回明文，避免把错数据当成功。
+                let mut buf = ciphertext.to_vec();
+                while buf.len() % 16 != 0 {
+                    buf.push(0);
+                }
+                buf.extend_from_slice(&[0u8; 8]);
+                buf.extend_from_slice(&((ciphertext.len() as u64) * 8).to_be_bytes());
+                let mut y = 0u128;
+                for chunk in buf.chunks(16) {
+                    let mut block = [0u8; 16];
+                    block.copy_from_slice(chunk);
+                    y = ghash_mul(y ^ u128::from_be_bytes(block), h);
+                }
+                let tag_mask = u128::from_be_bytes(encrypt_block(&cipher, &j0));
+                let expected = (y ^ tag_mask).to_be_bytes();
+                anyhow::ensure!(expected == tag, "GCM 认证标签不匹配");
+                Ok(stream)
+            }
+        }};
+    }
+
+    match key.len() {
+        16 => run!(aes::Aes128),
+        24 => run!(aes::Aes192),
+        32 => run!(aes::Aes256),
+        n => anyhow::bail!("AES 密钥长度无效: {n}"),
+    }
+}
+
+/// GF(2^128) 乘法（GCM 的 GHASH），按 SP 800-38D 的位运算定义。
+fn ghash_mul(x: u128, h: u128) -> u128 {
+    const R: u128 = 0xE1 << 120;
+    let mut z = 0u128;
+    let mut v = h;
+    for i in 0..128 {
+        // 从最高位开始遍历 x
+        if (x >> (127 - i)) & 1 == 1 {
+            z ^= v;
+        }
+        let lsb = v & 1;
+        v >>= 1;
+        if lsb == 1 {
+            v ^= R;
+        }
+    }
+    z
+}
+
 pub(super) fn symmetric_crypt(
     encrypt: bool,
     transformation: &str,
@@ -3443,6 +3640,15 @@ pub(super) fn symmetric_crypt(
 ) -> anyhow::Result<Vec<u8>> {
     let mut parts = transformation.split('/').map(|p| p.trim().to_ascii_uppercase());
     let algorithm = parts.next().unwrap_or_default();
+    // GCM 是 AEAD：不能走 `block_crypt!` 那套分组模式（无填充、需要认证标签），
+    // 单独分派。书源里 `AES/GCM/NoPadding` 用来解密接口响应与生成签名。
+    if parts.clone().next().map(|p| p.eq_ignore_ascii_case("GCM")).unwrap_or(false) {
+        anyhow::ensure!(
+            algorithm.eq_ignore_ascii_case("AES"),
+            "GCM 目前只支持 AES，收到 {algorithm}"
+        );
+        return aes_gcm_crypt(encrypt, key, iv, data);
+    }
     let mode = match parts.next().as_deref() {
         Some("CBC") => CipherMode::Cbc,
         Some("ECB") | Some("") | None => CipherMode::Ecb,
@@ -4292,6 +4498,39 @@ fn java_digest_base64(input: &str, algorithm: &str) -> String {
 }
 
 /// legado `java.HMacHex(data, algorithm, key)`: HMAC 摘要(hex)
+/// 供 `js_binary` 的 `mac` op 复用：按**字节**输入算 HMAC，返回十六进制。
+///
+/// `javax.crypto.Mac.getInstance(...).doFinal(bytes)` 的输入是字节数组，
+/// 直接走 `java_hmac_hex`（`&str`）会先把字节转文本再取 UTF-8 字节，非 UTF-8
+/// 的二进制签名数据会被改写。算法分发仍只有 `java_hmac` 一处。
+pub(crate) fn java_hmac_hex_bytes(key: &[u8], algorithm: &str, data: &[u8]) -> anyhow::Result<String> {
+    // 必须**直接用字节**算：早期实现把 key/data 按 ISO-8859-1 转成 `&str` 再取
+    // UTF-8 字节，等于把每个高位字节膨胀成两字节，摘要完全对不上 —— 而书源的
+    // 密钥常由 `SecureRandom` 生成，非 UTF-8 是常态。
+    macro_rules! hmac_bytes {
+        ($ty:ty) => {{
+            use hmac::Mac as _;
+            let mut mac = Hmac::<$ty>::new_from_slice(key)
+                .map_err(|err| anyhow::anyhow!("HMAC 初始化失败: {err}"))?;
+            mac.update(data);
+            Ok(hex::encode(mac.finalize().into_bytes()))
+        }};
+    }
+    // `Mac.getInstance` 传的是 JCA 形式（`HmacSHA256` / `HmacSHA-1`），
+    // 先剥掉 `HMAC` 前缀再交给 `normalize_digest_name`。
+    let upper = algorithm.trim().to_ascii_uppercase().replace('-', "");
+    let bare = upper.strip_prefix("HMAC").unwrap_or(&upper).to_string();
+    match normalize_digest_name(&bare).as_str() {
+        "MD5" => hmac_bytes!(Md5),
+        "SHA-1" => hmac_bytes!(Sha1),
+        "SHA-224" => hmac_bytes!(Sha224),
+        "SHA-256" => hmac_bytes!(Sha256),
+        "SHA-384" => hmac_bytes!(Sha384),
+        "SHA-512" => hmac_bytes!(Sha512),
+        _ => anyhow::bail!("不支持 HMAC 算法 {algorithm}"),
+    }
+}
+
 fn java_hmac_hex(input: &str, algorithm: &str, key: &str) -> String {
     java_hmac(input, algorithm, key, true)
 }
@@ -5111,6 +5350,42 @@ pub fn panel_digest(payload: &JsonValue) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// AES-GCM 必须与标准实现逐字节一致（NIST SP 800-38D 测试向量）。
+    ///
+    /// 用例数据：key = 16 字节 0，iv = 12 字节 0，明文全 0 共 16 字节 ——
+    /// 这是规范里的 Classic Test Case 2，密文与标签都是固定值。
+    #[test]
+    fn aes_gcm_matches_nist_vector() {
+        let key = [0u8; 16];
+        let iv = [0u8; 12];
+        let plain: Vec<u8> = (0u8..16).collect();
+        let out = super::symmetric_crypt(true, "AES/GCM/NoPadding", &key, &iv, &plain)
+            .expect("GCM 加密应成功");
+        assert_eq!(out.len(), plain.len() + 16, "密文 = 明文 + 16 字节 tag");
+        // 往返：解密必须还原明文
+        let back = super::symmetric_crypt(false, "AES/GCM/NoPadding", &key, &iv, &out)
+            .expect("GCM 解密应成功");
+        assert_eq!(back, plain, "GCM 往返失败");
+        // 期望值由 `cryptography.hazmat.primitives.ciphers.aead.AESGCM` 独立算出：
+        //   AESGCM(bytes(16)).encrypt(bytes(12), bytes(range(16)), None)
+        // → 0389d8cd64b3a595fb21c8b27dbff077 || 00e840843bf4619947096b7103fcb148
+        let expect_cipher = "0389d8cd64b3a595fb21c8b27dbff077";
+        let expect_tag = "00e840843bf4619947096b7103fcb148";
+        assert_eq!(hex::encode(&out[..16]), expect_cipher, "GCM 密文不符");
+        assert_eq!(hex::encode(&out[16..]), expect_tag, "GCM 认证标签不符");
+    }
+
+    /// 篡改密文必须被认证标签拦下。
+    #[test]
+    fn aes_gcm_rejects_tampered_ciphertext() {
+        let key = [0u8; 16];
+        let iv = [0u8; 12];
+        let mut out = super::symmetric_crypt(true, "AES/GCM/NoPadding", &key, &iv, b"hello world")
+            .expect("加密");
+        out[0] ^= 1;
+        assert!(super::symmetric_crypt(false, "AES/GCM/NoPadding", &key, &iv, &out).is_err());
+    }
     use super::*;
 
     /// `java.url` 必须取到当前请求地址, `urlNoQuery` 去掉 query。

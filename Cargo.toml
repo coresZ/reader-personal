@@ -74,6 +74,10 @@ axum = { version = "0.7", features = ["json", "multipart"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55"
+# 独立登录窗口读回 Cookie：WebView2 的 `ICoreWebView2CookieManager`，Tauri 没有
+# 暴露这层，只能自己调 COM。版本跟随树里的 tauri/wry，不要单独升级。
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_System_Com", "Win32_Foundation"] }
 
 [dev-dependencies]
 # Only used by tests/*.rs to spin up local mock upstream sites.

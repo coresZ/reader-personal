@@ -31,6 +31,14 @@ export interface SourceLoginView {
   actionCompleted: boolean
   showBrowser?: ShowBrowserRequest | null
   cancelled?: boolean
+  /**
+   * `mode: "web"` 时后端建议用**独立窗口**打开登录页。
+   *
+   * 这类页面常带 `X-Frame-Options: SAMEORIGIN` / CSP `frame-ancestors`，或用
+   * 前端安全 SDK 检测「是否被 iframe 嵌入」并整页替换成拦截提示。独立窗口里
+   * `window.top === window`，检测不触发 —— 与手机端 legado 直接 `loadUrl` 一致。
+   */
+  externalWindow?: boolean
 }
 
 export function loginBookSource(bookSourceUrl: string, action?: string, values?: Record<string, string>, onBrowser?: (request: ShowBrowserRequest) => void) {

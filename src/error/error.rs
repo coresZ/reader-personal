@@ -7,7 +7,11 @@ pub enum AppError {
     NotFound(String),
     #[error("bad request: {0}")]
     BadRequest(String),
-    #[error("internal error")]
+    /// 内部错误。**保留 anyhow 的原始描述**：早先这里只写 `internal error`，
+    /// 于是搜不到书时前端只看到「internal error」，分不清是网络不通、站点改版
+    /// 还是脚本异常 —— 排查时只能反复加日志重跑。`{0:#}` 会把 anyhow 的
+    /// context 链一并打印（`{0}` 只给最外层）。
+    #[error("internal error: {0:#}")]
     Internal(#[from] anyhow::Error),
     /// 数据库错误。**保留 sqlx 的原始描述**：早先这里只写 `db error`，于是
     /// `{"isSuccess":false,"errorMsg":"db error"}` 把"哪个表/哪条语句/是锁还是

@@ -39,16 +39,20 @@ pub struct RssPageRequest {
     pub url: Option<String>,
 }
 
-/// 为 RSS 源登记一个网页面板, 返回前端 `SourceBrowserPanel` 可直接加载的请求。
+/// 打开 RSS 源的网页（`singleUrl` 源看文章、普通源看站点首页）。
 ///
-/// `singleUrl` 源(legado 语义)没有文章列表, 源地址本身就是"一篇文章" —— 点开
-/// 应当直接看那个网页。书源的 `java.showBrowser` 面板走 `/sourcePanel` 时要求
-/// 面板归属一个**书源**(见 `fetch_source_panel_page`), RSS 源没有书源记录, 会
-/// 在抓取阶段 404。
+/// 这里**只解析出目标地址**，交给前端的 `open_external_window` 用独立窗口打开 ——
+/// 不再由后端抓 HTML 托管到 iframe 面板里。原因：
 ///
-/// 因此这里由后端**先把页面抓下来**, 再以静态 HTML 的形式登记面板:
-/// `render_source_panel_page` 是纯渲染路径, 不查书源表, 于是 RSS 也能复用同一套
-/// 面板(含桥脚本、`<base>` 修复、相对资源改写)。
+///   1. 上游常带 `X-Frame-Options: SAMEORIGIN` / CSP `frame-ancestors`，或用前端
+///      安全 SDK 检测「自己是否被 iframe 嵌入」，命中就整页替换成拦截提示；
+///   2. 托管 HTML 还要求后端重写相对资源、补 `<base>`、挡内网地址（防 SSRF），
+///      本质上是在复刻一个浏览器 —— 独立窗口直接就是浏览器；
+///   3. 用户在网页里登录后，Cookie 天然留在那个域下，关窗时由
+///      `open_external_window` 统一收回，不需要额外的桥脚本。
+///
+/// 返回值保留 `panelId` 字段的语义位置（现在恒为 `null`），这样前端旧分支读到
+/// `panelId: null` 会走 `external` 分支而不是去加载面板。
 #[tauri::command]
 pub async fn open_rss_source_panel(
     state: tauri::State<'_, AppState>,
@@ -76,76 +80,25 @@ pub async fn open_rss_source_panel(
         ));
     }
 
-    // 只代理 http(s); 自定义 scheme(如 `app-scheme://`)交给前端另行处理。
+    // 只代理 http(s); 自定义 scheme(如 `app-scheme://`)交给系统浏览器。
     if !target.starts_with("http://") && !target.starts_with("https://") {
         return Ok(ApiResponse::ok(serde_json::json!({
             "url": target,
             "external": true,
+            "panelId": null,
         })));
     }
 
-    // 面板会把抓到的页面托管到 `reader` origin 下(同源桥可触达宿主网络), 因此
-    // 目标必须是**公网**地址: 拒绝环回/私网/链路本地/保留地址, 避免恶意 RSS 源
-    // (导入的远程源 JSON 不受信任)把这里当成内网探测入口。
+    // 独立窗口会由 WebView2 自己去连目标地址，仍要挡私网/环回地址：导入的远程
+    // RSS 源 JSON 不受信任，不能让它把应用变成内网探测入口。
     reject_non_public_target(&target)?;
 
-    // 抓页面: 用**源级** http 上下文(独立 cookie jar + 源级代理), 与书源规则一致。
-    // 不能用全局 `http_client()`: 那会让不同 RSS 源共享 cookie, 且源级代理设置失效。
-    let context = crate::parser::js::source_http_context(&source.source_url)
-        .map_err(|e| AppError::Internal(e.into()))?;
-    let client = context.client.clone();
-    let mut request = client.get(&target);
-    if let Some(headers) = source.header.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        // 源 header 可能是 JS(如聚合类源), 交给 JS 引擎求值成 JSON 头。
-        let raw = headers
-            .strip_prefix("@js:")
-            .map(str::trim)
-            .unwrap_or(headers)
-            .to_string();
-        let base = target.clone();
-        let header_json = tokio::task::spawn_blocking(move || {
-            crate::parser::js::eval_js(&raw, "", &base).unwrap_or_default()
-        })
-        .await
-        .unwrap_or_default();
-        for (key, value) in crate::crawler::url_analyzer::parse_source_headers(&header_json) {
-            request = request.header(key, value);
-        }
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("打开网页失败: {e}")))?;
-    let final_url = response.url().to_string();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("读取网页失败: {e}")))?;
-    let html = crate::crawler::fetcher::decode_body(&bytes, None, None);
-
-    let entry = crate::service::book_service::SourcePanelEntry {
-        url: target.clone(),
-        html: html.clone(),
-        // 必须带上源级 http 上下文: 面板会注入 `document.cookie` 劫持脚本, 而
-        // `set_panel_cookie` 依赖 `entry.http` 里的 jar 落盘。留空会让它回落到
-        // `source_http_context("")` —— 给空键新建会话, cookie 写进垃圾 jar,
-        // 面板 origin 的登录态判断与后续请求都拿不到。
-        http: Some(context),
-        // 面板归属留空: RSS 源不需要书源的 jsLib / 登录桥能力。
-        //
-        // 二级链接交给系统浏览器: 首屏 HTML 由后端托管(在 reader origin 下渲染,
-        // 无 X-Frame-Options 限制), 但页面里的链接指向上游站点, 在 iframe 内直接
-        // 导航会被上游的 X-Frame-Options / CSP frame-ancestors 拒绝渲染 → 白屏。
-        external_links: true,
-        ..Default::default()
-    };
-    let panel_id = register_rss_panel(&source.source_url, entry);
-
     Ok(ApiResponse::ok(serde_json::json!({
-        "url": final_url,
+        "url": target,
         "title": source.source_name,
-        "panelId": panel_id,
+        // 恒为 false: 地址交给独立窗口，不再走 iframe 面板。
         "external": false,
+        "panelId": null,
     })))
 }
 
@@ -702,45 +655,6 @@ fn looks_like_url(value: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// RSS 网页面板自己的登记表: `(源地址, 面板id)`。
-///
-/// 书源面板与 RSS 面板共用 `register_source_panel` 的 8 个槽位, 而该函数在满了
-/// 之后会淘汰最旧的**并 `cancel_browser`** —— 若 RSS 面板无限累积, 反复切换
-/// 单 URL 源就会挤掉书源正在等待的登录面板(登录流程被"已取消网页操作"打断)。
-///
-/// 因此 RSS 侧只保留最近 `MAX_RSS_PANELS` 个, 且只移除**自己登记的**面板
-/// (用 `remove_source_panel`, 不触发 cancel, 因为 RSS 面板从不需要 await)。
-static RSS_PANELS: std::sync::LazyLock<
-    std::sync::Mutex<Vec<(String, String)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
-
-/// RSS 面板槽位数: 当前正在看的网页最多 1 个, 留 1 个余量给切换瞬间。
-const MAX_RSS_PANELS: usize = 2;
-
-/// 登记 RSS 网页面板, 同源复用并限制总量。
-fn register_rss_panel(
-    source_url: &str,
-    entry: crate::service::book_service::SourcePanelEntry,
-) -> String {
-    let mut panels = RSS_PANELS.lock().unwrap_or_else(|e| e.into_inner());
-    // 同源复用: 先撤掉该源之前的旧面板, 避免同一源堆积。
-    panels.retain(|(url, id)| {
-        if url == source_url {
-            crate::service::book_service::remove_source_panel(id);
-            false
-        } else {
-            true
-        }
-    });
-    // 超出上限时撤掉最旧的(只动自己登记的面板)。
-    while panels.len() >= MAX_RSS_PANELS {
-        let (_, id) = panels.remove(0);
-        crate::service::book_service::remove_source_panel(&id);
-    }
-    let id = crate::service::book_service::register_source_panel(entry);
-    panels.push((source_url.to_string(), id.clone()));
-    id
-}
 
 /// 拒绝把面板目标指向内网/本机地址。
 ///
