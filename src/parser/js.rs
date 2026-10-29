@@ -1028,6 +1028,19 @@ const JS_PRELUDE: &str = r#"(function (g) {
     if (arguments.length < 3) return rulePut(S(u), S(b));
     return httpResp(g.__http('PUT', S(u), S(b), requestHeaders(h), false), stripUrlOption(S(u)));
   };
+  /// `java.clearCookie(url)`：清掉该地址下的 Cookie。
+  ///
+  /// **legado 的 `JsExtensions` 里没有这个方法**（那边只有 `getCookie`，清除是
+  /// 书源编辑页的菜单项）。但书源确实在用它 —— 一类源把「清除 Cookie」做成
+  /// `loginUi` 按钮，脚本写 `java.clearCookie(url)`。缺失时的表现是点按钮弹
+  /// `not a function`，用户以为清不掉。
+  ///
+  /// 语义对齐 `java.removeCookie`（宿主侧同一个 `clear_url`）：按 eTLD+1
+  /// 清掉该域下所有 cookie，返回是否成功。保留 `removeCookie` 是因为已有书源
+  /// 在用；两个名字指向同一个实现。
+  J.clearCookie = function (url) {
+    return !!g.cookie.removeCookie(S(url));
+  };
   J.getCookie = function (tag, key) {
     var raw = S(g.cookie.getCookie(S(tag)));
     if (key == null) return raw;
@@ -1162,8 +1175,31 @@ const JS_PRELUDE: &str = r#"(function (g) {
                      S(options == null ? '' : typeof options === 'string' ? options : JSON.stringify(options)), '');
     return true;
   };
+  /// `java.startBrowser(url[, title][, html])`：打开一个浏览页面。
+  ///
+  /// **纯网址走独立窗口**，与 `startBrowserAwait` 保持同一套判据（`http(s)` +
+  /// 没有内联 `html`）。书源把它当作「打开一个网页给用户看」用：注册页、
+  /// 个人中心、账号后台、官网、播放页都走这里。
+  ///
+  /// 为什么不能一律用面板(iframe)：上游站点普遍带 `X-Frame-Options` 或
+  /// `frame-ancestors`，还有前端安全 SDK 主动检测「是否被嵌入」，命中就整页
+  /// 换成拦截提示。独立窗口里 `window.top === window`，这些都不触发 —— 与手机端
+  /// legado 直接 `loadUrl` 到浏览页面一致。
+  ///
+  /// 有内联 `html` 的仍用面板：那是书源自己拼好的内容（`data:text/html` 快照、
+  /// 播放器页），放进窗口反而丢掉「与规则同源」的上下文。
   J.startBrowser = function (u, title, html) {
-    g.__show_browser(S(u), html == null ? '' : S(html), '', '', S(title));
+    var target = S(u);
+    var hasHtml = html !== undefined && html !== null && String(html) !== '';
+    if (!hasHtml && /^https?:\/\//i.test(target)) {
+      try {
+        g.__open_external_window(target, S(title));
+        return true;
+      } catch (_e) {
+        // 打开失败就退回面板，至少用户还能看到页面（哪怕被拦）。
+      }
+    }
+    g.__show_browser(target, hasHtml ? String(html) : '', '', '', S(title));
     return true;
   };
   J.startBrowserAwait = function (u, title, refetchAfterSuccess, html) {

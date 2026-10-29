@@ -84,3 +84,98 @@ result
     .expect("求值应成功");
     assert_eq!(out, "fallback");
 }
+
+// ---------------------------------------------------------------------------
+// 下面几条验证 `java.startBrowser` 的**分流行为**。
+//
+// 难点：`eval_js` 每次求值都会重新注入原生函数（实测：把
+// `__open_external_window` 换成记录器后，调用期间又被换回原生的），
+// 所以在 JS 里打桩观察不到。这里改成：直接从 `js.rs` 里**取出真实的
+// `startBrowser` 源码**求值 —— 测的就是实现本身，不是重抄一遍条件。
+// ---------------------------------------------------------------------------
+
+/// 从 `js.rs` 的 prelude 里截出 `J.startBrowser = function (...) {...};` 整段。
+fn start_browser_source() -> String {
+    let full = include_str!("../src/parser/js.rs");
+    let start = full
+        .find("J.startBrowser = function (u, title, html) {")
+        .expect("js.rs 里应存在 J.startBrowser 定义");
+    let rest = &full[start..];
+    // 顶到第一个「行首两空格 + `};`」为止 —— 即该函数的收尾。
+    let end = rest.find("\n  };").expect("找不到函数结尾") + 4;
+    rest[..end].to_string()
+}
+
+/// 跑真实的 `startBrowser`，桩掉两个原生入口，返回 (走的路径, URL)。
+fn run_start_browser(url: &str, html: Option<&str>) -> (String, String) {
+    let source = demo_source();
+    let body = start_browser_source();
+    // 用 JSON 序列化注入参数：直接拼 `Debug` 输出会在含引号/反斜杠时失真。
+    let url_json = serde_json::to_string(url).expect("url");
+    let html_json = match html {
+        Some(value) => serde_json::to_string(value).expect("html"),
+        None => "null".to_string(),
+    };
+    // 桩函数与 `js.rs` 里同名同签名（`S` 是 prelude 里的字符串化工具）。
+    let script = format!(
+        r#"
+var __kind = 'none', __url = '';
+var __urlIn = {url_json};
+var __htmlIn = {html_json};
+var g = {{
+  __open_external_window: function (u, t) {{ __kind = 'external'; __url = String(u); }},
+  __show_browser: function (u, h) {{ __kind = 'panel'; __url = String(u); }}
+}};
+function S(v) {{ return v === undefined || v === null ? '' : String(v); }}
+var java = {{}};
+var J = java;
+{body}
+java.startBrowser(__urlIn, '标题', __htmlIn === null ? undefined : __htmlIn);
+__kind + '|' + __url
+"#
+    );
+    let out = with_source(&source, || eval_js(&script, "", "")).expect("求值应成功");
+    let (kind, url) = out.split_once('|').unwrap_or((out.as_str(), ""));
+    (kind.to_string(), url.to_string())
+}
+
+/// 无内联 `html` 的 http(s) 链接 → 独立窗口（方案 C 的核心行为）。
+#[test]
+fn start_browser_plain_url_uses_external_window() {
+    let (kind, url) =
+        run_start_browser("https://example.test/user/token-login?token=t", None);
+    assert_eq!(kind, "external", "纯网址应交给独立窗口");
+    assert!(
+        url.ends_with("/user/token-login?token=t"),
+        "窗口地址不对: {url}"
+    );
+}
+
+/// `http://` 同样走窗口。
+#[test]
+fn start_browser_plain_http_url_uses_external_window() {
+    let (kind, _) = run_start_browser("http://example.test/reg", None);
+    assert_eq!(kind, "external");
+}
+
+/// 带内联 `html` → 仍走面板（`data:text/html` 快照、播放器页）。
+#[test]
+fn start_browser_with_inline_html_uses_panel() {
+    let (kind, _) = run_start_browser("https://example.test/x", Some("<h1>hi</h1>"));
+    assert_eq!(kind, "panel", "带 html 应留在面板");
+}
+
+/// 非 http(s) 地址留在面板。
+#[test]
+fn start_browser_non_http_stays_in_panel() {
+    let (kind, url) = run_start_browser("about:blank", Some("<h1>player</h1>"));
+    assert_eq!(kind, "panel");
+    assert_eq!(url, "about:blank");
+}
+
+/// 空 `html` 字符串等同「没有 html」——书源常写 `''` 占位。
+#[test]
+fn start_browser_empty_html_counts_as_no_html() {
+    let (kind, _) = run_start_browser("https://example.test/a", Some(""));
+    assert_eq!(kind, "external", "空字符串应视为没有内联 html");
+}

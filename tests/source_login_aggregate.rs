@@ -220,15 +220,43 @@ async fn token_url_login_sources_carry_session_into_the_panel() {
     let auth = spec.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.clone());
     assert_eq!(auth.as_deref(), Some("Bearer mock-token-abc123"), "Authorization 应从源变量动态求值");
 
-    // 层4: 个人中心按钮产出 token-login 面板请求（startBrowser 非等待面板）
+    // 层4: 个人中心按钮打开 token-login 页面
+    //
+    // `startBrowser` 对**纯网址**现在走独立窗口（见 `source_browser_routing.rs`），
+    // 不再产生面板请求，所以这里按两条路径取 URL。本测试真正要验证的是
+    // 「拿到 token-login 地址 → 换到会话 → 会话随行」这条链，
+    // 窗口/面板只是承载方式，不影响断言。
     let ui: Value = serde_json::from_str(source.login_ui.as_deref().unwrap()).unwrap();
     let action = ui.as_array().unwrap().iter()
         .find(|row| row.get("name").and_then(|n| n.as_str()) == Some("个人中心"))
         .and_then(|row| row.get("action")).and_then(|a| a.as_str()).unwrap().to_string();
-    let _ = service.source_scope("default", &source, || eval_js(&action, "", ""));
-    let request = take_show_browser_request().expect("个人中心应产生浏览器请求");
-    assert!(!request.await_result, "startBrowser 应是非等待面板");
-    assert!(request.url.ends_with(&format!("/user/token-login?token={token}")), "URL 应携带 token: {}", request.url);
+    // 注入一个记录用的浏览器 handler：`java.startBrowser` 对纯网址走独立窗口，
+    // 请求从这里出来（不再是 `set_show_browser_request` 那条面板路径）。
+    let captured: std::sync::Arc<std::sync::Mutex<Vec<reader_rust::service::book_service::ShowBrowserRequest>>> =
+        std::sync::Arc::default();
+    let sink = captured.clone();
+    let handler: reader_rust::service::source_browser::BrowserHandler =
+        std::sync::Arc::new(move |request| {
+            sink.lock().unwrap().push(request);
+            Ok(())
+        });
+    reader_rust::service::source_browser::with_browser_handler(&source, Some(handler), || {
+        let _ = service.source_scope("default", &source, || eval_js(&action, "", ""));
+    })
+    .expect("handler 不应失败");
+
+    let request = captured
+        .lock()
+        .unwrap()
+        .pop()
+        .or_else(take_show_browser_request)
+        .expect("个人中心应产生浏览器请求");
+    assert!(!request.await_result, "startBrowser 应是非等待打开");
+    assert!(
+        request.url.ends_with(&format!("/user/token-login?token={token}")),
+        "URL 应携带 token: {}",
+        request.url
+    );
 
     // 层5: 面板加载 token-login → 302 /user，会话 cookie 必须随行
     let client = service.source_http_client("default", &source.book_source_url, None).await.unwrap();
