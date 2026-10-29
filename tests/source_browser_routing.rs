@@ -179,3 +179,84 @@ fn start_browser_empty_html_counts_as_no_html() {
     let (kind, _) = run_start_browser("https://example.test/a", Some(""));
     assert_eq!(kind, "external", "空字符串应视为没有内联 html");
 }
+
+// ---------------------------------------------------------------------------
+// `java.showBrowser` —— 段评 / 本章说的路由
+//
+// 书源里的写法是先抓页面再交给面板：
+//     var html = java.ajax(url);
+//     java.showBrowser(url, html, 'window.java=java;', config);
+//
+// 但段评页往往是**空壳 SPA**（`<div id="app"></div>` + 打包 JS），把静态壳塞进
+// iframe 面板永远渲染不出来：面板与上游跨域，SPA 的 XHR / localStorage / CORS
+// 都得靠桥逐项模拟，漏一处就是白屏。这类页面必须交给独立窗口，在真实域名下运行。
+// 反过来，带实质内容的 HTML 仍走面板 —— 不该让内嵌设置页突然弹窗。
+// ---------------------------------------------------------------------------
+
+fn show_browser_source() -> String {
+    let full = include_str!("../src/parser/js.rs");
+    let start = full
+        .find("J.showBrowser = function (u, html, preloadJs, options) {")
+        .expect("js.rs 里应存在 J.showBrowser 定义");
+    let rest = &full[start..];
+    let end = rest.find("\n  };").expect("J.showBrowser 应有收尾") + 4;
+    rest[..end].to_string()
+}
+
+fn run_show_browser(url: &str, html: Option<&str>) -> (String, String) {
+    let body = show_browser_source();
+    let url_json = serde_json::to_string(url).expect("url");
+    let html_json = match html {
+        Some(value) => serde_json::to_string(value).expect("html"),
+        None => "null".to_string(),
+    };
+    let script = format!(
+        r#"
+var __kind = 'none', __url = '';
+var g = {{
+  __open_external_window: function (u, t) {{ __kind = 'external'; __url = String(u); }},
+  __show_browser: function (u, h, p, o, t) {{ __kind = 'panel'; __url = String(u); }}
+}};
+var S = function (v) {{ return v === undefined || v === null ? '' : String(v); }};
+var J = {{}};
+{body}
+java = {{ showBrowser: J.showBrowser }};
+java.showBrowser({url_json}, {html_json}, 'window.java=java;', '{{}}');
+[__kind, __url].join('|')
+"#
+    );
+    let out = eval_js(&script, "", "").expect("求值失败");
+    let mut parts = out.splitn(2, '|');
+    let kind = parts.next().unwrap_or("").to_string();
+    let url_out = parts.next().unwrap_or("").to_string();
+    (kind, url_out)
+}
+
+/// 空壳 SPA + 纯网址 → 独立窗口。
+///
+/// 这是段评 / 本章说的实际形态：`java.ajax` 抓回来只有一个 `<div id="app">`。
+#[test]
+fn show_browser_spa_shell_uses_external_window() {
+    let shell = r#"<!doctype html><html><head><title>段评</title></head><body><div id="app"></div><script src="/assets/index-abc.js"></script></body></html>"#;
+    let (kind, url) = run_show_browser("https://example.test/user/paragraph-comments?chapter_id=1", Some(shell));
+    assert_eq!(kind, "external", "空壳 SPA 应交独立窗口打开");
+    assert!(url.starts_with("https://example.test/"), "窗口应加载真实地址: {url}");
+}
+
+/// 不传 html（纯网址）→ 独立窗口。
+#[test]
+fn show_browser_plain_url_uses_external_window() {
+    let (kind, _) = run_show_browser("https://example.test/page", None);
+    assert_eq!(kind, "external");
+}
+
+/// 带实质内容的 HTML → 仍走面板。
+///
+/// 内嵌设置页、阅读器片段本来就是静态的，面板更轻，也不该突然弹窗。
+#[test]
+fn show_browser_content_html_stays_in_panel() {
+    let content = r#"<html><body><h1>设置</h1><p>选择线路：</p></body></html>"#;
+    let (kind, _) = run_show_browser("https://example.test/settings", Some(content));
+    assert_eq!(kind, "panel", "带实质内容的 HTML 应继续走面板");
+}
+

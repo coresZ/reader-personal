@@ -138,6 +138,94 @@ mod imp {
         })
     }
 
+    /// 读出窗口**当前页面 origin 下**的 localStorage（`key=value` 对）。
+    ///
+    /// 为什么需要它：一类书源的「段评 / 本章说」页面是 SPA，鉴权要两样东西 ——
+    /// `Authorization`（在 Cookie 里）和 `X-Device-ID`（在 `localStorage` 里）。
+    /// 独立窗口跑在**上游真实域名**下，localStorage 天然是对的；但段评面板挂在
+    /// `reader.localhost` origin 下，localStorage 与上游完全隔离，SPA 取不到
+    /// device id 就现生成一个假的，服务端判定异常返回空 —— 表现就是
+    /// 「手机端能看段评，桌面端点开一片空白」。
+    ///
+    /// 因此窗口关闭时把 localStorage 一起收走，之后渲染面板时再注入回去。
+    /// WebView2 没有 localStorage 的 COM 接口，只能 `ExecuteScript` 读。
+    pub fn read_local_storage(window: &tauri::WebviewWindow) -> anyhow::Result<Vec<(String, String)>> {
+        use std::sync::{Arc, Mutex};
+
+        // `{k:v,...}` 形式回传，宿主侧再解析。
+        const SCRIPT: &str = r#"(function () {
+  try {
+    var out = {};
+    for (var i = 0; i < localStorage.length; i++) {
+      var key = localStorage.key(i);
+      if (key === null) continue;
+      out[key] = localStorage.getItem(key);
+    }
+    return JSON.stringify(out);
+  } catch (e) { return '{}'; }
+})()"#;
+
+        let collected: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let slot_out = Arc::clone(&collected);
+        let slot_err = Arc::clone(&failure);
+        let outer_out = Arc::clone(&collected);
+        let outer_err = Arc::clone(&failure);
+
+        window.with_webview(move |platform| unsafe {
+            let core = match platform.controller().CoreWebView2() {
+                Ok(core) => core,
+                Err(err) => {
+                    *slot_err.lock().unwrap() = Some(format!("CoreWebView2: {err}"));
+                    return;
+                }
+            };
+            let script = HSTRING::from(SCRIPT);
+            let inner_out = Arc::clone(&slot_out);
+            let inner_err = Arc::clone(&slot_err);
+            let outcome = webview2_com::ExecuteScriptCompletedHandler::wait_for_async_operation(
+                Box::new(move |handler| {
+                    core.ExecuteScript(PCWSTR(script.as_ptr()), &handler)
+                        .map_err(webview2_com::Error::from)
+                }),
+                // 回调签名是 `(HRESULT, PCWSTR)`：`PCWSTR` 指向脚本返回值的
+                // JSON 字面量（含外层引号），空指针表示脚本抛错或无返回值。
+                // 回调签名是 `(Result<(), Error>, String)`：第二个参数已经是解好的
+                // 脚本返回值（JSON 字面量，带外层引号）。
+                Box::new(move |error_code: windows::core::Result<()>, value: String| {
+                    if let Err(err) = error_code {
+                        *inner_err.lock().unwrap() = Some(format!("ExecuteScript: {err}"));
+                        return Ok(());
+                    }
+                    if !value.is_empty() {
+                        *inner_out.lock().unwrap() = Some(value);
+                    }
+                    Ok(())
+                }),
+            );
+            if let Err(err) = outcome {
+                *slot_err.lock().unwrap() = Some(format!("等待 localStorage 回调失败: {err}"));
+            }
+        })?;
+
+        if let Some(err) = outer_err.lock().unwrap().clone() {
+            anyhow::bail!(err);
+        }
+        // `ExecuteScript` 的结果本身是 JSON 字符串字面量（含引号），先按 JSON 解一次。
+        let raw = outer_out.lock().unwrap().clone().unwrap_or_default();
+        let decoded: String = serde_json::from_str(&raw).unwrap_or(raw);
+        let parsed: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&decoded).unwrap_or_default();
+        Ok(parsed
+            .into_iter()
+            .filter_map(|(key, value)| match value {
+                serde_json::Value::String(text) => Some((key, text)),
+                serde_json::Value::Null => None,
+                other => Some((key, other.to_string())),
+            })
+            .collect())
+    }
+
     /// 调用 `out PWSTR` 形式的 getter，读出字符串并归还 COM 内存。
     unsafe fn read_pwstr(mut get: impl FnMut(*mut PWSTR) -> windows::core::Result<()>) -> String {
         let mut ptr = PWSTR::null();
@@ -151,4 +239,4 @@ mod imp {
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{read_all, CookieRecord};
+pub use imp::{read_all, read_local_storage, CookieRecord};

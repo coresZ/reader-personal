@@ -462,6 +462,40 @@ fn strip_leading_content_title(content: &str) -> String {
 /// 测试书源必须区分这两者 —— 把用户主动中止当成检测失败会把可用书源误标为失效。
 pub const CANCELLED_ERR: &str = "cancelled by user";
 
+static SOURCE_WINDOW_STORAGE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<(String, String)>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 测试用：直接写入某个 origin 的 localStorage 快照。
+///
+/// 不加 `#[cfg(test)]`：集成测试（`tests/*.rs`）链接的是库的**非测试**构建，
+/// 带该标注会在那边看不到符号。
+pub fn set_source_window_storage_for_test(origin_url: &str, entries: &[(String, String)]) {
+    let Ok(url) = url::Url::parse(origin_url.trim()) else {
+        return;
+    };
+    SOURCE_WINDOW_STORAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(url.origin().ascii_serialization(), entries.to_vec());
+}
+
+pub fn source_window_storage_for(source_url: &str) -> Vec<(String, String)> {
+    let Ok(url) = url::Url::parse(source_url.trim()) else {
+        return Vec::new();
+    };
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        return Vec::new();
+    }
+    SOURCE_WINDOW_STORAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&origin)
+        .cloned()
+        .unwrap_or_default()
+}
+
 #[derive(Clone)]
 pub struct BookService {
     http: HttpClient,
@@ -906,6 +940,39 @@ impl BookService {
     ///   3. 书源地址本身可能**不是 URL**（一类聚合源用 jsLib 在运行时拼线路，
     ///      `bookSourceUrl` 只是一句标识而非网址），那种情况下 `url::Url::parse`
     ///      会失败，只能完全依赖 Cookie 的域。
+    /// 保存独立窗口里读到的源码页 `localStorage`（按**上游 origin** 隔离）。
+    ///
+    /// 用途见 `webview_cookies::read_local_storage`：一类书源的段评页是 SPA，
+    /// 鉴权除了 Cookie 里的 token，还要 `localStorage` 里的设备 id。面板挂在
+    /// `reader.localhost` 下与上游 origin 隔离，不注入就只能现生成假 id。
+    ///
+    /// 键形如 `__source_storage__<origin>`，值是一行一个 `key\tvalue`——
+    /// 用制表符而不是 JSON：值里可能有任意引号/换行，JSON 需要来回转义两次。
+    pub async fn set_source_window_storage(&self, source_url: &str, entries: &[(String, String)]) {
+        let Ok(url) = url::Url::parse(source_url.trim()) else {
+            return;
+        };
+        let origin = url.origin().ascii_serialization();
+        if origin == "null" || entries.is_empty() {
+            return;
+        }
+        SOURCE_WINDOW_STORAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(origin, entries.to_vec());
+    }
+
+/// 读出某个上游 origin 的源码页 `localStorage`（`set_source_window_storage` 的逆向）。
+///
+/// 面板渲染（`protocol::render_source_panel_page`）没有 `BookService` 实例，
+/// 因此这份数据单独放在进程级表里，按 origin 存取。
+
+/// 独立窗口收走的 localStorage，按**上游 origin** 存。
+///
+/// 为什么不用 `BookService` 的会话：面板渲染是 `protocol` 层的纯函数调用，
+/// 拿不到 service；而这份数据的生命周期正好是「窗口关闭 → 面板渲染」，
+/// 进程级表足够，也不需要落盘（值本身来自浏览器，重启后窗口会重新写）。
+
     pub async fn set_source_window_cookies(
         &self,
         source_url: &str,
@@ -2174,6 +2241,11 @@ impl BookService {
             let logs = take_js_logs();
             // 面板 HTML 由后端托管: 前端按 panelId 加载, 面板内的桥才能同源回调宿主
             let browser = take_show_browser_request().map(|req| {
+                // 独立窗口请求不需要面板条目（也不该被清掉 html/换 panelId），
+                // 原样交给前端 `openExternalWindow` 即可。
+                if req.external_window {
+                    return Ok(req);
+                }
                 crate::service::source_browser::register_browser_request(req, SourcePanelEntry {
                     book_source_url: source.book_source_url.clone(),
                     book_url: source_key.clone(),

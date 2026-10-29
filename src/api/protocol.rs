@@ -341,7 +341,10 @@ fn render_source_panel_page_with_cookie(panel_id: &str, entry: &crate::service::
             panel_url
         ));
     }
-    bridge.push_str(&build_source_panel_bridge_script(panel_id, entry.external_links));
+    // 上游 origin 的 localStorage（由独立窗口在真实域名下收走）。
+    // 段评这类 SPA 的鉴权需要设备 id，缺了就只能现生成假的。
+    let source_storage = crate::service::book_service::source_window_storage_for(&entry.book_source_url);
+    bridge.push_str(&build_source_panel_bridge_script(panel_id, entry.external_links, &source_storage));
     if let Some(preload) = &entry.preload_js {
         bridge.push_str(&format!("<script>(0,eval)({});</script>", script_string(preload)));
     }
@@ -1204,8 +1207,16 @@ fn is_html_response(content_type: Option<&str>, body: &[u8]) -> bool {
 /// 注意: 二级链接现在**统一**留在面板内经代理导航(见 click 兜底那段注释),
 /// 这个标志暂时没有消费方, 保留是为了让 `SourcePanelEntry` 的既有语义与
 /// 备份/调用方不受影响, 也便于将来按需恢复「RSS 外链走系统浏览器」。
-fn build_source_panel_bridge_script(panel_id: &str, external_links: bool) -> String {
+pub fn build_source_panel_bridge_script(panel_id: &str, external_links: bool, source_storage: &[(String, String)]) -> String {
     let panel_id_json = script_string(panel_id);
+    // 按 JSON 对象序列化后嵌进脚本：键值都可能是任意文本（含引号/换行）。
+    let storage_json = {
+        let mut map = serde_json::Map::new();
+        for (key, value) in source_storage {
+            map.insert(key.clone(), serde_json::Value::String(value.clone()));
+        }
+        script_string(&serde_json::Value::Object(map).to_string())
+    };
     let external_links_json = if external_links { "true" } else { "false" };
     format!(
         r#"<script>
@@ -1217,6 +1228,27 @@ fn build_source_panel_bridge_script(panel_id: &str, external_links: bool) -> Str
   var nativeFetch = window.fetch.bind(window);
   var pageUrl = window.__readerPanelUrl || "";
   var documentId = window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : String(Date.now()) + "-" + Math.random();
+  // 诊断: 桥开始执行。面板打不开时先看这一条在不在 —— 不在说明脚本没跑
+  // (被 CSP 拦、被上游页面脚本抛错打断), 在则继续看后面的 ready。
+  try {{ bridgeSync("log", {{ message: "[bridge] start doc=" + documentId }}); }} catch (e) {{}}
+
+  // 把**上游站点**的 localStorage 注入到本面板。
+  //
+  // 一类书源的段评页是 SPA，鉴权 = Cookie 里的 token + localStorage 里的设备 id
+  // (`app_device_id` 之类)。本面板跑在 reader origin 下，localStorage 与
+  // 上游隔离，SPA 取不到就现生成一个假的 id → 服务端判定异常 → 面板空白。
+  // 这些值由独立窗口（真实域名）关闭时收走，这里按「缺才写」回填：
+  // 页面自己写的值优先，避免覆盖新状态。
+  var sourceStorage = JSON.parse({storage_json});
+  if (sourceStorage && typeof sourceStorage === "object") {{
+    try {{
+      Object.keys(sourceStorage).forEach(function (key) {{
+        if (window.localStorage.getItem(key) === null) {{
+          window.localStorage.setItem(key, String(sourceStorage[key]));
+        }}
+      }});
+    }} catch (e) {{}}
+  }}
 
   // 同步桥: 与 legado 的 Java 同步接口语义一致(插件大量使用同步 ajax)。
   //
@@ -1550,6 +1582,113 @@ fn build_source_panel_bridge_script(panel_id: &str, external_links: bool) -> Str
     return result.value;
   }}
 
+
+  // axios 在浏览器里**默认用 XMLHttpRequest**（只有显式 `adapter: 'fetch'` 才用 fetch）。
+  // 段评 / 本章说这类页面是 SPA，全部走 axios —— 只重写 `fetch` 拦不住它们，
+  // 请求会从 reader origin 直连上游：CORS 不放行、Cookie 也带不过去，服务端返空，
+  // 表现为面板一片空白（宿主 5 秒后报「当前网页无法确认」）。
+  // 这里把跨域 XHR 也接到同一个桥接口上。
+  var NativeXHR = window.XMLHttpRequest;
+  function installXhrBridge() {{
+    function BridgedXHR() {{
+      this.readyState = 0; this.status = 0; this.statusText = "";
+      this.response = ""; this.responseText = ""; this.responseType = "";
+      this.timeout = 0; this.withCredentials = false;
+      this.upload = {{ addEventListener: function () {{}}, removeEventListener: function () {{}} }};
+      this._headers = {{}}; this._responseHeaders = {{}};
+      this._listeners = {{}}; this._url = null; this._method = "GET"; this._async = true;
+    }}
+    BridgedXHR.prototype.addEventListener = function (type, fn) {{
+      (this._listeners[type] = this._listeners[type] || []).push(fn);
+    }};
+    BridgedXHR.prototype.removeEventListener = function (type, fn) {{
+      var list = this._listeners[type]; if (!list) return;
+      this._listeners[type] = list.filter(function (item) {{ return item !== fn; }});
+    }};
+    BridgedXHR.prototype._emit = function (type) {{
+      var self = this;
+      (this._listeners[type] || []).forEach(function (fn) {{
+        try {{ fn.call(self, {{ type: type, target: self }}); }} catch (e) {{}}
+      }});
+      var handler = this["on" + type];
+      if (typeof handler === "function") {{ try {{ handler.call(this, {{ type: type, target: this }}); }} catch (e) {{}} }}
+    }};
+    BridgedXHR.prototype.open = function (method, url, async) {{
+      this._method = String(method || "GET").toUpperCase();
+      this._url = new URL(String(url), pageUrl || window.location.href);
+      this._async = async !== false;
+      this.readyState = 1;
+      this._emit("readystatechange");
+    }};
+    BridgedXHR.prototype.setRequestHeader = function (name, value) {{
+      this._headers[String(name)] = String(value);
+    }};
+    BridgedXHR.prototype.getAllResponseHeaders = function () {{
+      var self = this;
+      return Object.keys(this._responseHeaders).map(function (name) {{
+        return name + ": " + self._responseHeaders[name];
+      }}).join("\r\n");
+    }};
+    BridgedXHR.prototype.getResponseHeader = function (name) {{
+      var lowered = String(name).toLowerCase();
+      var map = this._responseHeaders || {{}};
+      var found = null;
+      Object.keys(map).forEach(function (key) {{
+        if (key.toLowerCase() === lowered) found = map[key];
+      }});
+      return found;
+    }};
+    BridgedXHR.prototype.abort = function () {{ this._aborted = true; }};
+    BridgedXHR.prototype.send = function (body) {{
+      var self = this;
+      if (!this._url || this._url.origin === window.location.origin || !/^https?:$/.test(this._url.protocol)) {{
+        // 同源/非 http 的请求交回原生实现（桥自身也用 XHR，必须走原生）。
+        var native = new NativeXHR();
+        this._native = native;
+        ["onload", "onerror", "ontimeout", "onabort", "onprogress", "onreadystatechange"].forEach(function (name) {{
+          if (typeof self[name] === "function") native[name] = function (event) {{ self[name].call(self, event); }};
+        }});
+        native.open(this._method, this._url ? this._url.href : "", this._async);
+        Object.keys(this._headers).forEach(function (name) {{ try {{ native.setRequestHeader(name, self._headers[name]); }} catch (e) {{}} }});
+        try {{ native.send(body); }} catch (e) {{ self._fail(e); }}
+        this._native = native;
+        // 让调用方读到原生对象的进度状态。
+        ["status", "statusText", "responseText", "response", "responseType", "readyState"].forEach(function (name) {{
+          Object.defineProperty(self, name, {{ get: function () {{ return native[name]; }}, configurable: true }});
+        }});
+        return;
+      }}
+      var payload = {{
+        url: this._url.href, method: this._method, headers: this._headers,
+        body: body == null ? "" : (typeof body === "string" ? body : String(body))
+      }};
+      bridgeAsync("fetch", payload).then(function (response) {{
+        if (self._aborted) return;
+        self.status = response.code || 200;
+        self.statusText = response.statusText || "";
+        self._responseHeaders = response.headers || {{}};
+        self.responseText = response.body || "";
+        self.response = response.body || "";
+        self.readyState = 4;
+        self._emit("readystatechange");
+        self._emit("load");
+        self._emit("loadend");
+      }}).catch(function (error) {{
+        self._fail(error);
+      }});
+    }};
+    BridgedXHR.prototype._fail = function (error) {{
+      if (this._aborted) return;
+      this.status = 0; this.readyState = 4;
+      this._error = error;
+      this._emit("readystatechange");
+      this._emit("error");
+      this._emit("loadend");
+    }};
+    window.XMLHttpRequest = BridgedXHR;
+  }}
+  installXhrBridge();
+
   // Inline settings pages use the source's native requests for CORS and cookies.
   window.fetch = async function (input, init) {{
     var rawUrl = input instanceof Request ? input.url : String(input);
@@ -1773,7 +1912,12 @@ window.addEventListener("message", function (event) {{
     catch (error) {{ r = {{ ok: false, error: String(error) }}; }}
     postToHost(r.ok ? {{ type: "complete", requestId: requestId }} : {{ type: "error", requestId: requestId, message: r.error }});
   }});
-  function ready(requestId) {{ postToHost({{ type: "ready", requestId: requestId, title: document.title, url: pageUrl }}); }}
+  function ready(requestId) {{
+    try {{
+      bridgeSync("log", {{ message: "[bridge] ready id=" + requestId + " rs=" + document.readyState + " scripts=" + document.scripts.length + " body=" + (document.body ? document.body.innerHTML.length : -1) }});
+    }} catch (e) {{}}
+    postToHost({{ type: "ready", requestId: requestId, title: document.title, url: pageUrl }});
+  }}
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () {{ ready(); }}, {{ once: true }});
   else ready();
 
@@ -2438,8 +2582,8 @@ mod tests {
     /// click 兜底, 行为一致。
     #[test]
     fn panel_bridge_keeps_secondary_links_inside_panel() {
-        let rss = build_source_panel_bridge_script("panel-rss", true);
-        let book = build_source_panel_bridge_script("panel-book", false);
+        let rss = build_source_panel_bridge_script("panel-rss", true, &[]);
+        let book = build_source_panel_bridge_script("panel-book", false, &[]);
 
         for (label, script) in [("RSS", &rss), ("书源", &book)] {
             // 两种面板都不应再调用 window.open 把链接甩给系统浏览器。
@@ -2474,7 +2618,7 @@ mod tests {
     /// 系统浏览器接管(表现为"点一下就跳出应用")。
     #[test]
     fn panel_bridge_handles_import_protocol_and_blank_links() {
-        let book = build_source_panel_bridge_script("panel-book", false);
+        let book = build_source_panel_bridge_script("panel-book", false, &[]);
 
         // 两种面板都要识别导入协议并转给宿主, 由前端拉取并入库。
         assert!(
@@ -2492,7 +2636,7 @@ mod tests {
 
         // 两种面板都要处理导入协议(源仓库既可能从书源面板打开, 也可能从
         // RSS 面板打开), 且都要把 _blank 链接留在面板内经代理导航。
-        let rss = build_source_panel_bridge_script("panel-rss", true);
+        let rss = build_source_panel_bridge_script("panel-rss", true, &[]);
         for (label, script) in [("RSS", &rss), ("书源", &book)] {
             assert!(
                 script.contains("function importProtocolUrl(raw)"),
@@ -2507,7 +2651,7 @@ mod tests {
 
     #[test]
     fn panel_bridge_script_exposes_legado_api_surface() {
-        let script = build_source_panel_bridge_script("panel-1", false);
+        let script = build_source_panel_bridge_script("panel-1", false, &[]);
 
         // 插件面板依赖的宿主接口 (legado WebJsExtensions)
         for expected in [
@@ -2534,7 +2678,7 @@ mod tests {
     /// 导致面板所有 API 调用无签名 → 书籍信息为空、段评加载不出来)。
     #[test]
     fn panel_bridge_script_declares_crypto_methods() {
-        let script = build_source_panel_bridge_script("panel-1", false);
+        let script = build_source_panel_bridge_script("panel-1", false, &[]);
         for method in [
             "createSymmetricCrypto:",
             "aesEncodeToBase64String:",
@@ -2556,7 +2700,7 @@ mod tests {
     #[test]
     fn panel_bridge_script_does_not_patch_xhr() {
         // 曾经 patch XMLHttpRequest.prototype 导致桥自身的 XHR 也被拦截(自递归)。
-        let script = build_source_panel_bridge_script("panel-1", false);
+        let script = build_source_panel_bridge_script("panel-1", false, &[]);
         assert!(!script.contains("XMLHttpRequest.prototype"));
     }
 

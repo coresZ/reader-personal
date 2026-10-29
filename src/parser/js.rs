@@ -1170,7 +1170,38 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.webViewGetOverrideUrl = J.webViewGetSource;
 
   J.showBrowser = function (u, html, preloadJs, options) {
-    g.__show_browser(S(u), html === undefined || html === null ? '' : S(html),
+    var target = S(u);
+    var inline = html === undefined || html === null ? '' : S(html);
+    // 判断传进来的 HTML 是不是「空壳 SPA」：只有挂载点/少量骨架，内容全靠
+    // 打包 JS 渲染。这类页面塞进 iframe 面板永远渲染不出来 —— 面板与上游跨域，
+    // SPA 的 XHR / localStorage / CORS 都得靠桥逐项模拟，漏一处就是白屏。
+    // 交给独立窗口在真实域名下运行才正常（与手机端 legado 直接 loadUrl 一致）。
+    //
+    // 反过来，**带实质内容**的 HTML（内嵌设置页、阅读器片段、播放器页）仍走面板：
+    // 那些页面本来就是静态的，面板渲染更轻，也不该突然弹出一个窗口。
+    function isSpaShell(markup) {
+      if (!markup) return false;
+      if (!/<div[^>]+id=["']?(?:app|root)["']?/i.test(markup)) return false;
+      // 只保留 <body>：<title>、<meta> 的文本不算「页面内容」。
+      var body = markup.replace(/<script[\s\S]*?<\/script>/gi, '')
+                       .replace(/<style[\s\S]*?<\/style>/gi, '');
+      var bodyMatch = /<body[^>]*>([\s\S]*?)<\/body>/i.exec(body);
+      if (bodyMatch) body = bodyMatch[1];
+      else body = body.replace(/<head[\s\S]*?<\/head>/gi, '');
+      // 去掉挂载点本身再算可见文本
+      body = body.replace(/<div[^>]+id=["']?(?:app|root)["']?[^>]*>\s*<\/div>/gi, '');
+      var text = body.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim();
+      return text.length === 0;
+    }
+    if (/^https?:\/\//i.test(target) && (!inline || isSpaShell(inline))) {
+      try {
+        g.__open_external_window(target, '');
+        return true;
+      } catch (_e) {
+        // 打不开窗口就退回面板，至少还有内容（带上传入的 html）。
+      }
+    }
+    g.__show_browser(target, html === undefined || html === null ? '' : S(html),
                      preloadJs === undefined || preloadJs === null ? '' : S(preloadJs),
                      S(options == null ? '' : typeof options === 'string' ? options : JSON.stringify(options)), '');
     return true;
@@ -2878,9 +2909,16 @@ fn eval_js_inner_with_source(
                 html: None, preload_js: None, options: None,
                 await_result: false, panel_id: None, external_window: true,
             };
-            match crate::service::source_browser::request_external_window(request) {
+            match crate::service::source_browser::request_external_window(request.clone()) {
                 Ok(()) => json!({"ok":true}).to_string(),
-                Err(error) => json!({"ok":false,"error":error}).to_string(),
+                Err(_) => {
+                    // 没有登录上下文时（如阅读页里的段评 / 本章说 / 内嵌设置页）
+                    // 退到「面板请求」槽位，由调用方（`eval_source_click` 等）取走，
+                    // 前端看到 `externalWindow` 就直接开窗口 —— 效果一样，
+                    // 只是这批场景没有 `BROWSER_CONTEXT`。
+                    crate::service::book_service::set_show_browser_request(request);
+                    json!({"ok":true}).to_string()
+                }
             }
         }))?;
         // 规则解析原语: 供 `java.getString` / `getStringList` / `getElement(s)` 使用

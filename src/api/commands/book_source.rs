@@ -513,12 +513,24 @@ pub async fn open_external_window(
                         return;
                     }
                 };
+                // 顺带收走 localStorage：一类书源的段评页是 SPA，鉴权要
+                // `X-Device-ID`（存 localStorage），而面板挂在 reader origin 下
+                // 与上游隔离，取不到就现生成假的，服务端判定异常 → 面板空白。
+                // 窗口跑在真实域名下，这里的值才是对的。
+                let storage = crate::service::webview_cookies::read_local_storage(&watched)
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(%err, "读取登录窗口 localStorage 失败");
+                        Vec::new()
+                    });
                 if cookies.is_empty() {
                     return;
                 }
                 let service = Arc::clone(&service);
                 let target = source_url.clone();
                 tauri::async_runtime::spawn(async move {
+                    if !storage.is_empty() {
+                        service.set_source_window_storage(&target, &storage).await;
+                    }
                     match service.set_source_window_cookies(&target, &cookies).await {
                         Ok(0) => tracing::warn!("登录窗口未产生可写入的 Cookie"),
                         Ok(count) => tracing::info!(count, "已把登录窗口的 Cookie 写回书源"),

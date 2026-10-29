@@ -415,7 +415,7 @@ import { useReaderStore, fontPresets, TOC_END_CHECK_INTERVAL_MS } from '../store
 import { useAppStore } from '../stores/app'
 import { isTauriRuntime } from '../api/transport'
 import { getBookInfo, getBookshelfWithCacheInfo } from '../api/bookshelf'
-import { evalSourceClick, type ShowBrowserRequest } from '../api/sourceClick'
+import { evalSourceClick, openExternalWindow, type ShowBrowserRequest } from '../api/sourceClick'
 import { applySystemTheme } from '../utils/systemUi'
 import { APP_VIEWPORT_CHANGE_EVENT, syncViewportSize } from '../utils/viewport'
 import { isReaderInteractiveClickTarget } from '../utils/readerClick'
@@ -719,6 +719,13 @@ const replaceDialog = ref({
 const sourceBrowser = ref<ShowBrowserRequest | null>(null)
 
 function openSourceBrowserPanel(request: ShowBrowserRequest) {
+  // 独立窗口：段评 / 本章说这类页面是 SPA，靠在真实域名下运行才正常
+  // （localStorage、Cookie、XHR 都是同源）。放在 iframe 面板里得一层层桥接，
+  // 漏一处就是白屏，因此这类请求直接开窗口。
+  if (request.externalWindow) {
+    void openExternalWindow(request.url, request.title || undefined)
+    return
+  }
   if (!request.panelId) {
     console.warn('[source-click] showBrowser 缺少 panelId')
     return
