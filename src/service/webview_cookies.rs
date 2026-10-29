@@ -240,3 +240,42 @@ mod imp {
 
 #[cfg(target_os = "windows")]
 pub use imp::{read_all, read_local_storage, CookieRecord};
+
+/// 非 Windows 平台的占位实现。
+///
+/// 独立登录窗口目前只有 Windows 用 WebView2 那套（`ICoreWebView2CookieManager`）；
+/// macOS / Linux 没有等价实现，这里给出空实现让库能编译、CI 能过。
+/// 调用方（窗口关闭回调）本来就把失败当「没有可写回的 Cookie」处理，
+/// 因此空值不会改变行为 —— 只是那两个平台上登录态暂时不会自动回传。
+#[cfg(not(target_os = "windows"))]
+mod imp_stub {
+    /// 一条 Cookie 的必需字段。与 Windows 版保持同名同字段，便于调用方共用签名。
+    #[derive(Debug, Clone)]
+    pub struct CookieRecord {
+        pub name: String,
+        pub value: String,
+        pub domain: String,
+        pub path: String,
+        pub secure: bool,
+        pub http_only: bool,
+    }
+
+    impl CookieRecord {
+        pub fn pair(&self) -> String {
+            format!("{}={}", self.name, self.value)
+        }
+    }
+
+    pub fn read_all(_window: &tauri::WebviewWindow) -> anyhow::Result<Vec<CookieRecord>> {
+        anyhow::bail!("当前平台暂不支持从登录窗口读取 Cookie")
+    }
+
+    pub fn read_local_storage(
+        _window: &tauri::WebviewWindow,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        anyhow::bail!("当前平台暂不支持从登录窗口读取 localStorage")
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub use imp_stub::{read_all, read_local_storage, CookieRecord};
