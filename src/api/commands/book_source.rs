@@ -501,47 +501,89 @@ pub async fn open_external_window(
             let service = Arc::clone(&state.book_service);
             let watched = window.clone();
             window.on_window_event(move |event| {
-                // 必须在 CloseRequested 里读：Destroyed 触发时 WebView2 已经
-                // 销毁，`with_webview` 拿不到 controller，Cookie 读不出来。
-                if !matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                // 必须在关闭**之前**读：Destroyed 触发时 WebView 已经销毁，
+                // Cookie 与 localStorage 都读不出来。
+                //
+                // 这里要把关闭拦下来：localStorage 只能靠执行脚本读，而脚本
+                // 求值是异步的（回调在事件循环线程上跑）。若就地同步等待，
+                // 事件循环被自己堵住，回调永远不派发 —— 死锁。所以先
+                // `prevent_close()`，读完后由我们自己 `close()`。
+                let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                     return;
-                }
+                };
+                api.prevent_close();
+
+                // Cookie 这条是同步的（wry 内部自己泵消息），先取。
                 let cookies = match crate::service::webview_cookies::read_all(&watched) {
-                    Ok(cookies) => cookies,
+                    Ok(cookies) => std::sync::Arc::new(cookies),
                     Err(err) => {
                         tracing::warn!(%err, "读取登录窗口 Cookie 失败");
+                        let _ = watched.close();
                         return;
                     }
                 };
+
                 // 顺带收走 localStorage：一类书源的段评页是 SPA，鉴权要
                 // `X-Device-ID`（存 localStorage），而面板挂在 reader origin 下
                 // 与上游隔离，取不到就现生成假的，服务端判定异常 → 面板空白。
                 // 窗口跑在真实域名下，这里的值才是对的。
-                let storage = crate::service::webview_cookies::read_local_storage(&watched)
-                    .unwrap_or_else(|err| {
-                        tracing::warn!(%err, "读取登录窗口 localStorage 失败");
-                        Vec::new()
-                    });
-                if cookies.is_empty() {
-                    return;
+                //
+                // 注意 `on_window_event` 的闭包是 `Fn`（可能被多次触发），
+                // 因此这里每次都 clone 一份，不能把外层变量 move 进去。
+                let service_for_read = Arc::clone(&service);
+                let target_for_read = source_url.clone();
+                let closing = watched.clone();
+                let cookies_for_read = std::sync::Arc::clone(&cookies);
+                let spawned = crate::service::webview_cookies::read_local_storage_async(
+                    &watched,
+                    move |storage| {
+                        // 无论有没有读到，都要把窗口关掉 —— 否则用户点了关闭
+                        // 窗口却一直停在原地。
+                        let _ = closing.close();
+                        let cookies = std::sync::Arc::try_unwrap(cookies_for_read)
+                            .unwrap_or_else(|shared| shared.as_ref().clone());
+                        persist_window_session(service_for_read, target_for_read, cookies, storage);
+                    },
+                );
+                if let Err(err) = spawned {
+                    tracing::warn!(%err, "读取登录窗口 localStorage 失败");
+                    let _ = watched.close();
+                    let fallback = std::sync::Arc::try_unwrap(cookies)
+                        .unwrap_or_else(|shared| shared.as_ref().clone());
+                    persist_window_session(
+                        Arc::clone(&service),
+                        source_url.clone(),
+                        fallback,
+                        Vec::new(),
+                    );
                 }
-                let service = Arc::clone(&service);
-                let target = source_url.clone();
-                tauri::async_runtime::spawn(async move {
-                    if !storage.is_empty() {
-                        service.set_source_window_storage(&target, &storage).await;
-                    }
-                    match service.set_source_window_cookies(&target, &cookies).await {
-                        Ok(0) => tracing::warn!("登录窗口未产生可写入的 Cookie"),
-                        Ok(count) => tracing::info!(count, "已把登录窗口的 Cookie 写回书源"),
-                        Err(err) => tracing::warn!(%err, "写入书源 Cookie 失败"),
-                    }
-                });
             });
         }
     }
 
     Ok(ApiResponse::ok(()))
+}
+
+/// 把独立窗口收到的 Cookie / localStorage 写回书源会话。
+fn persist_window_session(
+    service: Arc<crate::service::book_service::BookService>,
+    source_url: String,
+    cookies: Vec<crate::service::webview_cookies::CookieRecord>,
+    storage: Vec<(String, String)>,
+) {
+    if cookies.is_empty() && storage.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        if !storage.is_empty() {
+            service.set_source_window_storage(&source_url, &storage).await;
+        }
+        match service.set_source_window_cookies(&source_url, &cookies).await {
+            Ok(0) => tracing::warn!("登录窗口未产生可写入的 Cookie"),
+            Ok(count) => tracing::info!(count, "已把登录窗口的 Cookie 写回书源"),
+            Err(err) => tracing::warn!(%err, "写入书源 Cookie 失败"),
+        }
+    });
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -76,18 +76,25 @@ pub fn read_all(window: &tauri::WebviewWindow) -> anyhow::Result<Vec<CookieRecor
 ///
 /// 因此窗口关闭时把 localStorage 一起收走，之后渲染面板时再注入回去。
 ///
-/// 这条路目前**只有 Windows 实现**：wry 没有跨平台的「同步读脚本结果」接口，
-/// macOS 要 `WKWebView.evaluateJavaScript`、Linux 要 webkit2gtk 的异步回调，
-/// 各自需要单独适配。它只影响段评面板能否读到上游设备 id，不影响登录态回传
-/// （那是上面的 `read_all`，三平台都支持）。
-#[cfg(target_os = "windows")]
-pub fn read_local_storage(window: &tauri::WebviewWindow) -> anyhow::Result<Vec<(String, String)>> {
-    use std::sync::{Arc, Mutex};
-
-    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
-    use windows::core::{HSTRING, PCWSTR};
-
+/// ## 为什么是异步的
+///
+/// 读 localStorage 只能执行脚本，而脚本求值在 WebView 里天然异步。Tauri 的
+/// `eval_with_callback` 只是把任务投递到事件循环、立刻返回；**回调在事件循环
+/// 线程上执行**。若在 `on_window_event` 里同步 `recv()` 等它，事件循环被自己
+/// 堵住，回调永远派发不出来 —— 死锁。
+///
+/// （`read_all` 能同步是因为 wry 的 `cookies()` 内部用了 `with_with_bump` /
+/// `gtk::main_iteration` 自己泵消息；`eval` 这条路径没有等价物。）
+///
+/// 所以调用方要先把关闭拦下来（`api.prevent_close()`），拿到结果后再关窗。
+pub fn read_local_storage_async(
+    window: &tauri::WebviewWindow,
+    done: impl FnOnce(Vec<(String, String)>) + Send + 'static,
+) -> anyhow::Result<()> {
     // `{k:v,...}` 形式回传，宿主侧再解析。
+    //
+    // 外层 try/catch 是必要的：脚本抛错时 wry 在部分平台只会调用回调传空串，
+    // 在另一些平台则静默丢弃，返回 `'{}'` 能让两条路径都收敛到「没有数据」。
     const SCRIPT: &str = r#"(function () {
   try {
     var out = {};
@@ -100,67 +107,27 @@ pub fn read_local_storage(window: &tauri::WebviewWindow) -> anyhow::Result<Vec<(
   } catch (e) { return '{}'; }
 })()"#;
 
-    let collected: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let slot_out = Arc::clone(&collected);
-    let slot_err = Arc::clone(&failure);
-    let outer_out = Arc::clone(&collected);
-    let outer_err = Arc::clone(&failure);
-
-    window.with_webview(move |platform| unsafe {
-        let core: ICoreWebView2 = match platform.controller().CoreWebView2() {
-            Ok(core) => core,
-            Err(err) => {
-                *slot_err.lock().unwrap() = Some(format!("CoreWebView2: {err}"));
+    // Tauri 的 `eval_with_callback` 收的是 `Fn`（可能被调多次），而我们要的
+    // 是「只处理一次」的语义：用 Option 包住，取走后就置空，重复回调直接忽略。
+    let done = std::sync::Mutex::new(Some(done));
+    window
+        .eval_with_callback(SCRIPT, move |raw| {
+            let Some(done) = done.lock().unwrap_or_else(|e| e.into_inner()).take() else {
                 return;
-            }
-        };
-        let script = HSTRING::from(SCRIPT);
-        let inner_out = Arc::clone(&slot_out);
-        let inner_err = Arc::clone(&slot_err);
-        let outcome = webview2_com::ExecuteScriptCompletedHandler::wait_for_async_operation(
-            Box::new(move |handler| {
-                core.ExecuteScript(PCWSTR(script.as_ptr()), &handler)
-                    .map_err(webview2_com::Error::from)
-            }),
-            // 回调签名是 `(Result<(), Error>, String)`：第二个参数已经是解好的
-            // 脚本返回值（JSON 字面量，带外层引号）。
-            Box::new(move |error_code: windows::core::Result<()>, value: String| {
-                if let Err(err) = error_code {
-                    *inner_err.lock().unwrap() = Some(format!("ExecuteScript: {err}"));
-                    return Ok(());
-                }
-                if !value.is_empty() {
-                    *inner_out.lock().unwrap() = Some(value);
-                }
-                Ok(())
-            }),
-        );
-        if let Err(err) = outcome {
-            *slot_err.lock().unwrap() = Some(format!("等待 localStorage 回调失败: {err}"));
-        }
-    })?;
-
-    if let Some(err) = outer_err.lock().unwrap().clone() {
-        anyhow::bail!(err);
-    }
-    // `ExecuteScript` 的结果本身是 JSON 字符串字面量（含引号），先按 JSON 解一次。
-    let raw = outer_out.lock().unwrap().clone().unwrap_or_default();
-    let decoded: String = serde_json::from_str(&raw).unwrap_or(raw);
-    let parsed: std::collections::BTreeMap<String, serde_json::Value> =
-        serde_json::from_str(&decoded).unwrap_or_default();
-    Ok(parsed
-        .into_iter()
-        .filter_map(|(key, value)| match value {
-            serde_json::Value::String(text) => Some((key, text)),
-            serde_json::Value::Null => None,
-            other => Some((key, other.to_string())),
+            };
+            // wry 把结果序列化成 JSON 字符串再交回来：脚本返回的是
+            // JSON.stringify 的字符串，所以这里先解一层字符串、再解一层对象。
+            let decoded: String = serde_json::from_str(&raw).unwrap_or_default();
+            let parsed: std::collections::BTreeMap<String, serde_json::Value> =
+                serde_json::from_str(&decoded).unwrap_or_default();
+            done(parsed
+                .into_iter()
+                .filter_map(|(key, value)| match value {
+                    serde_json::Value::String(text) => Some((key, text)),
+                    serde_json::Value::Null => None,
+                    other => Some((key, other.to_string())),
+                })
+                .collect());
         })
-        .collect())
-}
-
-/// 非 Windows：localStorage 读取暂未实现，返回空表让调用方走默认路径。
-#[cfg(not(target_os = "windows"))]
-pub fn read_local_storage(_window: &tauri::WebviewWindow) -> anyhow::Result<Vec<(String, String)>> {
-    Ok(Vec::new())
+        .map_err(|err| anyhow::anyhow!("读取 localStorage 失败: {err}"))
 }
