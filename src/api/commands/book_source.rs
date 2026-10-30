@@ -500,6 +500,11 @@ pub async fn open_external_window(
         if !source_url.is_empty() {
             let service = Arc::clone(&state.book_service);
             let watched = window.clone();
+            // 「已经处理过关闭」的标志。
+            //
+            // 有它兜底：即使某条路径仍然用 `close()`（会再触发一次
+            // `CloseRequested`），第二次进来也直接放行，不会再拦一遍。
+            let handled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             window.on_window_event(move |event| {
                 // 必须在关闭**之前**读：Destroyed 触发时 WebView 已经销毁，
                 // Cookie 与 localStorage 都读不出来。
@@ -507,10 +512,14 @@ pub async fn open_external_window(
                 // 这里要把关闭拦下来：localStorage 只能靠执行脚本读，而脚本
                 // 求值是异步的（回调在事件循环线程上跑）。若就地同步等待，
                 // 事件循环被自己堵住，回调永远不派发 —— 死锁。所以先
-                // `prevent_close()`，读完后由我们自己 `close()`。
+                // `prevent_close()`，读完后由我们自己关窗。
                 let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                     return;
                 };
+                // 已经处理过一次了：放行，别再拦。
+                if handled.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
                 api.prevent_close();
 
                 // Cookie 这条是同步的（wry 内部自己泵消息），先取。
@@ -518,7 +527,7 @@ pub async fn open_external_window(
                     Ok(cookies) => std::sync::Arc::new(cookies),
                     Err(err) => {
                         tracing::warn!(%err, "读取登录窗口 Cookie 失败");
-                        let _ = watched.close();
+                        let _ = watched.destroy();
                         return;
                     }
                 };
@@ -537,9 +546,11 @@ pub async fn open_external_window(
                 let spawned = crate::service::webview_cookies::read_local_storage_async(
                     &watched,
                     move |storage| {
-                        // 无论有没有读到，都要把窗口关掉 —— 否则用户点了关闭
-                        // 窗口却一直停在原地。
-                        let _ = closing.close();
+                        // 用 `destroy()` 而不是 `close()`：后者会再触发一次
+                        // `CloseRequested`，把「拦截→读取→关窗」再走一遍，
+                        // 变成无限循环（窗口关不掉、日志刷屏）。
+                        // `destroy()` 强制关闭且不发事件，正好是这里要的语义。
+                        let _ = closing.destroy();
                         let cookies = std::sync::Arc::try_unwrap(cookies_for_read)
                             .unwrap_or_else(|shared| shared.as_ref().clone());
                         persist_window_session(service_for_read, target_for_read, cookies, storage);
@@ -547,7 +558,7 @@ pub async fn open_external_window(
                 );
                 if let Err(err) = spawned {
                     tracing::warn!(%err, "读取登录窗口 localStorage 失败");
-                    let _ = watched.close();
+                    let _ = watched.destroy();
                     let fallback = std::sync::Arc::try_unwrap(cookies)
                         .unwrap_or_else(|shared| shared.as_ref().clone());
                     persist_window_session(
