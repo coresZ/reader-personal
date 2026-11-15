@@ -832,6 +832,12 @@ fn truncate_trace_body(body: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SearchPageResult {
+    pub books: Vec<crate::model::search::SearchBook>,
+    pub has_more: bool,
+}
+
 impl BookService {
     pub fn new(http: HttpClient, parser: RuleEngine, cache: FileCache, storage_dir: &str) -> Self {
         let storage_dir = PathBuf::from(storage_dir);
@@ -1603,6 +1609,16 @@ impl BookService {
         key: &str,
         page: i32,
     ) -> Result<Vec<SearchBook>, AppError> {
+        Ok(self.search_book_page(user_ns, source, key, page).await?.books)
+    }
+
+    pub async fn search_book_page(
+        &self,
+        user_ns: &str,
+        source: &BookSource,
+        key: &str,
+        page: i32,
+    ) -> Result<SearchPageResult, AppError> {
         self.search_book_cancellable(user_ns, source, key, page, None)
             .await
     }
@@ -1616,7 +1632,7 @@ impl BookService {
         key: &str,
         page: i32,
         cancel: Option<&CancelSignal>,
-    ) -> Result<Vec<SearchBook>, AppError> {
+    ) -> Result<SearchPageResult, AppError> {
         if is_cancelled(cancel) {
             return Err(AppError::BadRequest(CANCELLED_ERR.to_string()));
         }
@@ -1656,8 +1672,9 @@ impl BookService {
                 "书源搜索请求失败（HTTP {}），请检查站点访问状态或网络设置", res.status
             )));
         }
-        tracing::info!("found {} books", books.len());
-        Ok(books)
+        let has_more = crate::parser::search_pagination::infer_search_has_more(&res.body, page, books.len());
+        tracing::info!("found {} books, has_more={}", books.len(), has_more);
+        Ok(SearchPageResult { books, has_more })
     }
 
     /// 搜索解析放到阻塞线程池: 规则里可能带 `js:` 且 JS 内会发起同步 HTTP

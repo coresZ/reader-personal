@@ -1,4 +1,5 @@
 pub mod html;
+pub mod search_pagination;
 pub mod http_tts_template;
 pub mod js;
 mod js_binary;

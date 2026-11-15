@@ -2295,8 +2295,41 @@ pub async fn search_book_multi_sse(
                 let cur_idx = idx;
                 let user_ns_value = user_ns;
                 tasks.push(tokio::spawn(async move {
-                    let res = svc.search_book(&user_ns_value, &source, &k, 1).await;
-                    (cur_idx, source.book_source_name, res)
+                    // 源内翻页：直到 has_more=false 或达到上限（避免只搜 page=1）
+                    const MAX_PAGES_PER_SOURCE: i32 = 10;
+                    let mut all = Vec::new();
+                    let mut page = 1i32;
+                    let mut last_err: Option<String> = None;
+                    while page <= MAX_PAGES_PER_SOURCE {
+                        match svc
+                            .search_book_page(&user_ns_value, &source, &k, page)
+                            .await
+                        {
+                            Ok(result) => {
+                                if result.books.is_empty() {
+                                    break;
+                                }
+                                all.extend(result.books);
+                                if !result.has_more {
+                                    break;
+                                }
+                                page += 1;
+                            }
+                            Err(e) => {
+                                last_err = Some(format!("{e}"));
+                                break;
+                            }
+                        }
+                    }
+                    if all.is_empty() {
+                        if let Some(err) = last_err {
+                            (cur_idx, source.book_source_name, Err(err))
+                        } else {
+                            (cur_idx, source.book_source_name, Ok(all))
+                        }
+                    } else {
+                        (cur_idx, source.book_source_name, Ok(all))
+                    }
                 }));
                 idx += 1;
             }
