@@ -1895,7 +1895,7 @@ impl BookService {
                 .search_book_cancellable(user_ns, source, &keyword, 1, cancel)
                 .await
             {
-                Ok(books) => (!books.is_empty(), None),
+                Ok(page) => (!page.books.is_empty(), None),
                 Err(err) => (false, Some(format!("{err:?}"))),
             }
         } else {
