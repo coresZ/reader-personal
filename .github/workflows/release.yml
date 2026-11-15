@@ -5,9 +5,27 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: 构建平台（只想要便携版选 Windows 即可）
+        type: choice
+        options:
+          - windows
+          - linux
+          - macos
+          - all
+        default: windows
+      publish:
+        description: 构建成功后发布 GitHub Release（取消草稿并标为 latest）
+        type: boolean
+        default: true
+      skip_tests:
+        description: 跳过前端/Rust 测试以加快构建
+        type: boolean
+        default: false
 
 concurrency:
-  group: desktop-release-${{ github.ref }}
+  group: desktop-release-${{ github.ref }}-${{ github.event.inputs.platforms || 'tag' }}
   cancel-in-progress: false
 
 jobs:
@@ -19,9 +37,41 @@ jobs:
       contents: write
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      do_publish: ${{ steps.release.outputs.do_publish }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve platforms matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          # tag 推送：全平台；手动：按选择
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]] || [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            choice="all"
+          else
+            choice="${{ github.event.inputs.platforms || 'windows' }}"
+          fi
+
+          windows='{"os":"windows-latest","platform":"windows","arch":"x64","target":"x86_64-pc-windows-msvc","rust_targets":"x86_64-pc-windows-msvc","bundles":"nsis"}'
+          linux='{"os":"ubuntu-22.04","platform":"linux","arch":"x64","target":"x86_64-unknown-linux-gnu","rust_targets":"x86_64-unknown-linux-gnu","bundles":"appimage,deb"}'
+          macos='{"os":"macos-latest","platform":"macos","arch":"universal","target":"universal-apple-darwin","rust_targets":"aarch64-apple-darwin,x86_64-apple-darwin","bundles":"dmg"}'
+
+          case "$choice" in
+            windows) include="[$windows]" ;;
+            linux)   include="[$linux]" ;;
+            macos)   include="[$macos]" ;;
+            all)     include="[$windows,$linux,$macos]" ;;
+            *)
+              echo "Unknown platforms: $choice" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "platforms=$choice"
+          echo "matrix=$(jq -c -n --argjson include "$include" '{include:$include}')" >> "$GITHUB_OUTPUT"
 
       - name: Resolve Release target
         id: release
@@ -31,20 +81,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1) 打 tag 触发：直接用标签名
-          # 2) 手动 workflow_dispatch：优先已有 latest Release，否则用项目 version 建草稿
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]] || [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
             release_tag="${GITHUB_REF_NAME}"
-          elif release_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName' 2>/dev/null)" \
-            && [[ -n "${release_tag}" ]]; then
-            echo "Using existing published Release: $release_tag"
+            do_publish="true"
           else
+            # 手动：默认用当前代码版本；若已有同名 Release 则复用
             ver="$(node -p "require('./desktop/src-tauri/tauri.conf.json').version" 2>/dev/null || true)"
             if [[ -z "${ver}" ]]; then
               ver="$(node -p "require('./frontend/package.json').version")"
             fi
             release_tag="v${ver}"
-            echo "No existing Release; will create $release_tag from package version"
+            do_publish="${{ github.event.inputs.publish || 'true' }}"
           fi
 
           if [[ -z "${release_tag}" ]]; then
@@ -68,7 +115,8 @@ jobs:
           fi
 
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-          echo "Release target: $release_tag"
+          echo "do_publish=$do_publish" >> "$GITHUB_OUTPUT"
+          echo "Release target: $release_tag (publish=$do_publish)"
 
   build:
     name: ${{ matrix.platform }}-${{ matrix.arch }}
@@ -79,26 +127,7 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            platform: windows
-            arch: x64
-            target: x86_64-pc-windows-msvc
-            rust_targets: x86_64-pc-windows-msvc
-            bundles: nsis
-          - os: ubuntu-22.04
-            platform: linux
-            arch: x64
-            target: x86_64-unknown-linux-gnu
-            rust_targets: x86_64-unknown-linux-gnu
-            bundles: appimage,deb
-          - os: macos-latest
-            platform: macos
-            arch: universal
-            target: universal-apple-darwin
-            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
-            bundles: dmg
+      matrix: ${{ fromJson(needs.prepare-release.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -114,7 +143,7 @@ jobs:
             librsvg2-dev \
             patchelf
 
-      - name: Set up Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -142,10 +171,12 @@ jobs:
         run: npm run build
 
       - name: Test frontend
+        if: ${{ github.event_name == 'push' || github.event.inputs.skip_tests != 'true' }}
         working-directory: frontend
         run: npm test -- --run
 
       - name: Test Rust core
+        if: ${{ github.event_name == 'push' || github.event.inputs.skip_tests != 'true' }}
         run: cargo test --lib -j 4
 
       - name: Install desktop dependencies
@@ -184,7 +215,7 @@ jobs:
     needs:
       - prepare-release
       - build
-    if: ${{ always() && needs.build.result == 'success' }}
+    if: ${{ always() && needs.build.result == 'success' && needs.prepare-release.outputs.do_publish == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -195,7 +226,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
         run: |
-          # 先结束草稿状态，再单独设置 latest，避免 GitHub API 在同一请求中
-          # 先校验 latest 而把仍处于 draft 状态的 Release 判定为无效。
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --latest
