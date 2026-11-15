@@ -3,11 +3,11 @@
     <div class="search-header">
       <h2>
         搜索 "{{ searchKey }}"
-        <span v-if="isSearching" class="searching-indicator" :class="{ soft: displayResults.length >
-          {{ displayResults.length > 0 ? '仍在搜索其他书源…' : '搜索中…' }}
-        </span>
-          搜索中...
-        </span>
+        <span
+          v-if="isSearching"
+          class="searching-indicator"
+          :class="{ soft: displayResults.length > 0 }"
+        >{{ displayResults.length > 0 ? '仍在搜索其他书源…' : '搜索中…' }}</span>
         <span v-else class="result-count">({{ rankedResults.length }} 个结果)</span>
         <!-- 结果来自会话缓存时标一下；点它可重搜。
              原来是单独一行提示条（"已显示上次的搜索结果 / 重新搜索"），既多占
