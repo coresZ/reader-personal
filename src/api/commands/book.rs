@@ -2294,13 +2294,17 @@ pub async fn search_book_multi_sse(
                 let k = key.clone();
                 let cur_idx = idx;
                 let user_ns_value = user_ns;
+                let cancel_flag = cancel_guard.clone();
                 tasks.push(tokio::spawn(async move {
-                    // 源内翻页：直到 has_more=false 或达到上限（避免只搜 page=1）
-                    const MAX_PAGES_PER_SOURCE: i32 = 10;
+                    const MAX_PAGES_PER_SOURCE: i32 = 5;
                     let mut all = Vec::new();
                     let mut page = 1i32;
                     let mut last_err: Option<String> = None;
+                    let mut prev_fingerprint = String::new();
                     while page <= MAX_PAGES_PER_SOURCE {
+                        if cancel_flag.is_cancelled() {
+                            break;
+                        }
                         match svc
                             .search_book_page(&user_ns_value, &source, &k, page)
                             .await
@@ -2309,6 +2313,17 @@ pub async fn search_book_multi_sse(
                                 if result.books.is_empty() {
                                     break;
                                 }
+                                let fingerprint = result
+                                    .books
+                                    .iter()
+                                    .map(|b| b.book_url.as_str())
+                                    .take(8)
+                                    .collect::<Vec<_>>()
+                                    .join("|");
+                                if !fingerprint.is_empty() && fingerprint == prev_fingerprint {
+                                    break;
+                                }
+                                prev_fingerprint = fingerprint;
                                 all.extend(result.books);
                                 if !result.has_more {
                                     break;

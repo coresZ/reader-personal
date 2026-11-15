@@ -3,8 +3,9 @@
     <div class="search-header">
       <h2>
         搜索 "{{ searchKey }}"
-        <span v-if="isSearching" class="searching-indicator">
-          <span class="dot-pulse"></span>
+        <span v-if="isSearching" class="searching-indicator" :class="{ soft: displayResults.length >
+          {{ displayResults.length > 0 ? '仍在搜索其他书源…' : '搜索中…' }}
+        </span>
           搜索中...
         </span>
         <span v-else class="result-count">({{ rankedResults.length }} 个结果)</span>
@@ -542,6 +543,15 @@ function streamSearch(key: string, sessionKey: string, startIndex: number) {
     )
   }
 
+  // 后端若卡在某个源的翻页/限速，避免转圈永不结束
+  const searchSafetyTimer = window.setTimeout(() => {
+    if (!isCurrentSearch()) return
+    if (shelfStore.isSearching) {
+      shelfStore.isSearching = false
+      commitSession(shelfStore.searchResults.length > 0, searchLastIndex)
+    }
+  }, 90_000)
+
   stream.onmessage = (event) => {
     if (!isCurrentSearch()) return
     try {
@@ -570,6 +580,7 @@ function streamSearch(key: string, sessionKey: string, startIndex: number) {
 
   stream.addEventListener('end', (event) => {
     if (!isCurrentSearch()) return
+    window.clearTimeout(searchSafetyTimer)
     const payload = event.data as { lastIndex?: number; hasMore?: boolean }
     if (typeof payload?.lastIndex === 'number') searchLastIndex = payload.lastIndex
     shelfStore.isSearching = false
@@ -581,6 +592,7 @@ function streamSearch(key: string, sessionKey: string, startIndex: number) {
 
   stream.addEventListener('error', () => {
     if (!isCurrentSearch()) return
+    window.clearTimeout(searchSafetyTimer)
     shelfStore.isSearching = false
     stream.close()
     eventSource = null
@@ -589,6 +601,7 @@ function streamSearch(key: string, sessionKey: string, startIndex: number) {
 
   stream.onerror = () => {
     if (!isCurrentSearch()) return
+    window.clearTimeout(searchSafetyTimer)
     shelfStore.isSearching = false
     stream.close()
     eventSource = null
@@ -791,6 +804,10 @@ function handleBookContextMenu({ book, event }: { book: Book | SearchBook; event
   color: var(--color-text-tertiary);
 }
 
+.searching-indicator.soft {
+  opacity: 0.75;
+  font-size: 12px;
+}
 .searching-indicator {
   display: inline-flex;
   align-items: center;
