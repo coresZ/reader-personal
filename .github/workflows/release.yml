@@ -20,25 +20,51 @@ jobs:
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Resolve Release target
         id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            release_tag="$GITHUB_REF_NAME"
-          elif ! release_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName' 2>/dev/null)"; then
-            echo "No published Release found" >&2
+          set -euo pipefail
+
+          # 1) 打 tag 触发：直接用标签名
+          # 2) 手动 workflow_dispatch：优先已有 latest Release，否则用项目 version 建草稿
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]] || [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+          elif release_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName' 2>/dev/null)" \
+            && [[ -n "${release_tag}" ]]; then
+            echo "Using existing published Release: $release_tag"
+          else
+            ver="$(node -p "require('./desktop/src-tauri/tauri.conf.json').version" 2>/dev/null || true)"
+            if [[ -z "${ver}" ]]; then
+              ver="$(node -p "require('./frontend/package.json').version")"
+            fi
+            release_tag="v${ver}"
+            echo "No existing Release; will create $release_tag from package version"
+          fi
+
+          if [[ -z "${release_tag}" ]]; then
+            echo "Unable to resolve release tag" >&2
             exit 1
           fi
 
           if ! gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$release_tag" \
+            echo "Creating draft Release $release_tag"
+            if ! gh release create "$release_tag" \
               --repo "$GITHUB_REPOSITORY" \
               --draft \
               --title "Reader $release_tag" \
-              --generate-notes
+              --generate-notes; then
+              gh release create "$release_tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --draft \
+                --title "Reader $release_tag" \
+                --notes "Desktop build for $release_tag"
+            fi
           fi
 
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
